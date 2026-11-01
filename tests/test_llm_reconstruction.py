@@ -6,10 +6,11 @@ import weakref
 from safetensors.torch import load_file, save_file
 
 from lp_llm.encode import encode
+from lp_llm.evaluate import _identity
 from lp_llm.model_adapter import SelectionPolicy, expected_qwen3, inventory
 from lp_llm.reconstruct import reconstruct
-from lp_llm.storage import storage_report
-from lp_llm.quantize import affine_quantize
+from lp_llm.storage import decode_prefix, read_layer, storage_report
+from lp_llm.quantize import affine_quantize, encode_layers
 
 
 CONFIG = {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
@@ -61,10 +62,31 @@ def test_incremental_encode_resume_and_reconstruct(tmp_path, granularity):
         assert row["total_physical_bytes"] == sum(row[key] for key in (
             "packed_code_bytes", "scale_zero_metadata_bytes", "other_decoder_framing_bytes",
             "shared_unquantized_bytes"))
+        required = ["manifest.json", "COMPLETE.json", *manifest["sidecars"]]
+        required += [r["shared"] for r in manifest["tensors"] if not r["eligible"]]
+        selected = [layer for r in manifest["tensors"] if r["eligible"]
+                    for layer in r["layers"][:row["depth"]]]
+        required += [path for layer in selected for path in (layer["code"], layer["metadata"])]
+        assert row["total_physical_bytes"] == sum((artifact / path).stat().st_size for path in required)
+        assert row["scale_zero_metadata_bytes"] == sum(
+            read_layer(artifact, layer)[key].numel() * read_layer(artifact, layer)[key].element_size()
+            for layer in selected for key in ("scale", "zero_point"))
     assert sum(1 for r in manifest["tensors"] if r["eligible"]) == 7
+    for record in manifest["tensors"]:
+        if not record["eligible"]:
+            continue
+        original = originals[record["name"]].float()
+        for depth, (params, _, encoder_prefix) in enumerate(
+                encode_layers(original, settings["bits"], granularity, settings["group_size"]), 1):
+            stored = read_layer(artifact, record["layers"][depth - 1])
+            assert torch.equal(stored["codes"], params["codes"])
+            assert torch.equal(stored["scale"], params["scale"])
+            assert torch.equal(stored["zero_point"], params["zero_point"])
+            assert torch.equal(decode_prefix(artifact, record, depth), encoder_prefix)
     for depth in range(1, 5):
         out = tmp_path / f"prefix-{depth}"
         index = reconstruct(artifact, out, depth)
+        assert _identity(out, "test")["kind"] == "lp_reconstructed"
         assert set(index["weight_map"]) == set(originals)
         for record in manifest["tensors"]:
             name = record["name"]
@@ -72,10 +94,26 @@ def test_incremental_encode_resume_and_reconstruct(tmp_path, granularity):
             if not record["eligible"]:
                 assert torch.equal(actual, originals[name])
             else:
-                assert actual.dtype == torch.bfloat16 and torch.isfinite(actual).all()
+                assert actual.dtype == torch.bfloat16
+                assert torch.equal(actual, decode_prefix(artifact, record, depth).to(torch.bfloat16))
     for shard in source.glob("*.safetensors"):
         shard.unlink()
     assert reconstruct(artifact, tmp_path / "independent", 2)
+
+
+def test_lp_checkpoint_identity_rejects_bad_completion_marker(tmp_path):
+    source = tmp_path / "source"
+    make_checkpoint(source)
+    artifact = tmp_path / "artifact"
+    encode(source, artifact, {"bits": [2], "granularity": "channel"})
+    out = tmp_path / "decoded"
+    reconstruct(artifact, out, 1)
+    marker = next(out.glob(".done-*.json"))
+    data = json.loads(marker.read_text())
+    data["sha256"] = "0" * 64
+    marker.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="integrity check failed"):
+        _identity(out, "test")
 
 
 def test_index_detects_missing_or_unexpected_keys(tmp_path):

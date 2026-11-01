@@ -32,12 +32,11 @@ def affine_quantize(weight: torch.Tensor, bits: int, granularity: str = "channel
         return {"bits": bits, "granularity": granularity, "group_size": cols,
                 "shape": [rows, cols], "codes": params["quantized"],
                 "scale": params["scale"].reshape(rows),
-                "zero_point": params["zero_point"].reshape(rows),
-                "t_min": params["t_min"].reshape(rows)}, decoded
+                "zero_point": params["zero_point"].reshape(rows)}, decoded
     full, tail = divmod(cols, group_size)
     codes = torch.empty((rows, cols), dtype=torch.uint8 if bits <= 8 else torch.uint16)
     decoded = torch.empty_like(x)
-    scales, zeros, minima = [], [], []
+    scales, zeros = [], []
     if full:
         regions = x[:, :full * group_size].reshape(rows * full, group_size)
         p, d = IntegerFormat("channel", 0).quantize(regions, bits)
@@ -45,18 +44,15 @@ def affine_quantize(weight: torch.Tensor, bits: int, granularity: str = "channel
         decoded[:, :full * group_size] = d.reshape(rows, full * group_size)
         scales.append(p["scale"].reshape(rows, full))
         zeros.append(p["zero_point"].reshape(rows, full))
-        minima.append(p["t_min"].reshape(rows, full))
     if tail:
         p, d = IntegerFormat("channel", 0).quantize(x[:, full * group_size:], bits)
         codes[:, full * group_size:] = p["quantized"]
         decoded[:, full * group_size:] = d
         scales.append(p["scale"].reshape(rows, 1))
         zeros.append(p["zero_point"].reshape(rows, 1))
-        minima.append(p["t_min"].reshape(rows, 1))
     return {"bits": bits, "granularity": granularity, "group_size": group_size,
             "shape": [rows, cols], "codes": codes,
-            "scale": torch.cat(scales, 1), "zero_point": torch.cat(zeros, 1),
-            "t_min": torch.cat(minima, 1)}, decoded
+            "scale": torch.cat(scales, 1), "zero_point": torch.cat(zeros, 1)}, decoded
 
 
 def affine_decode(params: dict) -> torch.Tensor:
@@ -80,9 +76,11 @@ def affine_decode(params: dict) -> torch.Tensor:
             start, stop = 0, cols
         scale = params["scale"].reshape(rows, groups)[:, g:g+1].float()
         zero = params["zero_point"].reshape(rows, groups)[:, g:g+1].float()
-        minimum = params["t_min"].reshape(rows, groups)[:, g:g+1].float()
-        result[:, start:stop] = torch.where(scale > 0,
-            scale * (params["codes"][:, start:stop].float() - zero), minimum)
+        contribution = scale * (params["codes"][:, start:stop].float() - zero)
+        if "t_min" in params:  # Read artifacts written before zero-scale metadata was elided.
+            minimum = params["t_min"].reshape(rows, groups)[:, g:g+1].float()
+            contribution = torch.where(scale > 0, contribution, minimum)
+        result[:, start:stop] = contribution
     return result
 
 

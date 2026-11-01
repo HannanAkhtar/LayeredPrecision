@@ -83,8 +83,9 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
     meta = root / (stem + ".safetensors")
     pack_codes(code, params["codes"], params["bits"])
     zero = params["zero_point"].to(torch.int32) if params["bits"] > 8 else params["zero_point"]
-    atomic_safetensors(meta, {"scale": params["scale"], "zero_point": zero,
-                              "t_min": params["t_min"]})
+    # With zero included in every fitted range, scale==0 only for an all-zero
+    # region; its code and zero point are zero, so no fallback value is needed.
+    atomic_safetensors(meta, {"scale": params["scale"], "zero_point": zero})
     return {"code": str(code.relative_to(root)).replace("\\", "/"),
             "metadata": str(meta.relative_to(root)).replace("\\", "/"),
             "code_bytes": code.stat().st_size, "metadata_bytes": meta.stat().st_size,
@@ -94,7 +95,8 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
             "bits": params["bits"], "granularity": params["granularity"],
             "group_size": params["group_size"], "shape": params["shape"],
             "family": "affine_asymmetric", "reconstruction_dtype": "float32",
-            "rounding": "torch.round_ties_to_even", "zero_in_range": True}
+            "rounding": "torch.round_ties_to_even", "zero_in_range": True,
+            "zero_scale_decodes_to": 0.0}
 
 
 def read_layer(root: Path, record: dict, verify: bool = True) -> dict:

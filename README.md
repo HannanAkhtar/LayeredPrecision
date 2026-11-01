@@ -382,9 +382,11 @@ BF16 cast MSE, SQNR, residual energy, and residual MSE; task metrics measure
 the actual BF16 inference model.
 
 Each eligible tensor owns one packed `.bin` code stream and one Safetensors
-metadata file per LP layer. Metadata contains FP32 scales and zero range
-minima plus integer zero points. Bits within a byte are stored least significant
-first. The versioned manifest records the model identity, selected parameters,
+metadata file per LP layer. Metadata contains FP32 scales and integer zero
+points. Zero is included in every fitted range, so a zero scale occurs only
+for an all-zero region and decodes to zero without a stored minimum. Bits
+within a byte are stored least significant first. The versioned manifest
+records the model identity, selected parameters,
 bit schedule, numerical conventions, software versions, stream hashes, and
 source inventory. Excluded BF16 tensors and Hugging Face configuration and
 tokenizer sidecars are copied into the artifact. A tensor completion marker is
@@ -416,9 +418,12 @@ python -m pytest tests -q
 
 On AWS, deploy this reviewed source tree to `$LP_ROOT/paper_release` after
 publishing it yourself. The existing Conda environment and `$LP_ROOT/env.sh`
-are used by the Slurm scripts. The scripts do not install packages. These
-commands submit only the first per channel LP quantization, then one selected
-reconstruction and perplexity evaluation after the preceding job completes:
+are used by the Slurm scripts. The scripts do not install packages. All four
+scripts default to 12 GB host RAM and four CPUs, matching the earlier working
+allocation. Slurm command line options such as `--mem=14G --cpus-per-task=8`
+override these defaults when needed. First verify BF16 protocol parity, then
+submit the first per channel LP quantization. Reconstruction and evaluation
+are separate submissions after their preceding completion marker appears:
 
 ```bash
 export LP_ROOT=/shared/makhtar/lp_llm
@@ -427,6 +432,11 @@ mkdir -p "$LP_ROOT/logs" "$LP_ROOT/results"
 test -f "$LP_ROOT/models/qwen3-8b-base/model.safetensors.index.json"
 test -f "$LP_CODE/configs/llm/qwen3_lp_channel.yaml"
 
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_CHECKPOINT="$LP_ROOT/models/qwen3-8b-base",LP_RESULT="$LP_ROOT/results/qwen3_bf16_wikitext_parity.json",LP_PROTOCOL=wikitext \
+  "$LP_CODE/hpc/lp_evaluate.sbatch"
+
+# After the BF16 job completes, verify 299078 corpus tokens, 299077 scored
+# tokens, and perplexity near 6.219182234107349 before quantized runs.
 sbatch --export=ALL,LP_CODE="$LP_CODE",LP_CONFIG="$LP_CODE/configs/llm/qwen3_lp_channel.yaml",LP_SOURCE="$LP_ROOT/models/qwen3-8b-base",LP_OUTPUT="$LP_ROOT/results/qwen3_lp_channel" \
   "$LP_CODE/hpc/lp_quantize.sbatch"
 
@@ -453,13 +463,19 @@ directories and is not part of the first submission.
 
 WikiText-2 uses `Salesforce/wikitext`, `wikitext-2-raw-v1` test text joined
 with double newlines, no added special tokens, context 2048, stride 512,
-and token weighted sliding window loss. The reference BF16 run scored
+and the original baseline window construction: each step ends at `i+stride`
+and begins up to 2048 tokens before that end. Valid shifted labels are counted
+for each window when weighting its loss. The reference BF16 run scored
 299,077 of 299,078 tokens and reached perplexity 6.219182234107349.
 Zero shot evaluation uses the existing Hugging Face backend of
 `lm-evaluation-harness==0.4.13` for ARC Easy, ARC Challenge, PIQA,
-WinoGrande, and HellaSwag; both `acc` and `acc_norm` are recorded where
-available. Completed evaluation JSON files are reused only for the same
-checkpoint identity and protocol.
+WinoGrande, and HellaSwag. The complete harness result is retained, including
+accuracy, normalized accuracy, standard errors, task versions, and settings.
+The evaluation command accepts either an original Hugging Face Safetensors
+checkpoint or a completed LP reconstruction. Completed JSON results are reused
+only for the same checkpoint contents and protocol. Evaluation hashes every
+Safetensors shard to establish that identity, adding bounded-memory disk I/O
+before a run or a resume check.
 
 Full 8B correctness, peak RAM, disk throughput, reconstructed model loading,
 and task quality still require AWS validation. The local synthetic tests
