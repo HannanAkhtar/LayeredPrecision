@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.DS_Store
+
+data/
+outputs/
+checkpoints/
+artifacts/
+*.pth
+*.pt
+*.partial

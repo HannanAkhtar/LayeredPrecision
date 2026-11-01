@@ -1,0 +1,4 @@
+numpy==2.3.5
+Pillow==12.0.0
+matplotlib==3.10.7
+torchcodec==0.10.0
