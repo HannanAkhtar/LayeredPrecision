@@ -1,0 +1,127 @@
+import json
+
+import pytest
+import torch
+import weakref
+from safetensors.torch import load_file, save_file
+
+from lp_llm.encode import encode
+from lp_llm.model_adapter import SelectionPolicy, expected_qwen3, inventory
+from lp_llm.reconstruct import reconstruct
+from lp_llm.storage import storage_report
+from lp_llm.quantize import affine_quantize
+
+
+CONFIG = {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
+          "num_hidden_layers": 1, "hidden_size": 16, "intermediate_size": 24,
+          "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
+          "vocab_size": 32, "tie_word_embeddings": False, "torch_dtype": "bfloat16"}
+
+
+def make_checkpoint(path):
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(CONFIG))
+    names = expected_qwen3(CONFIG)
+    mapping = {}
+    tensors = {}
+    for i, (name, shape) in enumerate(sorted(names.items())):
+        tensor = (torch.randn(shape) * 0.02).bfloat16()
+        if "norm" in name:
+            tensor.fill_(1)
+        tensors[name] = tensor
+        shard = f"model-{i // 7:05d}.safetensors"
+        mapping[name] = shard
+    for shard in set(mapping.values()):
+        save_file({name: tensors[name] for name in mapping if mapping[name] == shard}, str(path / shard))
+    (path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": mapping}))
+    return tensors
+
+
+@pytest.mark.parametrize("granularity", ["channel", "group"])
+def test_incremental_encode_resume_and_reconstruct(tmp_path, granularity):
+    source, artifact = tmp_path / "source", tmp_path / "artifact"
+    originals = make_checkpoint(source)
+    _, mapping = inventory(source)
+    assert set(mapping) == set(originals)
+    settings = {"bits": [2, 2, 2, 2], "granularity": granularity, "group_size": 7}
+    assert encode(source, artifact, settings, stop_after=5) is None
+    marker = artifact / "markers/0000.json"
+    first = marker.stat().st_mtime_ns
+    manifest = encode(source, artifact, settings)
+    assert marker.stat().st_mtime_ns == first
+    manifest_hash = (artifact / "COMPLETE.json").read_text()
+    assert encode(source, artifact, settings) == manifest
+    assert (artifact / "COMPLETE.json").read_text() == manifest_hash
+    assert manifest["eligible_parameters"] > 0 and manifest["excluded_parameters"] > 0
+    assert len(manifest["prefix_diagnostics"]) == 4
+    assert [row["nominal_bits"] for row in manifest["prefix_diagnostics"]] == [2, 4, 6, 8]
+    assert sum(r["numel"] for r in manifest["tensors"]) == manifest["eligible_parameters"] + manifest["excluded_parameters"]
+    assert storage_report(artifact, manifest) == json.loads((artifact / "storage_report.json").read_text())
+    for row in storage_report(artifact, manifest)["prefixes"]:
+        assert row["total_physical_bytes"] == sum(row[key] for key in (
+            "packed_code_bytes", "scale_zero_metadata_bytes", "other_decoder_framing_bytes",
+            "shared_unquantized_bytes"))
+    assert sum(1 for r in manifest["tensors"] if r["eligible"]) == 7
+    for depth in range(1, 5):
+        out = tmp_path / f"prefix-{depth}"
+        index = reconstruct(artifact, out, depth)
+        assert set(index["weight_map"]) == set(originals)
+        for record in manifest["tensors"]:
+            name = record["name"]
+            actual = load_file(str(out / index["weight_map"][name]))[name]
+            if not record["eligible"]:
+                assert torch.equal(actual, originals[name])
+            else:
+                assert actual.dtype == torch.bfloat16 and torch.isfinite(actual).all()
+    for shard in source.glob("*.safetensors"):
+        shard.unlink()
+    assert reconstruct(artifact, tmp_path / "independent", 2)
+
+
+def test_index_detects_missing_or_unexpected_keys(tmp_path):
+    source = tmp_path / "source"
+    make_checkpoint(source)
+    index = source / "model.safetensors.index.json"
+    value = json.loads(index.read_text())
+    value["weight_map"].pop("lm_head.weight")
+    index.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="Checkpoint key mismatch"):
+        inventory(source)
+
+
+@pytest.mark.parametrize("granularity", ["channel", "group"])
+def test_monolithic_is_independent_quantization(tmp_path, granularity):
+    source = tmp_path / "source"
+    originals = make_checkpoint(source)
+    artifact = tmp_path / "mono"
+    manifest = encode(source, artifact, {"method": "monolithic", "bits": [4],
+                                         "granularity": granularity, "group_size": 7})
+    out = tmp_path / "decoded"
+    index = reconstruct(artifact, out, 1)
+    for record in manifest["tensors"]:
+        if record["eligible"]:
+            name = record["name"]
+            expected = affine_quantize(originals[name].float(), 4, granularity, 7)[1].bfloat16()
+            actual = load_file(str(out / index["weight_map"][name]))[name]
+            assert torch.equal(actual, expected)
+
+
+def test_source_tensors_are_released_before_next_read(tmp_path, monkeypatch):
+    import lp_llm.encode as encoder
+    source = tmp_path / "source"
+    make_checkpoint(source)
+    actual_read = encoder.read_tensor
+    previous = None
+    count = 0
+
+    def bounded_read(*args):
+        nonlocal previous, count
+        assert previous is None or previous() is None
+        tensor = actual_read(*args)
+        previous = weakref.ref(tensor)
+        count += 1
+        return tensor
+
+    monkeypatch.setattr(encoder, "read_tensor", bounded_read)
+    encode(source, tmp_path / "artifact", {"bits": [2], "granularity": "channel"})
+    assert count == len(expected_qwen3(CONFIG))

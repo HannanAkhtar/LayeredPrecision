@@ -1,0 +1,7 @@
+# The AWS environment already supplies PyTorch 2.9.1+cu128. Do not replace it.
+transformers==4.57.1
+safetensors
+PyYAML
+datasets
+accelerate
+lm-eval==0.4.13

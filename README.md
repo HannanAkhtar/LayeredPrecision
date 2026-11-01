@@ -357,3 +357,112 @@ writes per-dataset sum tables because every sample owns a separate model.
   same seed. Quantizing the same saved checkpoints is the strict comparison.
 - Datasets, pretrained caches, checkpoints, and generated outputs are not part
   of this source directory.
+
+## Qwen3-8B-Base LLM experiments
+
+`lp_llm` extends the same unsigned affine INT quantizer to the pinned
+`Qwen/Qwen3-8B-Base` revision
+`49e3418fbbbca6ecbdf9608b4d22e5a407081db4`. It reads the Safetensors
+index and maps one tensor at a time. It validates the complete Qwen3 key set,
+BF16 dtype, and tensor shapes before writing anything. The selection policy is
+in `lp_llm/model_adapter.py`; it quantizes the four attention projections and
+three MLP projections in each transformer layer. Embeddings, the separate
+untied LM head, RMSNorms, and all other tensors are copied exactly as shared
+BF16 state. The quantizer itself has no Transformers dependency.
+
+The first schedule is `[2,2,2,2]` with nominal 2, 4, 6, and 8 bit prefixes.
+Arbitrary schedules such as `[5,2,2,2]` are accepted. `channel` fits one range
+per output row. `group` fits one range per 128 consecutive input values within
+each row; the final short group is fitted separately. Both modes include zero
+in each range and use the existing `IntegerFormat` rounding, zero point, and
+zero range behavior. Each eligible BF16 tensor is converted to FP32, and all
+base, residual, and prefix arithmetic stays FP32. Only the reconstructed
+checkpoint is cast to BF16. Per tensor metrics include FP32 parameter MSE,
+BF16 cast MSE, SQNR, residual energy, and residual MSE; task metrics measure
+the actual BF16 inference model.
+
+Each eligible tensor owns one packed `.bin` code stream and one Safetensors
+metadata file per LP layer. Metadata contains FP32 scales and zero range
+minima plus integer zero points. Bits within a byte are stored least significant
+first. The versioned manifest records the model identity, selected parameters,
+bit schedule, numerical conventions, software versions, stream hashes, and
+source inventory. Excluded BF16 tensors and Hugging Face configuration and
+tokenizer sidecars are copied into the artifact. A tensor completion marker is
+written after its files; an interrupted run can repeat the same command. A
+final `COMPLETE.json` is created only after every tensor finishes.
+
+`storage_report.json` measures the bytes needed to retain each prefix:
+packed codes, scale/zero point payload, other decoder metadata and framing,
+and shared unquantized tensor files. The final prefix total is the cumulative
+hierarchy size. These are physical file sizes, not nominal bit widths. Resume
+markers and `run.json` are measured separately; the optional report file
+itself is excluded because the decoder does not need these files.
+Only the streams up to the requested prefix are read during reconstruction.
+Each tensor is written to its own output Safetensors shard and an index is
+generated after all shards finish. The original checkpoint is never modified
+or needed to decode an artifact.
+
+For local testing, use Python with PyTorch, Safetensors, NumPy, PyYAML, pytest,
+and Transformers 4.57.1. `requirements-llm.txt` lists the added LLM packages;
+it is separate from the validated ImageNet environment. The tiny Qwen3 test
+requires a Transformers release with `Qwen3Config` and creates its own random
+sharded checkpoint. It performs an AutoModel reload and forward pass for every
+LP prefix in both granularity modes and for a monolithic model. No model
+download is needed.
+
+```bash
+python -m pytest tests -q
+```
+
+On AWS, deploy this reviewed source tree to `$LP_ROOT/paper_release` after
+publishing it yourself. The existing Conda environment and `$LP_ROOT/env.sh`
+are used by the Slurm scripts. The scripts do not install packages. These
+commands submit only the first per channel LP quantization, then one selected
+reconstruction and perplexity evaluation after the preceding job completes:
+
+```bash
+export LP_ROOT=/shared/makhtar/lp_llm
+export LP_CODE=$LP_ROOT/paper_release
+mkdir -p "$LP_ROOT/logs" "$LP_ROOT/results"
+test -f "$LP_ROOT/models/qwen3-8b-base/model.safetensors.index.json"
+test -f "$LP_CODE/configs/llm/qwen3_lp_channel.yaml"
+
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_CONFIG="$LP_CODE/configs/llm/qwen3_lp_channel.yaml",LP_SOURCE="$LP_ROOT/models/qwen3-8b-base",LP_OUTPUT="$LP_ROOT/results/qwen3_lp_channel" \
+  "$LP_CODE/hpc/lp_quantize.sbatch"
+
+# After qwen3_lp_channel/COMPLETE.json exists, choose one depth (1 to 4):
+export LP_DEPTH=1
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_ARTIFACT="$LP_ROOT/results/qwen3_lp_channel",LP_DEPTH="$LP_DEPTH",LP_OUTPUT="$LP_ROOT/results/qwen3_lp_channel/prefix-$LP_DEPTH" \
+  "$LP_CODE/hpc/lp_reconstruct.sbatch"
+
+# After prefix-1/COMPLETE.json exists:
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_CHECKPOINT="$LP_ROOT/results/qwen3_lp_channel/prefix-$LP_DEPTH",LP_RESULT="$LP_ROOT/results/qwen3_lp_channel/wikitext-$LP_DEPTH.json",LP_PROTOCOL=wikitext \
+  "$LP_CODE/hpc/lp_evaluate.sbatch"
+```
+
+Repeat the selected depth commands for 2, 3, and 4 after inspecting each
+result. Use `LP_PROTOCOL=zeroshot` and a distinct result file for the five
+zero shot tasks, batch size 1 and no few shot examples. To run the next G128
+experiment, use `qwen3_lp_group128.yaml` and a distinct artifact directory.
+For matched monolithic controls, use `qwen3_monolithic.yaml` or
+`qwen3_monolithic_group128.yaml` and pass `LP_BITS=2`, `4`, `6`, or `8`, with
+one distinct output directory per width. The same Slurm quantization and
+reconstruction scripts apply; monolithic depth is always 1. The optional
+array script evaluates already reconstructed `prefix-1` through `prefix-4`
+directories and is not part of the first submission.
+
+WikiText-2 uses `Salesforce/wikitext`, `wikitext-2-raw-v1` test text joined
+with double newlines, no added special tokens, context 2048, stride 512,
+and token weighted sliding window loss. The reference BF16 run scored
+299,077 of 299,078 tokens and reached perplexity 6.219182234107349.
+Zero shot evaluation uses the existing Hugging Face backend of
+`lm-evaluation-harness==0.4.13` for ARC Easy, ARC Challenge, PIQA,
+WinoGrande, and HellaSwag; both `acc` and `acc_norm` are recorded where
+available. Completed evaluation JSON files are reused only for the same
+checkpoint identity and protocol.
+
+Full 8B correctness, peak RAM, disk throughput, reconstructed model loading,
+and task quality still require AWS validation. The local synthetic tests
+exercise streaming behavior but cannot prove the 16 GB host RAM target or the
+22 GiB GPU target. Huffman coding, other quantizer families, Llama selection,
+and activation quantization are deferred.

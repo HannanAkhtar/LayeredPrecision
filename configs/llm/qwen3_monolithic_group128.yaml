@@ -1,0 +1,7 @@
+model_id: Qwen/Qwen3-8B-Base
+revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
+method: monolithic
+bits: [2]
+granularity: group
+group_size: 128
+projections: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
