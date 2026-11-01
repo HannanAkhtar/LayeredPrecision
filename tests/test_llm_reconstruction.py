@@ -10,7 +10,12 @@ from lp_llm.evaluate import _identity
 from lp_llm.model_adapter import SelectionPolicy, expected_qwen3, inventory
 from lp_llm.reconstruct import reconstruct
 from lp_llm.storage import decode_prefix, read_layer, storage_report
+from lp_llm.storage import atomic_json
 from lp_llm.quantize import affine_quantize, encode_layers
+from lp_llm.validate_stage import encoding as validate_encoding
+from lp_llm.validate_stage import reconstruction as validate_reconstruction
+from lp_llm.validate_stage import evaluation as validate_evaluation
+from lp_llm.evaluate import _package_version
 
 
 CONFIG = {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
@@ -163,3 +168,27 @@ def test_source_tensors_are_released_before_next_read(tmp_path, monkeypatch):
     monkeypatch.setattr(encoder, "read_tensor", bounded_read)
     encode(source, tmp_path / "artifact", {"bits": [2], "granularity": "channel"})
     assert count == len(expected_qwen3(CONFIG))
+
+
+@pytest.mark.parametrize("granularity", ["channel", "group"])
+def test_monolithic_batch_stage_validation(tmp_path, granularity):
+    source, artifact = tmp_path / "source", tmp_path / "artifact"
+    make_checkpoint(source)
+    checkpoint, result = artifact / "checkpoint", artifact / "wikitext.json"
+    assert not validate_encoding(artifact, source, 2, granularity)
+    encode(source, artifact, {"method": "monolithic", "bits": [2],
+                              "granularity": granularity, "group_size": 128})
+    assert validate_encoding(artifact, source, 2, granularity)
+    assert not validate_reconstruction(artifact, checkpoint)
+    reconstruct(artifact, checkpoint, 1)
+    assert validate_reconstruction(artifact, checkpoint)
+    assert not validate_evaluation(checkpoint, result)
+    identity = _identity(checkpoint, "wikitext-2-raw-v1") | {
+        "context": 2048, "stride": 512, "datasets": _package_version("datasets"),
+        "join": "\\n\\n", "add_special_tokens": False}
+    atomic_json(result, {"identity": identity, "status": "complete", "corpus_tokens": 10,
+                         "scored_tokens": 9, "perplexity": 2.0})
+    assert validate_evaluation(checkpoint, result)
+    atomic_json(result, {"identity": identity, "status": "incomplete"})
+    with pytest.raises(ValueError, match="different identity"):
+        validate_evaluation(checkpoint, result)

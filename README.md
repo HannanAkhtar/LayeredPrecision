@@ -461,6 +461,34 @@ reconstruction scripts apply; monolithic depth is always 1. The optional
 array script evaluates already reconstructed `prefix-1` through `prefix-4`
 directories and is not part of the first submission.
 
+For the monolithic comparison with fewer simultaneous submissions, use the
+consolidated runners below after the already submitted LP jobs. Each runner
+uses one GPU allocation and processes 2, 4, 6, and 8 bits in order, performing
+encode, reconstruction, and WikiText evaluation for each width. The defaults
+are 12 GB RAM, four CPUs, and 24 hours (the same wall-time request as the
+existing accepted quantization jobs); Slurm command-line options can override
+these requests within the QoS limit. If the allocation ends before all widths
+finish, resubmit the same script. Valid completed stages are skipped; a
+present but invalid artifact stops the job with an error for inspection.
+The runners use distinct result roots and do not touch existing LP results.
+
+```bash
+export LP_ROOT=/shared/makhtar/lp_llm
+export LP_CODE=$LP_ROOT/paper_release
+mkdir -p "$LP_ROOT/logs" "$LP_ROOT/results"
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_ROOT="$LP_ROOT" \
+  "$LP_CODE/hpc/monolithic_channel_batch.sbatch"
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_ROOT="$LP_ROOT" \
+  "$LP_CODE/hpc/monolithic_group128_batch.sbatch"
+```
+
+These are two jobs total. Submit them when the `gpu-long-makhtar-001`
+`GrpSubmitJobs=15` limit has room. Outputs appear under
+`$LP_ROOT/results/qwen3_monolithic_channel/bits-{2,4,6,8}` and the analogous
+`qwen3_monolithic_group128` root. Each width contains the LP artifact, a
+`checkpoint` directory, and `wikitext.json`. No packages are installed by
+the batch scripts; they activate the existing Conda environment.
+
 WikiText-2 uses `Salesforce/wikitext`, `wikitext-2-raw-v1` test text joined
 with double newlines, no added special tokens, context 2048, stride 512,
 and the original baseline window construction: each step ends at `i+stride`
