@@ -1,0 +1,10 @@
+# Controlled symmetric RTN G128 ablation, not a verified RRQ implementation.
+# Restricted signed range q in [-1,0,1] at 2 bits; 4th code unused.
+model_id: Qwen/Qwen3-8B-Base
+revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
+method: lp
+bits: [2, 2, 2, 2]
+granularity: group
+group_size: 128
+quantizer_family: symmetric_rtn
+projections: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
