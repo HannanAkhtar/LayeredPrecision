@@ -55,6 +55,62 @@ def affine_quantize(weight: torch.Tensor, bits: int, granularity: str = "channel
             "scale": torch.cat(scales, 1), "zero_point": torch.cat(zeros, 1)}, decoded
 
 
+def _symmetric_regions(regions: torch.Tensor, bits: int):
+    """Restricted-range signed symmetric RTN; exact zero is a representable level.
+
+    q in [-Q,Q], Q=2^(bits-1)-1. Code q+2^(bits-1) is unsigned for
+    compatibility with the existing bitstream. Code zero is unused.
+    """
+    offset = 1 << (bits - 1)
+    qmax = offset - 1
+    scale = regions.abs().amax(dim=1, keepdim=True) / qmax
+    safe = torch.where(scale > 0, scale, torch.ones_like(scale))
+    signed = torch.round(regions / safe).clamp(-qmax, qmax)
+    codes = (signed + offset).to(torch.uint8 if bits <= 8 else torch.uint16)
+    return codes, signed * scale, scale
+
+
+def symmetric_rtn_quantize(weight: torch.Tensor, bits: int, granularity: str = "group",
+                           group_size: int = 128) -> tuple[dict, torch.Tensor]:
+    """A calibration-free *symmetric* RTN control, not a verified RRQ reproduction.
+
+    Unlike affine asymmetric quantization, the group zero point is a fixed
+    implicit code offset and therefore is not serialized per group.
+    At two bits this is a ternary grid {-s,0,+s} (one unused code).
+    """
+    _check(weight, bits, granularity, group_size)
+    if bits < 2:
+        raise ValueError("symmetric_rtn requires at least 2 bits")
+    x = weight.to(torch.float32)
+    rows, cols = x.shape
+    codes = torch.empty((rows, cols), dtype=torch.uint8 if bits <= 8 else torch.uint16)
+    decoded = torch.empty_like(x)
+    if granularity == "channel":
+        c, d, scale = _symmetric_regions(x, bits)
+        codes.copy_(c)
+        decoded.copy_(d)
+        scales = scale.reshape(rows)
+        group_size = cols
+    else:
+        full, tail = divmod(cols, group_size)
+        groups = []
+        if full:
+            region = x[:, :full * group_size].reshape(rows * full, group_size)
+            c, d, scale = _symmetric_regions(region, bits)
+            codes[:, :full * group_size] = c.reshape(rows, full * group_size)
+            decoded[:, :full * group_size] = d.reshape(rows, full * group_size)
+            groups.append(scale.reshape(rows, full))
+        if tail:
+            c, d, scale = _symmetric_regions(x[:, full * group_size:], bits)
+            codes[:, full * group_size:] = c
+            decoded[:, full * group_size:] = d
+            groups.append(scale.reshape(rows, 1))
+        scales = torch.cat(groups, dim=1)
+    return {"family": "symmetric_rtn", "bits": bits, "granularity": granularity,
+            "group_size": group_size, "shape": [rows, cols], "codes": codes,
+            "scale": scales}, decoded
+
+
 def affine_decode(params: dict) -> torch.Tensor:
     rows, cols = params["shape"]
     bits, granularity, group_size = (params[k] for k in ("bits", "granularity", "group_size"))
@@ -75,7 +131,13 @@ def affine_decode(params: dict) -> torch.Tensor:
         if granularity == "channel":
             start, stop = 0, cols
         scale = params["scale"].reshape(rows, groups)[:, g:g+1].float()
-        zero = params["zero_point"].reshape(rows, groups)[:, g:g+1].float()
+        family = params.get("family", "affine_asymmetric")
+        if family == "symmetric_rtn":
+            zero = float(1 << (bits - 1))
+        elif family == "affine_asymmetric":
+            zero = params["zero_point"].reshape(rows, groups)[:, g:g+1].float()
+        else:
+            raise ValueError(f"Unknown quantizer family {family}")
         contribution = scale * (params["codes"][:, start:stop].float() - zero)
         if "t_min" in params:  # Read artifacts written before zero-scale metadata was elided.
             minimum = params["t_min"].reshape(rows, groups)[:, g:g+1].float()
@@ -85,12 +147,17 @@ def affine_decode(params: dict) -> torch.Tensor:
 
 
 def encode_layers(weight: torch.Tensor, bits: Iterable[int], granularity: str,
-                  group_size: int = 128):
+                  group_size: int = 128, quantizer_family: str = "affine_asymmetric"):
     original = weight.to(torch.float32)
     prefix = torch.zeros_like(original)
     for layer, width in enumerate(bits):
         residual = original - prefix if layer else original
-        params, contribution = affine_quantize(residual, width, granularity, group_size)
+        if quantizer_family == "symmetric_rtn":
+            params, contribution = symmetric_rtn_quantize(residual, width, granularity, group_size)
+        elif quantizer_family == "affine_asymmetric":
+            params, contribution = affine_quantize(residual, width, granularity, group_size)
+        else:
+            raise ValueError(f"Unknown quantizer family {quantizer_family}")
         prefix = prefix + contribution if layer else contribution
         error = original - prefix
         residual_error = residual - contribution
