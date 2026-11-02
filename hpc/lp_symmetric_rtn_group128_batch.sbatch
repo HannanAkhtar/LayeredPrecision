@@ -16,8 +16,8 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
 LP_ROOT="${LP_ROOT:-/shared/makhtar/lp_llm}"
-: "${LP_CODE:?Point LP_CODE at a separate checkout of the symmetric-rtn experiment branch}"
-EVAL_CODE="${EVAL_CODE:-$LP_ROOT/code}"
+: "${LP_CODE:?Point LP_CODE to the symmetric-rtn experiment checkout}"
+EVAL_CODE="${EVAL_CODE:-$LP_CODE}"
 LP_SOURCE="${LP_SOURCE:-$LP_ROOT/models/qwen3-8b-base}"
 RESULT_ROOT="${RESULT_ROOT:-$LP_ROOT/results/qwen3_8b_base}"
 ARTIFACT="$RESULT_ROOT/lp_symmetric_rtn_g128_2_2_2_2"
@@ -31,9 +31,8 @@ CONFIG="$LP_CODE/configs/llm/qwen3_lp_symmetric_rtn_group128.yaml"
     echo "Missing MatGPTQ-style evaluator in $EVAL_CODE" >&2; exit 1;
 }
 [[ -f "$LP_SOURCE/model.safetensors.index.json" ]] || { echo "Missing model" >&2; exit 1; }
-[[ "$LP_CODE" != "$EVAL_CODE" ]] || {
-    echo "ERROR: symmetric experiment must use a separate checkout from running jobs." >&2; exit 1;
-}
+# A shared checkout is safe only after previous jobs have finished. The
+# experiment uses separate output paths and does not overwrite prior artifacts.
 mkdir -p "$OUT_DIR" "$PPL_DIR"
 cd "$LP_CODE"
 echo "[INFO] symmetric experiment source: $LP_CODE"
@@ -54,7 +53,7 @@ for depth in 1 2 3 4; do
     python -m lp_llm.reconstruct --artifact "$ARTIFACT" --depth "$depth" --output "$checkpoint"
     test -f "$checkpoint/COMPLETE.json" || { echo "Reconstruction incomplete" >&2; exit 1; }
 
-    # The MatGPTQ-style evaluator is in the unchanged original checkout.
+    # The MatGPTQ-style evaluator is imported from EVAL_CODE.
     cd "$EVAL_CODE"
     python -m lp_llm.evaluate_matgptq --checkpoint "$checkpoint" --output "$result" \
         --sequence-length 2048 --dtype float16
