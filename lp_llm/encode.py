@@ -80,11 +80,17 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
     group_size = int(settings.get("group_size", 128))
     if granularity not in ("channel", "group") or group_size < 1:
         raise ValueError("Invalid granularity or group size")
+    quantizer_family = settings.get("quantizer_family", "affine_asymmetric")
+    if quantizer_family not in ("affine_asymmetric", "symmetric_rtn"):
+        raise ValueError(f"Unknown quantizer_family: {quantizer_family}")
+    if quantizer_family == "symmetric_rtn" and any(b < 2 for b in bits):
+        raise ValueError("symmetric_rtn requires all layer widths >= 2")
     policy = SelectionPolicy(tuple(settings.get("projections", SelectionPolicy().projections)))
     config, mapping = inventory(source, policy)
     identity = {"format": FORMAT_VERSION, "model_id": settings.get("model_id", QWEN3_MODEL_ID),
                 "revision": settings.get("revision", QWEN3_REVISION), "method": method,
                 "bits": bits, "granularity": granularity, "group_size": group_size,
+                "quantizer_family": quantizer_family,
                 "projections": list(policy.projections),
                 "index_sha256": sha256(source / "model.safetensors.index.json"),
                 "config_sha256": sha256(source / "config.json"),
@@ -141,7 +147,8 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
                 schedules = bits
                 nominal = 0
                 for layer, (params, metrics, prefix) in enumerate(
-                        encode_layers(fp32, schedules, granularity, group_size)):
+                        encode_layers(fp32, schedules, granularity, group_size,
+                                      quantizer_family=quantizer_family)):
                     stream = write_layer(output, tensor_id, layer, params)
                     record["layers"].append(stream)
                     nominal += schedules[layer]
@@ -156,6 +163,7 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
             if stop_after is not None and len(records) >= stop_after:
                 return None
     manifest = {"format": FORMAT_VERSION, "identity": identity, "method": method,
+                "quantizer_family": quantizer_family,
                 "bits": bits, "sidecars": sidecars,
                 "software": identity["software"], "code_revision": _revision(),
                 "tensors": records, "eligible_parameters": sum(r["numel"] for r in records if r["eligible"]),
