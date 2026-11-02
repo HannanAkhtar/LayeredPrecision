@@ -82,19 +82,28 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
     code = root / (stem + ".bin")
     meta = root / (stem + ".safetensors")
     pack_codes(code, params["codes"], params["bits"])
-    zero = params["zero_point"].to(torch.int32) if params["bits"] > 8 else params["zero_point"]
-    # With zero included in every fitted range, scale==0 only for an all-zero
-    # region; its code and zero point are zero, so no fallback value is needed.
-    atomic_safetensors(meta, {"scale": params["scale"], "zero_point": zero})
+    family = params.get("family", "affine_asymmetric")
+    if family == "affine_asymmetric":
+        zero = params["zero_point"].to(torch.int32) if params["bits"] > 8 else params["zero_point"]
+        metadata = {"scale": params["scale"], "zero_point": zero}
+        extra_bytes = zero.numel() * zero.element_size()
+    elif family == "symmetric_rtn":
+        # The fixed signed-to-unsigned code offset is implicit; do not
+        # falsely charge a per-group zero point for this symmetric format.
+        metadata = {"scale": params["scale"]}
+        extra_bytes = 0
+    else:
+        raise ValueError(f"Unknown quantizer family: {family}")
+    atomic_safetensors(meta, metadata)
     return {"code": str(code.relative_to(root)).replace("\\", "/"),
             "metadata": str(meta.relative_to(root)).replace("\\", "/"),
             "code_bytes": code.stat().st_size, "metadata_bytes": meta.stat().st_size,
             "scale_zero_bytes": params["scale"].numel() * params["scale"].element_size() +
-                                zero.numel() * zero.element_size(),
+                                extra_bytes,
             "code_sha256": sha256(code), "metadata_sha256": sha256(meta),
             "bits": params["bits"], "granularity": params["granularity"],
             "group_size": params["group_size"], "shape": params["shape"],
-            "family": "affine_asymmetric", "reconstruction_dtype": "float32",
+            "family": family, "reconstruction_dtype": "float32",
             "rounding": "torch.round_ties_to_even", "zero_in_range": True,
             "zero_scale_decodes_to": 0.0}
 
@@ -108,7 +117,8 @@ def read_layer(root: Path, record: dict, verify: bool = True) -> dict:
     values = load_file(str(meta), device="cpu")
     return {"codes": unpack_codes(code, tuple(record["shape"]), record["bits"]),
             "bits": record["bits"], "granularity": record["granularity"],
-            "group_size": record["group_size"], "shape": record["shape"], **values}
+            "group_size": record["group_size"], "shape": record["shape"],
+            "family": record.get("family", "affine_asymmetric"), **values}
 
 
 def decode_prefix(root: Path, record: dict, depth: int) -> torch.Tensor:
