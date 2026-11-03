@@ -489,6 +489,69 @@ These are two jobs total. Submit them when the `gpu-long-makhtar-001`
 `checkpoint` directory, and `wikitext.json`. No packages are installed by
 the batch scripts; they activate the existing Conda environment.
 
+### AutoRound-compatible plain symmetric RTN G128 LP experiment
+
+The `autoround_rtn_sym` family is separate from the earlier `symmetric_rtn`
+ternary-style ablation and from asymmetric affine quantization. It follows
+[`quant_tensor_rtn_sym` at Intel AutoRound commit `6c824f741be358983baba87aff83f9c5aa0a01e7`](https://github.com/intel/auto-round/blob/6c824f741be358983baba87aff83f9c5aa0a01e7/auto_round/data_type/int.py#L124-L164),
+with row-local 128-element groups and zero padding of each final partial
+group. This is the plain RTN function; AutoRound also has distinct optimized
+RTN and learned quantizers. The [RRQ paper](https://arxiv.org/html/2608.04048)
+reports Qwen3-8B-Base all-RTN perplexities around 16.75, 8.39, 7.22, and
+7.10 for 2/4/6/8 bits, but its exact AutoRound revision and evaluation setup
+are not established as identical to this experiment. Those values are
+external context, not validation targets.
+
+For each group, let `Q = 2^(b-1)`, `n = -min(min(w), 0)`, and
+`p = max(max(w), 0)`. The signed extremum is `n` if `n > p`, otherwise `-p`
+(including ties). The scale is `float16(signed_extremum / Q)`, clipped to
+absolute magnitude at least `1e-5` while retaining its sign; zero groups
+receive a positive minimum scale. Codes are
+`q = clamp(round_ties_to_even(w / scale), -Q, Q-1)`, and the FP32 decoded
+contribution is `q * scale`. Packing stores `u = q + Q`, covering every
+unsigned `b`-bit code; decoding uses `q = u - Q`. No group zero point is
+stored. The encoder uses the FP32 decoded prefix to form the next residual;
+the final checkpoint casts that decoded prefix to BF16. Scale conversion,
+division, multiplication, and final input-dtype conversion match the pinned
+reference function. The tests retain an instrumented, independently
+verifiable copy of its arithmetic and compare scales, codes, and outputs for
+FP32/BF16, outliers, skew, constants, zeros, and partial groups.
+
+Use the existing Conda environment and the locally installed, **untracked**
+`lp_llm/evaluate_matgptq.py` on the AWS checkout. The runner does not install
+packages or add a tracked file at that path. It passes `--sequence-length 2048
+--dtype float16` to that evaluator, whose protocol uses non-overlapping
+WikiText-2 blocks. Run pilot first; submit full only after its output is
+validated. Each phase uses one 12 GB, four CPU, 12-hour GPU allocation by
+default. Override memory, CPU, or time with Slurm command-line flags if the
+QoS permits. The jobs are not submitted by this repository.
+
+```bash
+export LP_ROOT=/shared/makhtar/lp_llm
+export LP_CODE=$LP_ROOT/paper_release
+mkdir -p "$LP_ROOT/logs" "$LP_ROOT/results/qwen3_8b_base"
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_ROOT="$LP_ROOT",LP_PHASE=pilot \
+  "$LP_CODE/hpc/lp_autoround_rtn_group128_batch.sbatch"
+# Inspect the 2-bit result, then submit the remaining prefixes:
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_ROOT="$LP_ROOT",LP_PHASE=full \
+  "$LP_CODE/hpc/lp_autoround_rtn_group128_batch.sbatch"
+```
+
+The hierarchy is stored under
+`results/qwen3_8b_base/lp_autoround_rtn_g128_2_2_2_2/`; reconstructed
+prefixes and MatGPTQ protocol results use the corresponding
+`decoded/lp_autoround_rtn_g128_{bits}bit/` and
+`matgptq_protocol/lp_autoround_rtn_g128_{bits}.json` paths. The runner writes
+`autoround_comparison.json` into the hierarchy directory with nominal and
+effective bits, packed codes and metadata bytes, MSE/SQNR, perplexity, and
+timings. It automatically includes the earlier ternary results when present.
+To compare an asymmetric G128 run, export `ASYM_ARTIFACT` as its hierarchy
+directory and `ASYM_RESULT_PREFIX` as the stem before `_{bits}.json` in
+`matgptq_protocol`. Missing control results appear as null values. Resubmitting
+a phase skips validated stages; a corrupt or conflicting completed stage
+stops with an error. The full phase requires the pilot encoding and does not
+re-submit or modify the existing LP jobs.
+
 WikiText-2 uses `Salesforce/wikitext`, `wikitext-2-raw-v1` test text joined
 with double newlines, no added special tokens, context 2048, stride 512,
 and the original baseline window construction: each step ends at `i+stride`

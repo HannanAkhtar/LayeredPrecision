@@ -16,6 +16,10 @@ from lp_llm.validate_stage import encoding as validate_encoding
 from lp_llm.validate_stage import reconstruction as validate_reconstruction
 from lp_llm.validate_stage import evaluation as validate_evaluation
 from lp_llm.evaluate import _package_version
+from lp_llm.validate_autoround_stage import (encoding as validate_autoround_encoding,
+                                             reconstruction as validate_autoround_reconstruction,
+                                             evaluation as validate_autoround_evaluation)
+from lp_llm.report_autoround import report as autoround_report
 
 
 CONFIG = {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
@@ -119,6 +123,45 @@ def test_lp_checkpoint_identity_rejects_bad_completion_marker(tmp_path):
     marker.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="integrity check failed"):
         _identity(out, "test")
+
+
+def test_autoround_end_to_end_and_stage_validation(tmp_path):
+    source = tmp_path / "source"
+    originals = make_checkpoint(source)
+    artifact = tmp_path / "lp_autoround_rtn_g128_2_2_2_2"
+    settings = {"method": "lp", "bits": [2, 2, 2, 2], "granularity": "group",
+                "group_size": 128, "quantizer_family": "autoround_rtn_sym"}
+    manifest = encode(source, artifact, settings)
+    assert validate_autoround_encoding(artifact, source)
+    assert manifest["identity"]["quantizer_spec"]["scale_dtype"] == "float16"
+    result_root = tmp_path
+    evaluator = tmp_path / "evaluate_matgptq.py"
+    evaluator.write_text("# local evaluator identity fixture\n")
+    for depth in range(1, 5):
+        bits = depth * 2
+        out = result_root / "decoded" / f"lp_autoround_rtn_g128_{bits}bit"
+        index = reconstruct(artifact, out, depth)
+        assert validate_autoround_reconstruction(artifact, out, depth)
+        for record in manifest["tensors"]:
+            name = record["name"]
+            actual = load_file(str(out / index["weight_map"][name]))[name]
+            expected = (decode_prefix(artifact, record, depth).bfloat16()
+                        if record["eligible"] else originals[name])
+            assert torch.equal(actual, expected)
+        result = result_root / "matgptq_protocol" / f"lp_autoround_rtn_g128_{bits}.json"
+        result.parent.mkdir(exist_ok=True)
+        result.write_text(json.dumps({"perplexity": 10.0 + depth}))
+        with pytest.raises(ValueError, match="unmarked"):
+            validate_autoround_evaluation(artifact, out, result, evaluator, depth)
+        assert validate_autoround_evaluation(artifact, out, result, evaluator, depth, mark=True)
+        assert validate_autoround_evaluation(artifact, out, result, evaluator, depth)
+    summary = autoround_report(artifact, result_root)
+    assert [r["perplexity"] for r in summary["prefixes"]] == [11., 12., 13., 14.]
+    assert all(r["packed_code_bytes"] > 0 and r["metadata_and_framing_bytes"] > 0
+               for r in summary["prefixes"])
+    result.write_text(json.dumps({"perplexity": 99.0}))
+    with pytest.raises(ValueError, match="identity/content"):
+        validate_autoround_evaluation(artifact, out, result, evaluator, depth)
 
 
 def test_index_detects_missing_or_unexpected_keys(tmp_path):

@@ -6,6 +6,7 @@ import math
 from collections.abc import Iterable
 
 import torch
+import torch.nn.functional as F
 
 from layered_quantization import IntegerFormat
 
@@ -111,6 +112,48 @@ def symmetric_rtn_quantize(weight: torch.Tensor, bits: int, granularity: str = "
             "scale": scales}, decoded
 
 
+AUTOROUND_RTN_SOURCE = "intel/auto-round@6c824f741be358983baba87aff83f9c5aa0a01e7:auto_round/data_type/int.py:quant_tensor_rtn_sym"
+
+
+def autoround_rtn_sym_quantize(weight: torch.Tensor, bits: int, granularity: str = "group",
+                               group_size: int = 128) -> tuple[dict, torch.Tensor]:
+    """Plain AutoRound signed RTN, including its signed FP16 scale and zero padding.
+
+    The stored code is signed_integer + 2**(bits-1); the offset is implicit.
+    No group zero point is stored. The returned reconstruction has input dtype,
+    matching the reference quantize/dequantize function.
+    """
+    _check(weight, bits, granularity, group_size)
+    if bits < 2:
+        raise ValueError("autoround_rtn_sym requires at least 2 bits")
+    rows, cols = weight.shape
+    size = cols if granularity == "channel" else group_size
+    pad_len = (-cols) % size
+    padded = F.pad(weight, (0, pad_len)) if pad_len else weight
+    regions = padded.reshape(-1, size)
+    maxq = 1 << (bits - 1)
+    wmin = torch.clamp(regions.min(-1)[0], max=0)
+    wmax = torch.clamp(regions.max(-1)[0], min=0)
+    negative_abs = -wmin
+    max_v = (2 * (wmax < negative_abs).int() - 1) * torch.maximum(wmax, negative_abs)
+    scale = (max_v / maxq).to(torch.float16)
+    scale = torch.where(scale < 0, torch.clamp(scale, max=-1e-5),
+                        torch.clamp(scale, min=1e-5))
+    signed = regions.div(scale.unsqueeze(-1)).round_().clamp_(-maxq, maxq - 1)
+    # AutoRound multiplies the rounded values by the converted scale before
+    # casting back to the input dtype. Keep that operation order.
+    reconstructed = signed.clone().mul_(scale.unsqueeze(-1)).to(weight.dtype)
+    codes = (signed.to(torch.int32) + maxq).to(torch.uint8 if bits <= 8 else torch.uint16)
+    codes = codes.reshape(rows, -1)[:, :cols].contiguous()
+    reconstructed = reconstructed.reshape(rows, -1)[:, :cols].contiguous()
+    scale = scale.reshape(rows, -1)
+    if granularity == "channel":
+        scale = scale.reshape(rows)
+    return {"family": "autoround_rtn_sym", "bits": bits, "granularity": granularity,
+            "group_size": size, "shape": [rows, cols], "codes": codes,
+            "scale": scale}, reconstructed
+
+
 def affine_decode(params: dict) -> torch.Tensor:
     rows, cols = params["shape"]
     bits, granularity, group_size = (params[k] for k in ("bits", "granularity", "group_size"))
@@ -132,7 +175,7 @@ def affine_decode(params: dict) -> torch.Tensor:
             start, stop = 0, cols
         scale = params["scale"].reshape(rows, groups)[:, g:g+1].float()
         family = params.get("family", "affine_asymmetric")
-        if family == "symmetric_rtn":
+        if family in ("symmetric_rtn", "autoround_rtn_sym"):
             zero = float(1 << (bits - 1))
         elif family == "affine_asymmetric":
             zero = params["zero_point"].reshape(rows, groups)[:, g:g+1].float()
@@ -154,6 +197,8 @@ def encode_layers(weight: torch.Tensor, bits: Iterable[int], granularity: str,
         residual = original - prefix if layer else original
         if quantizer_family == "symmetric_rtn":
             params, contribution = symmetric_rtn_quantize(residual, width, granularity, group_size)
+        elif quantizer_family == "autoround_rtn_sym":
+            params, contribution = autoround_rtn_sym_quantize(residual, width, granularity, group_size)
         elif quantizer_family == "affine_asymmetric":
             params, contribution = affine_quantize(residual, width, granularity, group_size)
         else:

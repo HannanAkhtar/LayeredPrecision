@@ -20,6 +20,7 @@ from . import FORMAT_VERSION, QWEN3_MODEL_ID, QWEN3_REVISION
 from .diagnostics import elapsed, peak_rss_bytes, started
 from .model_adapter import SelectionPolicy, inventory, read_tensor
 from .quantize import encode_layers
+from .quantize import AUTOROUND_RTN_SOURCE
 from .storage import SIDECARS, atomic_json, atomic_safetensors, copy_sidecars, sha256, storage_report
 
 
@@ -81,10 +82,10 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
     if granularity not in ("channel", "group") or group_size < 1:
         raise ValueError("Invalid granularity or group size")
     quantizer_family = settings.get("quantizer_family", "affine_asymmetric")
-    if quantizer_family not in ("affine_asymmetric", "symmetric_rtn"):
+    if quantizer_family not in ("affine_asymmetric", "symmetric_rtn", "autoround_rtn_sym"):
         raise ValueError(f"Unknown quantizer_family: {quantizer_family}")
-    if quantizer_family == "symmetric_rtn" and any(b < 2 for b in bits):
-        raise ValueError("symmetric_rtn requires all layer widths >= 2")
+    if quantizer_family in ("symmetric_rtn", "autoround_rtn_sym") and any(b < 2 for b in bits):
+        raise ValueError(f"{quantizer_family} requires all layer widths >= 2")
     policy = SelectionPolicy(tuple(settings.get("projections", SelectionPolicy().projections)))
     config, mapping = inventory(source, policy)
     identity = {"format": FORMAT_VERSION, "model_id": settings.get("model_id", QWEN3_MODEL_ID),
@@ -100,6 +101,12 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
                 "software": _versions(), "implementation_sha256": _code_fingerprint(),
                 "sidecar_sha256": {name: sha256(source / name) for name in sorted(SIDECARS)
                                    if (source / name).is_file()}}
+    if quantizer_family == "autoround_rtn_sym":
+        identity["quantizer_spec"] = {
+            "implementation": AUTOROUND_RTN_SOURCE, "scale_dtype": "float16",
+            "scale_threshold": 1e-5, "rounding": "torch.round_ties_to_even",
+            "signed_code_mapping": "unsigned=signed+2**(bits-1)",
+            "padding": "right_zero_per_row"}
     output.mkdir(parents=True, exist_ok=True)
     run_path = output / "run.json"
     if run_path.exists():

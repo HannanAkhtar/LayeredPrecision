@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
-from .quantize import affine_decode
+from .quantize import AUTOROUND_RTN_SOURCE, affine_decode
 
 
 CHUNK = 1 << 20  # divisible by eight: independent chunks preserve bit alignment
@@ -87,7 +87,7 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
         zero = params["zero_point"].to(torch.int32) if params["bits"] > 8 else params["zero_point"]
         metadata = {"scale": params["scale"], "zero_point": zero}
         extra_bytes = zero.numel() * zero.element_size()
-    elif family == "symmetric_rtn":
+    elif family in ("symmetric_rtn", "autoround_rtn_sym"):
         # The fixed signed-to-unsigned code offset is implicit; do not
         # falsely charge a per-group zero point for this symmetric format.
         metadata = {"scale": params["scale"]}
@@ -95,7 +95,7 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
     else:
         raise ValueError(f"Unknown quantizer family: {family}")
     atomic_safetensors(meta, metadata)
-    return {"code": str(code.relative_to(root)).replace("\\", "/"),
+    record = {"code": str(code.relative_to(root)).replace("\\", "/"),
             "metadata": str(meta.relative_to(root)).replace("\\", "/"),
             "code_bytes": code.stat().st_size, "metadata_bytes": meta.stat().st_size,
             "scale_zero_bytes": params["scale"].numel() * params["scale"].element_size() +
@@ -106,6 +106,12 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
             "family": family, "reconstruction_dtype": "float32",
             "rounding": "torch.round_ties_to_even", "zero_in_range": True,
             "zero_scale_decodes_to": 0.0}
+    if family == "autoround_rtn_sym":
+        record.update(scale_dtype="float16", signed_code_offset=1 << (params["bits"] - 1),
+                      signed_range=[-(1 << (params["bits"] - 1)), (1 << (params["bits"] - 1)) - 1],
+                      scale_threshold=1e-5, implementation=AUTOROUND_RTN_SOURCE,
+                      padding="right_zero_per_row", rounding="torch.round_ties_to_even")
+    return record
 
 
 def read_layer(root: Path, record: dict, verify: bool = True) -> dict:
@@ -115,6 +121,14 @@ def read_layer(root: Path, record: dict, verify: bool = True) -> dict:
                    sha256(meta) != record["metadata_sha256"]):
         raise ValueError(f"Corrupt LP layer: {code}")
     values = load_file(str(meta), device="cpu")
+    if record.get("family") == "autoround_rtn_sym":
+        expected_offset = 1 << (record["bits"] - 1)
+        if (record.get("scale_dtype") != "float16" or
+                record.get("signed_code_offset") != expected_offset or
+                record.get("implementation") != AUTOROUND_RTN_SOURCE or
+                record.get("rounding") != "torch.round_ties_to_even" or
+                set(values) != {"scale"} or values["scale"].dtype != torch.float16):
+            raise ValueError("Invalid AutoRound RTN layer metadata")
     return {"codes": unpack_codes(code, tuple(record["shape"]), record["bits"]),
             "bits": record["bits"], "granularity": record["granularity"],
             "group_size": record["group_size"], "shape": record["shape"],
