@@ -7,6 +7,7 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
+from .rtn_reproduction import MODES, quantize_base
 
 from layered_quantization import IntegerFormat
 
@@ -175,7 +176,7 @@ def affine_decode(params: dict) -> torch.Tensor:
             start, stop = 0, cols
         scale = params["scale"].reshape(rows, groups)[:, g:g+1].float()
         family = params.get("family", "affine_asymmetric")
-        if family in ("symmetric_rtn", "autoround_rtn_sym"):
+        if family in ("symmetric_rtn", "autoround_rtn_sym", *MODES):
             zero = float(1 << (bits - 1))
         elif family == "affine_asymmetric":
             zero = params["zero_point"].reshape(rows, groups)[:, g:g+1].float()
@@ -190,7 +191,8 @@ def affine_decode(params: dict) -> torch.Tensor:
 
 
 def encode_layers(weight: torch.Tensor, bits: Iterable[int], granularity: str,
-                  group_size: int = 128, quantizer_family: str = "affine_asymmetric"):
+                  group_size: int = 128, quantizer_family: str = "affine_asymmetric",
+                  compute_device: str = "cpu"):
     original = weight.to(torch.float32)
     prefix = torch.zeros_like(original)
     for layer, width in enumerate(bits):
@@ -199,19 +201,34 @@ def encode_layers(weight: torch.Tensor, bits: Iterable[int], granularity: str,
             params, contribution = symmetric_rtn_quantize(residual, width, granularity, group_size)
         elif quantizer_family == "autoround_rtn_sym":
             params, contribution = autoround_rtn_sym_quantize(residual, width, granularity, group_size)
+        elif quantizer_family in MODES:
+            if layer or width != 2 or granularity != "group":
+                raise ValueError("Phase 1 modes require a single 2-bit G128 base")
+            params, contribution = quantize_base(weight, quantizer_family,
+                                                  group_size=group_size,
+                                                  compute_device=compute_device)
         elif quantizer_family == "affine_asymmetric":
             params, contribution = affine_quantize(residual, width, granularity, group_size)
         else:
             raise ValueError(f"Unknown quantizer family {quantizer_family}")
         prefix = prefix + contribution if layer else contribution
-        error = original - prefix
-        residual_error = residual - contribution
+        error = original - prefix.float()
+        residual_error = residual.float() - contribution.float()
         bf16_error = original - prefix.to(torch.bfloat16).float()
         signal = float(original.square().mean())
         mse = float(error.square().mean())
-        yield params, {"layer": layer, "bits": width, "nominal_bits": None,
+        metrics = {"layer": layer, "bits": width, "nominal_bits": None,
                        "parameter_mse_fp32": mse,
                        "parameter_mse_after_bf16_cast": float(bf16_error.square().mean()),
                        "sqnr_db_fp32": 10 * math.log10(signal / mse) if mse and signal else (None if not mse else 0.0),
                        "residual_energy_fp32": float(residual.square().mean()),
-                       "residual_mse_fp32": float(residual_error.square().mean())}, prefix
+                       "residual_mse_fp32": float(residual_error.square().mean())}
+        if quantizer_family in MODES:
+            independent = affine_decode(params)
+            before = independent - contribution.float()
+            after = independent.to(contribution.dtype).to(torch.bfloat16).float() - contribution.to(torch.bfloat16).float()
+            metrics.update(qdq_decode_max_abs_before_cast=float(before.abs().max()),
+                           qdq_decode_rmse_before_cast=float(torch.sqrt(before.square().mean())),
+                           qdq_decode_max_abs_after_bf16_cast=float(after.abs().max()),
+                           qdq_decode_rmse_after_bf16_cast=float(torch.sqrt(after.square().mean())))
+        yield params, metrics, prefix

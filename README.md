@@ -489,6 +489,10 @@ These are two jobs total. Submit them when the `gpu-long-makhtar-001`
 `checkpoint` directory, and `wikitext.json`. No packages are installed by
 the batch scripts; they activate the existing Conda environment.
 
+For the separate 2-bit RTN reproduction and diagnostic workflow (B0–B3),
+including the consolidated screen and selected full-evaluation Slurm
+commands, see [Phase 1 RTN reproduction](docs/rtn_reproduction_phase1.md).
+
 ### AutoRound-compatible plain symmetric RTN G128 LP experiment
 
 The `autoround_rtn_sym` family is separate from the earlier `symmetric_rtn`

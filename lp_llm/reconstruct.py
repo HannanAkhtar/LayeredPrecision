@@ -13,6 +13,7 @@ import torch
 from . import FORMAT_VERSION
 from .diagnostics import elapsed, peak_rss_bytes, started
 from .storage import atomic_json, atomic_safetensors, decode_prefix, sha256
+from .rtn_reproduction import MODES
 
 
 def reconstruct(artifact: Path, output: Path, depth: int) -> dict:
@@ -50,7 +51,11 @@ def reconstruct(artifact: Path, output: Path, depth: int) -> dict:
                 mapping[name] = filename
                 continue
         if record["eligible"]:
-            tensor = decode_prefix(artifact, record, depth).to(dtype=torch.bfloat16)
+            tensor = decode_prefix(artifact, record, depth)
+            if manifest.get("quantizer_family") in MODES:
+                qdq_dtype = MODES[manifest["quantizer_family"]][1]
+                tensor = tensor.to(qdq_dtype)
+            tensor = tensor.to(dtype=torch.bfloat16)
         else:
             shared = artifact / record["shared"]
             if sha256(shared) != record["shared_sha256"]:

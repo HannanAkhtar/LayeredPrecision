@@ -14,6 +14,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from .quantize import AUTOROUND_RTN_SOURCE, affine_decode
+from .rtn_reproduction import AUTOROUND_COMMIT, MODES
 
 
 CHUNK = 1 << 20  # divisible by eight: independent chunks preserve bit alignment
@@ -87,7 +88,7 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
         zero = params["zero_point"].to(torch.int32) if params["bits"] > 8 else params["zero_point"]
         metadata = {"scale": params["scale"], "zero_point": zero}
         extra_bytes = zero.numel() * zero.element_size()
-    elif family in ("symmetric_rtn", "autoround_rtn_sym"):
+    elif family in ("symmetric_rtn", "autoround_rtn_sym", *MODES):
         # The fixed signed-to-unsigned code offset is implicit; do not
         # falsely charge a per-group zero point for this symmetric format.
         metadata = {"scale": params["scale"]}
@@ -111,6 +112,14 @@ def write_layer(root: Path, tensor_id: int, layer: int, params: dict) -> dict:
                       signed_range=[-(1 << (params["bits"] - 1)), (1 << (params["bits"] - 1)) - 1],
                       scale_threshold=1e-5, implementation=AUTOROUND_RTN_SOURCE,
                       padding="right_zero_per_row", rounding="torch.round_ties_to_even")
+    if family in MODES:
+        record.update(scale_dtype="float16", signed_code_offset=2,
+                      signed_range=[-2, 1], scale_threshold=1e-5,
+                      implementation=f"intel/auto-round@{AUTOROUND_COMMIT}",
+                      algorithm=params["algorithm"], qdq_dtype=params["qdq_dtype"],
+                      compute_device=params["compute_device"],
+                      checkpoint_materialization="qdq_dtype_then_bfloat16",
+                      padding="right_zero_per_row", rounding="torch.round_ties_to_even")
     return record
 
 
@@ -129,6 +138,15 @@ def read_layer(root: Path, record: dict, verify: bool = True) -> dict:
                 record.get("rounding") != "torch.round_ties_to_even" or
                 set(values) != {"scale"} or values["scale"].dtype != torch.float16):
             raise ValueError("Invalid AutoRound RTN layer metadata")
+    if record.get("family") in MODES:
+        expected_algorithm, expected_dtype = MODES[record["family"]]
+        if (record.get("scale_dtype") != "float16" or
+                record.get("signed_code_offset") != 2 or
+                record.get("implementation") != f"intel/auto-round@{AUTOROUND_COMMIT}" or
+                record.get("algorithm") != expected_algorithm or
+                record.get("qdq_dtype") != str(expected_dtype).removeprefix("torch.") or
+                set(values) != {"scale"} or values["scale"].dtype != torch.float16):
+            raise ValueError("Invalid Phase 1 RTN layer metadata")
     return {"codes": unpack_codes(code, tuple(record["shape"]), record["bits"]),
             "bits": record["bits"], "granularity": record["granularity"],
             "group_size": record["group_size"], "shape": record["shape"],

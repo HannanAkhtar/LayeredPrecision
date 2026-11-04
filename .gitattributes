@@ -1,0 +1,2 @@
+*.sbatch text eol=lf
+tests/fixtures/autoround_*.py text eol=lf

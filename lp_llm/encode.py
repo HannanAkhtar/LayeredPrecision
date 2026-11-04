@@ -21,6 +21,7 @@ from .diagnostics import elapsed, peak_rss_bytes, started
 from .model_adapter import SelectionPolicy, inventory, read_tensor
 from .quantize import encode_layers
 from .quantize import AUTOROUND_RTN_SOURCE
+from .rtn_reproduction import AUTOROUND_COMMIT, MODES
 from .storage import SIDECARS, atomic_json, atomic_safetensors, copy_sidecars, sha256, storage_report
 
 
@@ -46,6 +47,7 @@ def _code_fingerprint() -> str:
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent.parent
     for name in ("layered_quantization.py", "lp_llm/model_adapter.py", "lp_llm/quantize.py",
+                 "lp_llm/rtn_reproduction.py",
                  "lp_llm/storage.py", "lp_llm/encode.py"):
         digest.update(name.encode())
         digest.update((root / name).read_bytes())
@@ -82,10 +84,20 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
     if granularity not in ("channel", "group") or group_size < 1:
         raise ValueError("Invalid granularity or group size")
     quantizer_family = settings.get("quantizer_family", "affine_asymmetric")
-    if quantizer_family not in ("affine_asymmetric", "symmetric_rtn", "autoround_rtn_sym"):
+    if quantizer_family not in ("affine_asymmetric", "symmetric_rtn", "autoround_rtn_sym", *MODES):
         raise ValueError(f"Unknown quantizer_family: {quantizer_family}")
     if quantizer_family in ("symmetric_rtn", "autoround_rtn_sym") and any(b < 2 for b in bits):
         raise ValueError(f"{quantizer_family} requires all layer widths >= 2")
+    if quantizer_family in MODES and (bits != [2] or granularity != "group" or group_size != 128):
+        raise ValueError("Phase 1 modes require bits=[2], group granularity, group_size=128")
+    compute_device = settings.get("compute_device", "cpu")
+    if quantizer_family in MODES and compute_device not in ("cpu", "cuda"):
+        raise ValueError("Phase 1 compute_device must be cpu or cuda")
+    if quantizer_family == "autoround_opt_fp16":
+        expected_opt = {"iters": 0, "disable_opt_rtn": False,
+                        "enable_neuqi": False, "imatrix": None, "search_grid": 181}
+        if settings.get("opt_rtn_settings", expected_opt) != expected_opt:
+            raise ValueError("Unsupported optimized RTN settings")
     policy = SelectionPolicy(tuple(settings.get("projections", SelectionPolicy().projections)))
     config, mapping = inventory(source, policy)
     identity = {"format": FORMAT_VERSION, "model_id": settings.get("model_id", QWEN3_MODEL_ID),
@@ -107,6 +119,25 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
             "scale_threshold": 1e-5, "rounding": "torch.round_ties_to_even",
             "signed_code_mapping": "unsigned=signed+2**(bits-1)",
             "padding": "right_zero_per_row"}
+    if quantizer_family in MODES:
+        algorithm, dtype = MODES[quantizer_family]
+        identity["experiment_id"] = settings.get("experiment_id", quantizer_family)
+        identity["quantizer_spec"] = {
+            "implementation": f"intel/auto-round@{AUTOROUND_COMMIT}",
+            "algorithm": algorithm, "source_dtype": "bfloat16",
+            "quantization_input_dtype": str(dtype).removeprefix("torch."),
+            "statistics_dtype": str(dtype).removeprefix("torch."),
+            "scale_calculation_dtype": str(dtype).removeprefix("torch."),
+            "stored_scale_dtype": "float16",
+            "rounding_dtype": "float32" if dtype == torch.bfloat16 else "float16",
+            "qdq_multiply_dtype": "float32" if dtype == torch.bfloat16 else "float16",
+            "in_memory_reconstruction_dtype": str(dtype).removeprefix("torch."),
+            "checkpoint_dtype": "bfloat16", "checkpoint_materialization": "qdq_dtype_then_bfloat16",
+            "evaluation_dtype": "float16", "compute_device": compute_device,
+            "group_size": 128, "scale_threshold": 1e-5, "rounding": "torch.round_ties_to_even",
+            "signed_code_mapping": "unsigned=signed+2", "padding": "right_zero_per_row"}
+        if quantizer_family == "autoround_opt_fp16":
+            identity["quantizer_spec"]["opt_rtn_settings"] = expected_opt
     output.mkdir(parents=True, exist_ok=True)
     run_path = output / "run.json"
     if run_path.exists():
@@ -147,22 +178,23 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
                 del original
             else:
                 from .storage import write_layer
-                fp32 = original.float()
+                quantization_source = original if quantizer_family in MODES else original.float()
                 del original
                 record["layers"] = []
                 record["metrics"] = []
                 schedules = bits
                 nominal = 0
                 for layer, (params, metrics, prefix) in enumerate(
-                        encode_layers(fp32, schedules, granularity, group_size,
-                                      quantizer_family=quantizer_family)):
+                        encode_layers(quantization_source, schedules, granularity, group_size,
+                                      quantizer_family=quantizer_family,
+                                      compute_device=compute_device)):
                     stream = write_layer(output, tensor_id, layer, params)
                     record["layers"].append(stream)
                     nominal += schedules[layer]
                     metrics["nominal_bits"] = nominal
                     record["metrics"].append(metrics)
                     del params, prefix
-                del fp32
+                del quantization_source
             atomic_json(path, record)  # completion marker is written last
             records.append(record)
             print(f"[{len(records)}/{len(mapping)}] {name} ({'eligible' if record['eligible'] else 'shared'})", flush=True)
@@ -190,6 +222,16 @@ def encode(source: Path, output: Path, settings: dict, *, stop_after: int | None
                            sqnr_db_fp32=(10 * math.log10(signal / mse) if mse and signal
                                          else None if not mse else 0.0))
             manifest["prefix_diagnostics"].append(metrics)
+        if quantizer_family in MODES:
+            for diagnostic in manifest["prefix_diagnostics"]:
+                depth = diagnostic["depth"] - 1
+                diagnostic["qdq_decode_max_abs_before_cast"] = max(
+                    r["metrics"][depth]["qdq_decode_max_abs_before_cast"] for r in eligible)
+                diagnostic["qdq_decode_max_abs_after_bf16_cast"] = max(
+                    r["metrics"][depth]["qdq_decode_max_abs_after_bf16_cast"] for r in eligible)
+                for key in ("qdq_decode_rmse_before_cast", "qdq_decode_rmse_after_bf16_cast"):
+                    diagnostic[key] = math.sqrt(sum(
+                        r["numel"] * r["metrics"][depth][key] ** 2 for r in eligible) / count)
     atomic_json(output / "manifest.json", manifest)
     atomic_json(output / "COMPLETE.json", {"manifest_sha256": sha256(output / "manifest.json")})
     report = storage_report(output, manifest)

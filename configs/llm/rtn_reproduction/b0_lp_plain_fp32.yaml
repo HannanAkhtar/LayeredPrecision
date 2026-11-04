@@ -1,0 +1,15 @@
+experiment_id: b0_lp_plain_fp32
+role: established_control
+model_id: Qwen/Qwen3-8B-Base
+revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
+quantizer_family: autoround_rtn_sym
+granularity: group
+group_size: 128
+bits: [2]
+quantization_input_dtype: float32
+checkpoint_dtype: bfloat16
+evaluation_dtype: float16
+established_full_perplexity: 9730.84365
+existing_artifact: lp_autoround_rtn_g128_2_2_2_2
+existing_checkpoint: decoded/lp_autoround_rtn_g128_2bit
+existing_result: matgptq_protocol/lp_autoround_rtn_g128_2.json

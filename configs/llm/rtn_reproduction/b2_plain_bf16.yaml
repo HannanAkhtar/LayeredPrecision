@@ -1,0 +1,12 @@
+experiment_id: b2_plain_bf16
+model_id: Qwen/Qwen3-8B-Base
+revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
+method: lp
+bits: [2]
+granularity: group
+group_size: 128
+expected_quantized_parameters: 6945767424
+expected_excluded_parameters: 1244967936
+quantizer_family: autoround_plain_bf16
+compute_device: cuda
+projections: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
