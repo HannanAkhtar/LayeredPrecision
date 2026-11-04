@@ -23,6 +23,7 @@ def aggregate(result_root: Path) -> dict:
     b0_storage = _read(b0_artifact / "storage_report.json")
     b0_full = _read(result_root / "matgptq_protocol" / "lp_autoround_rtn_g128_2.json")
     rows = [{"experiment_id": "b0_lp_plain_fp32", "algorithm": "plain RTN",
+             "checkpoint_dtype": "bfloat16",
              "quantization_input_dtype": "float32",
              "parameter_mse_fp32": (b0_manifest["prefix_diagnostics"][0]["parameter_mse_fp32"]
                                     if b0_manifest else None),
@@ -44,18 +45,31 @@ def aggregate(result_root: Path) -> dict:
         storage = report.get("physical_storage") or {}
         rows.append({"experiment_id": experiment_id, "status": report["validation_status"],
                      "algorithm": spec.get("algorithm"),
+                     "checkpoint_dtype": "bfloat16",
                      "quantization_input_dtype": spec.get("quantization_input_dtype"),
                      "parameter_mse_fp32": report.get("parameter_mse_fp32"),
                      "sqnr_db_fp32": report.get("sqnr_db_fp32"),
                      "effective_bits_per_total_parameter": storage.get("effective_bits_per_total_parameter"),
                      "diagnostic_perplexity": diagnostic.get("perplexity"),
                      "full_perplexity": report.get("full_wikitext2_perplexity")})
+        if experiment_id == "b3_opt_fp16":
+            materialization = _read(result_root / "rtn_reproduction" / experiment_id /
+                                    "materialization_fp16" / "comparison.json")
+            if materialization:
+                rows.append({"experiment_id": "b3_opt_fp16_fp16_checkpoint",
+                             "algorithm": spec.get("algorithm"), "checkpoint_dtype": "float16",
+                             "quantization_input_dtype": spec.get("quantization_input_dtype"),
+                             "parameter_mse_fp32": report.get("parameter_mse_fp32"),
+                             "sqnr_db_fp32": report.get("sqnr_db_fp32"),
+                             "effective_bits_per_total_parameter": storage.get("effective_bits_per_total_parameter"),
+                             "diagnostic_perplexity": materialization["diagnostic"]["fp16_checkpoint"]["perplexity"],
+                             "full_perplexity": None})
     return {"protocol": "MatGPTQ-style WikiText-2, nonoverlap 2048, FP16 inference for full results",
             "rows": rows}
 
 
 def markdown(value: dict) -> str:
-    columns = ("experiment_id", "algorithm", "quantization_input_dtype", "parameter_mse_fp32",
+    columns = ("experiment_id", "algorithm", "quantization_input_dtype", "checkpoint_dtype", "parameter_mse_fp32",
                "sqnr_db_fp32", "effective_bits_per_total_parameter", "diagnostic_perplexity",
                "full_perplexity")
     lines = ["| " + " | ".join(columns) + " |", "|" + "|".join("---" for _ in columns) + "|"]

@@ -32,7 +32,7 @@ def logit_stats(reference: torch.Tensor, candidate: torch.Tensor, tokens: torch.
 
 
 def compare(source: Path, artifact: Path, checkpoint: Path, tokens: torch.Tensor,
-            device: str = "cuda:0") -> dict:
+            device: str = "cuda:0", fp16_checkpoint: Path | None = None) -> dict:
     from transformers import AutoModelForCausalLM
 
     manifest = json.loads((artifact / "manifest.json").read_text())
@@ -42,9 +42,14 @@ def compare(source: Path, artifact: Path, checkpoint: Path, tokens: torch.Tensor
     policy = SelectionPolicy()
     records = {record["name"]: record for record in manifest["tensors"]}
     results = {}
-    for variant in ("upstream_in_memory", "lp_in_memory", "saved_reloaded"):
-        path = checkpoint if variant == "saved_reloaded" else source
-        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16,
+    variants = ("upstream_in_memory", "lp_in_memory", "saved_reloaded")
+    if fp16_checkpoint is not None:
+        variants += ("saved_fp16_reloaded",)
+    for variant in variants:
+        path = (fp16_checkpoint if variant == "saved_fp16_reloaded" else
+                checkpoint if variant == "saved_reloaded" else source)
+        load_dtype = torch.float16 if variant == "saved_fp16_reloaded" else torch.bfloat16
+        model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=load_dtype,
                                                        low_cpu_mem_usage=True, device_map=device)
         if variant != "saved_reloaded":
             with torch.no_grad():
@@ -74,6 +79,11 @@ def compare(source: Path, artifact: Path, checkpoint: Path, tokens: torch.Tensor
               "source_index_sha256": sha256(source / "model.safetensors.index.json"),
               "artifact_manifest_sha256": sha256(artifact / "manifest.json"),
               "checkpoint_identity": _identity(checkpoint, "rtn-logit-parity")}
+    if fp16_checkpoint is not None:
+        output["saved_fp16_reloaded"] = logit_stats(reference, results["saved_fp16_reloaded"], tokens)
+        output["saved_fp16_vs_lp_in_memory"] = logit_stats(
+            results["lp_in_memory"], results["saved_fp16_reloaded"], tokens)
+        output["fp16_checkpoint_identity"] = _identity(fp16_checkpoint, "rtn-logit-parity-fp16")
     if any(not math.isfinite(v["mean_token_cross_entropy"]) for v in
            (output["upstream_in_memory"], output["lp_in_memory"], output["saved_reloaded"])):
         raise ValueError("Nonfinite logit diagnostic")
@@ -85,6 +95,7 @@ def main():
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--fp16-checkpoint", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tokens", default="1,2,3,4,5,6,7,8")
     parser.add_argument("--device", default="cuda:0")
@@ -92,7 +103,8 @@ def main():
     tokens = torch.tensor([[int(x) for x in args.tokens.split(",")]], dtype=torch.long)
     if tokens.shape[1] < 2:
         raise ValueError("Need at least two input tokens")
-    value = compare(args.source, args.artifact, args.checkpoint, tokens, args.device)
+    value = compare(args.source, args.artifact, args.checkpoint, tokens, args.device,
+                    args.fp16_checkpoint)
     atomic_json(args.output, value)
     print(json.dumps({key: value[key] for key in
                       ("lp_in_memory", "saved_reloaded", "saved_vs_lp_in_memory")}, indent=2))

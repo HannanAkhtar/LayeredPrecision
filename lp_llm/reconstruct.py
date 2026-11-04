@@ -16,7 +16,8 @@ from .storage import atomic_json, atomic_safetensors, decode_prefix, sha256
 from .rtn_reproduction import MODES
 
 
-def reconstruct(artifact: Path, output: Path, depth: int) -> dict:
+def reconstruct(artifact: Path, output: Path, depth: int,
+                checkpoint_dtype: str = "bfloat16") -> dict:
     artifact, output = Path(artifact), Path(output)
     if artifact.resolve() == output.resolve():
         raise ValueError("Output must differ from LP artifact")
@@ -26,8 +27,14 @@ def reconstruct(artifact: Path, output: Path, depth: int) -> dict:
     manifest = json.loads((artifact / "manifest.json").read_text())
     if manifest["format"] != FORMAT_VERSION or depth < 1 or depth > len(manifest["bits"]):
         raise ValueError("Unsupported format or prefix depth")
+    if checkpoint_dtype not in ("bfloat16", "float16"):
+        raise ValueError("checkpoint_dtype must be bfloat16 or float16")
+    if checkpoint_dtype == "float16" and manifest.get("quantizer_family") != "autoround_opt_fp16":
+        raise ValueError("FP16 checkpoint materialization is reserved for B3")
     output.mkdir(parents=True, exist_ok=True)
     identity = {"manifest_sha256": complete["manifest_sha256"], "depth": depth}
+    if checkpoint_dtype == "float16":
+        identity["checkpoint_dtype"] = "float16"
     run = output / "reconstruction.json"
     if run.exists():
         if json.loads(run.read_text())["identity"] != identity:
@@ -38,6 +45,11 @@ def reconstruct(artifact: Path, output: Path, depth: int) -> dict:
         atomic_json(run, {"identity": identity})
     for sidecar in manifest["sidecars"]:
         shutil.copyfile(artifact / sidecar, output / Path(sidecar).name)
+    if checkpoint_dtype == "float16":
+        config_path = output / "config.json"
+        config = json.loads(config_path.read_text())
+        config["torch_dtype"] = "float16"
+        atomic_json(config_path, config)
     mapping = {}
     begun = started()
     for record in manifest["tensors"]:
@@ -55,13 +67,15 @@ def reconstruct(artifact: Path, output: Path, depth: int) -> dict:
             if manifest.get("quantizer_family") in MODES:
                 qdq_dtype = MODES[manifest["quantizer_family"]][1]
                 tensor = tensor.to(qdq_dtype)
-            tensor = tensor.to(dtype=torch.bfloat16)
+            tensor = tensor.to(dtype=torch.float16 if checkpoint_dtype == "float16" else torch.bfloat16)
         else:
             shared = artifact / record["shared"]
             if sha256(shared) != record["shared_sha256"]:
                 raise ValueError(f"Corrupt shared tensor: {name}")
             with safe_open(shared, framework="pt", device="cpu") as handle:
                 tensor = handle.get_tensor(name)
+            if checkpoint_dtype == "float16":
+                tensor = tensor.to(torch.float16)
         atomic_safetensors(target, {name: tensor})
         atomic_json(marker, {"name": name, "sha256": sha256(target)})
         mapping[name] = filename
@@ -72,6 +86,7 @@ def reconstruct(artifact: Path, output: Path, depth: int) -> dict:
     atomic_json(output / "model.safetensors.index.json", index)
     atomic_json(output / "COMPLETE.json", {"identity": identity,
                 "index_sha256": sha256(output / "model.safetensors.index.json"),
+                **({"checkpoint_dtype": "float16"} if checkpoint_dtype == "float16" else {}),
                 "seconds": elapsed(begun), "peak_rss_bytes": peak_rss_bytes()})
     return index
 
@@ -81,8 +96,9 @@ def main():
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--depth", type=int, required=True)
+    parser.add_argument("--checkpoint-dtype", choices=("bfloat16", "float16"), default="bfloat16")
     args = parser.parse_args()
-    reconstruct(args.artifact, args.output, args.depth)
+    reconstruct(args.artifact, args.output, args.depth, args.checkpoint_dtype)
 
 
 if __name__ == "__main__":

@@ -127,3 +127,45 @@ preserves B0's 9,730.84365 user-reported full PPL if its original JSON is
 unavailable and labels that provenance explicitly. RRQ's 16.75 remains an
 external literature value until its exact implementation and protocol can
 be established.
+
+## B3 checkpoint materialization follow-up
+
+The initial B3 run reported exact upstream-versus-LP in-memory logits, but
+BF16-saved/reloaded logit RMSE 0.2338584661 and maximum error 1.75, with
+eight-block diagnostic perplexity 315.02235. The existing decoder rounds
+the FP16 optimized RTN QDQ values to BF16 when saving. This is a plausible
+source of the discrepancy; the full Qwen3-8B weight/logit confirmation must
+run against the existing AWS artifact.
+
+The `--checkpoint-dtype float16` reconstruction option is restricted to B3.
+It writes to a **new** checkpoint directory, records the materialization
+dtype in the reconstruction identity, stores all parameters as FP16, and
+updates the copied model config to FP16. The existing BF16 checkpoint,
+quantized streams, scale metadata, and diagnostic JSON remain in place. A
+different dtype cannot resume into the same reconstruction directory.
+
+The follow-up compares each eligible saved tensor with exact pinned upstream
+FP16 QDQ, reporting exact equality, maximum absolute error, and RMSE for
+packed decoding, BF16 saving, and FP16 saving. It also checks that the BF16
+checkpoint equals the upstream values explicitly cast to BF16. Logits are
+measured for upstream in memory, LP in memory, the old BF16 checkpoint, and
+the new FP16 checkpoint. Both checkpoints use the same eight complete
+non-overlapping 2048-token WikiText-2 blocks and FP16 inference. The runner
+checks their selected-token hashes and scored-token counts before reporting
+perplexity and mean cross-entropy. No full WikiText-2 evaluation is invoked.
+
+```bash
+export LP_ROOT=/shared/makhtar/lp_llm
+export LP_CODE=$LP_ROOT/paper_release
+sbatch --export=ALL,LP_CODE="$LP_CODE",LP_ROOT="$LP_ROOT" \
+  "$LP_CODE/hpc/rtn_b3_materialization.sbatch"
+```
+
+New results are under
+`results/qwen3_8b_base/rtn_reproduction/b3_opt_fp16/materialization_fp16/`:
+`checkpoint/`, `weights.json`, `logits.json`, `diagnostic.json`, and
+`comparison.json`. The consolidated `comparison.md` adds a separate B3
+FP16-checkpoint row; the algorithm, quantized codes, artifact storage, MSE,
+and SQNR are the same for both B3 rows. FP16 and BF16 each occupy two bytes
+per parameter. The report records checkpoint and model-loading dtypes
+separately because equal byte counts do not imply equal logits.

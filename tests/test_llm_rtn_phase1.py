@@ -17,6 +17,7 @@ from lp_llm.storage import decode_prefix, read_layer
 from lp_llm.upstream_reference import direct_qdq
 from lp_llm.run_rtn_reproduction import numerical, prepare, report, full, _paths
 from lp_llm.aggregate_rtn_reproduction import aggregate, markdown
+from lp_llm.rtn_materialization import compare_weights
 
 
 CONFIG = {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
@@ -190,16 +191,21 @@ def test_restart_safe_numerical_prepare_and_aggregation(tmp_path):
         full(paths, evaluator)
 
 
-def test_small_model_logit_pipeline_with_saved_reload(tmp_path, monkeypatch):
+@pytest.mark.parametrize("family", ["autoround_plain_fp16", "autoround_opt_fp16"])
+def test_small_model_logit_pipeline_with_saved_reload(tmp_path, monkeypatch, family):
     from lp_llm.rtn_logits import compare
     source = tmp_path / "source"
     _checkpoint(source)
     artifact = tmp_path / "artifact"
     encode(source, artifact, {"method": "lp", "bits": [2], "granularity": "group",
-                              "group_size": 128, "quantizer_family": "autoround_plain_fp16",
+                              "group_size": 128, "quantizer_family": family,
                               "compute_device": "cpu"})
     checkpoint = tmp_path / "checkpoint"
     reconstruct(artifact, checkpoint, 1)
+    fp16_checkpoint = None
+    if family == "autoround_opt_fp16":
+        fp16_checkpoint = tmp_path / "fp16-checkpoint"
+        reconstruct(artifact, fp16_checkpoint, 1, checkpoint_dtype="float16")
 
     class TinyModel(torch.nn.Module):
         def __init__(self):
@@ -225,10 +231,119 @@ def test_small_model_logit_pipeline_with_saved_reload(tmp_path, monkeypatch):
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoModelForCausalLM = TinyModel
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    value = compare(source, artifact, checkpoint, torch.tensor([[1, 2, 3, 4]]), "cpu")
+    value = compare(source, artifact, checkpoint, torch.tensor([[1, 2, 3, 4]]), "cpu",
+                    fp16_checkpoint=fp16_checkpoint)
     assert value["lp_in_memory"]["max_abs_logit_error"] == 0
-    assert value["saved_vs_lp_in_memory"]["max_abs_logit_error"] == 0
-    assert value["saved_reloaded"]["predicted_token_agreement"] == 1
+    if fp16_checkpoint is not None:
+        assert value["saved_fp16_vs_lp_in_memory"]["max_abs_logit_error"] == 0
+        assert value["saved_fp16_reloaded"]["predicted_token_agreement"] == 1
+    else:
+        assert value["saved_vs_lp_in_memory"]["max_abs_logit_error"] == 0
+        assert value["saved_reloaded"]["predicted_token_agreement"] == 1
+
+
+def test_b3_fp16_materialization_preserves_upstream_qdq(tmp_path):
+    torch.manual_seed(123)
+    source = tmp_path / "source"
+    _checkpoint(source)
+    artifact = tmp_path / "artifact"
+    encode(source, artifact, {"method": "lp", "bits": [2], "granularity": "group",
+                              "group_size": 128, "quantizer_family": "autoround_opt_fp16",
+                              "compute_device": "cpu"})
+    bf16_checkpoint = tmp_path / "bf16-checkpoint"
+    fp16_checkpoint = tmp_path / "fp16-checkpoint"
+    reconstruct(artifact, bf16_checkpoint, 1)
+    reconstruct(artifact, fp16_checkpoint, 1, checkpoint_dtype="float16")
+    bf16_run = json.loads((bf16_checkpoint / "reconstruction.json").read_text())
+    fp16_run = json.loads((fp16_checkpoint / "reconstruction.json").read_text())
+    assert "checkpoint_dtype" not in bf16_run["identity"]
+    assert fp16_run["identity"]["checkpoint_dtype"] == "float16"
+    assert json.loads((fp16_checkpoint / "config.json").read_text())["torch_dtype"] == "float16"
+    assert (json.loads((bf16_checkpoint / "model.safetensors.index.json").read_text())["metadata"]["total_size"]
+            == json.loads((fp16_checkpoint / "model.safetensors.index.json").read_text())["metadata"]["total_size"])
+    values = compare_weights(source, artifact, bf16_checkpoint, fp16_checkpoint, "cpu")
+    assert values["comparisons"]["packed_fp32_cast_fp16"]["exact"]
+    assert values["comparisons"]["fp16_saved"]["exact"]
+    assert values["comparisons"]["fp16_saved"]["max_abs_error"] == 0
+    assert values["comparisons"]["fp16_saved"]["rmse"] == 0
+    assert not values["comparisons"]["bf16_saved"]["exact"]
+    assert values["comparisons"]["bf16_saved"]["rmse"] > 0
+    with pytest.raises(ValueError, match="another reconstruction"):
+        reconstruct(artifact, bf16_checkpoint, 1, checkpoint_dtype="float16")
+
+
+def test_aggregate_distinguishes_b3_materialization(tmp_path):
+    root = tmp_path / "rtn_reproduction" / "b3_opt_fp16"
+    variant = root / "materialization_fp16"
+    variant.mkdir(parents=True)
+    (root / "result.json").write_text(json.dumps({
+        "validation_status": {"checkpoint": True},
+        "quantizer": {"algorithm": "optimized_search_scales", "quantization_input_dtype": "float16"},
+        "physical_storage": {"effective_bits_per_total_parameter": 4.2},
+        "parameter_mse_fp32": 0.1, "sqnr_db_fp32": 7.0,
+        "diagnostic": {"perplexity": 315.0}, "full_wikitext2_perplexity": None}))
+    (variant / "comparison.json").write_text(json.dumps({
+        "diagnostic": {"fp16_checkpoint": {"perplexity": 20.0}}}))
+    rows = aggregate(tmp_path)["rows"]
+    bf16, fp16 = rows[-2:]
+    assert bf16["algorithm"] == fp16["algorithm"]
+    assert bf16["checkpoint_dtype"] == "bfloat16"
+    assert fp16["checkpoint_dtype"] == "float16"
+    assert bf16["effective_bits_per_total_parameter"] == fp16["effective_bits_per_total_parameter"]
+    assert (bf16["diagnostic_perplexity"], fp16["diagnostic_perplexity"]) == (315.0, 20.0)
+
+
+def test_b3_materialization_runner_reuses_verified_results(tmp_path, monkeypatch):
+    import lp_llm.run_b3_materialization as runner
+    from lp_llm.evaluate import _identity
+    from lp_llm.storage import sha256
+    torch.manual_seed(123)
+    source = tmp_path / "source"
+    _checkpoint(source)
+    result_root = tmp_path / "results"
+    root = result_root / "rtn_reproduction" / "b3_opt_fp16"
+    root.mkdir(parents=True)
+    artifact = root / "artifact"
+    encode(source, artifact, {"method": "lp", "bits": [2], "granularity": "group",
+                              "group_size": 128, "quantizer_family": "autoround_opt_fp16",
+                              "compute_device": "cpu"})
+    bf16_checkpoint = root / "checkpoint"
+    reconstruct(artifact, bf16_checkpoint, 1)
+    def fake_logits(source_path, artifact_path, checkpoint_path, tokens, device, fp16_checkpoint):
+        stat = {"max_abs_logit_error": 0.0}
+        return {"artifact_manifest_sha256": sha256(artifact_path / "manifest.json"),
+                "checkpoint_identity": _identity(checkpoint_path, "rtn-logit-parity"),
+                "fp16_checkpoint_identity": _identity(fp16_checkpoint, "rtn-logit-parity-fp16"),
+                "upstream_in_memory": stat, "lp_in_memory": stat,
+                "saved_reloaded": stat, "saved_fp16_reloaded": stat}
+    def fake_diagnostic(checkpoint, output, device):
+        return {"identity": {"block_length": 2048, "block_limit": 8},
+                "selected_token_sha256": "same-fixed-blocks", "scored_tokens": 8 * 2047,
+                "perplexity": 20.0 if "materialization_fp16" in str(checkpoint) else 315.0,
+                "mean_cross_entropy": 3.0}
+    monkeypatch.setattr(runner, "compare_logits", fake_logits)
+    monkeypatch.setattr(runner, "diagnostic_evaluate", fake_diagnostic)
+    first = runner.run(source, result_root, "cpu")
+    assert first["diagnostic"]["bf16_checkpoint"]["perplexity"] == 315.0
+    assert first["diagnostic"]["fp16_checkpoint"]["perplexity"] == 20.0
+    monkeypatch.setattr(runner, "compare_weights", lambda *args: pytest.fail("recomputed weights"))
+    monkeypatch.setattr(runner, "compare_logits", lambda *args, **kwargs: pytest.fail("recomputed logits"))
+    assert runner.run(source, result_root, "cpu") == first
+
+
+@pytest.mark.parametrize("family", ["affine_asymmetric", "autoround_plain_fp16", "autoround_plain_bf16"])
+def test_existing_materialization_defaults_remain_bf16(tmp_path, family):
+    source = tmp_path / "source"
+    _checkpoint(source)
+    artifact = tmp_path / "artifact"
+    encode(source, artifact, {"method": "lp", "bits": [2], "granularity": "group",
+                              "group_size": 128, "quantizer_family": family,
+                              "compute_device": "cpu"})
+    checkpoint = tmp_path / "checkpoint"
+    index = reconstruct(artifact, checkpoint, 1)
+    name = "model.layers.0.self_attn.q_proj.weight"
+    assert load_file(str(checkpoint / index["weight_map"][name]))[name].dtype == torch.bfloat16
+    assert "checkpoint_dtype" not in json.loads((checkpoint / "reconstruction.json").read_text())["identity"]
 
 
 def test_tiny_qwen3_logit_workflow_when_transformers_supports_it(tmp_path):
