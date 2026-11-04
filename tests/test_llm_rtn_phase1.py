@@ -194,6 +194,7 @@ def test_restart_safe_numerical_prepare_and_aggregation(tmp_path):
 @pytest.mark.parametrize("family", ["autoround_plain_fp16", "autoround_opt_fp16"])
 def test_small_model_logit_pipeline_with_saved_reload(tmp_path, monkeypatch, family):
     from lp_llm.rtn_logits import compare
+    from lp_llm.storage import sha256
     source = tmp_path / "source"
     _checkpoint(source)
     artifact = tmp_path / "artifact"
@@ -208,6 +209,7 @@ def test_small_model_logit_pipeline_with_saved_reload(tmp_path, monkeypatch, fam
         reconstruct(artifact, fp16_checkpoint, 1, checkpoint_dtype="float16")
 
     class TinyModel(torch.nn.Module):
+        poison_fp16 = False
         def __init__(self):
             super().__init__()
             self.model = torch.nn.Module()
@@ -222,21 +224,36 @@ def test_small_model_logit_pipeline_with_saved_reload(tmp_path, monkeypatch, fam
             index = json.loads((path / "model.safetensors.index.json").read_text())["weight_map"]
             for name, parameter in model.named_parameters():
                 parameter.data = load_file(str(path / index[name]))[name]
+            if fp16_checkpoint is not None and path == fp16_checkpoint:
+                # A deliberately non-idempotent loaded weight. The comparison
+                # must use it as loaded, without replacing it from the bitstream.
+                model.model.layers[0].self_attn.q_proj.weight.data[0, 0] += 0.5
+                model.poison = cls.poison_fp16
             return model
         def forward(self, input_ids):
             hidden = self.model.embed_tokens(input_ids)
             hidden = self.model.layers[0].self_attn.q_proj(hidden)
-            return type("Output", (), {"logits": self.lm_head(hidden)})()
+            logits = self.lm_head(hidden)
+            if getattr(self, "poison", False):
+                logits = logits * float("nan")
+            return type("Output", (), {"logits": logits})()
 
     fake_transformers = types.ModuleType("transformers")
     fake_transformers.AutoModelForCausalLM = TinyModel
     monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    fp16_hashes = ({path.name: sha256(path) for path in fp16_checkpoint.glob("*.safetensors")}
+                   if fp16_checkpoint is not None else None)
     value = compare(source, artifact, checkpoint, torch.tensor([[1, 2, 3, 4]]), "cpu",
                     fp16_checkpoint=fp16_checkpoint)
     assert value["lp_in_memory"]["max_abs_logit_error"] == 0
     if fp16_checkpoint is not None:
-        assert value["saved_fp16_vs_lp_in_memory"]["max_abs_logit_error"] == 0
-        assert value["saved_fp16_reloaded"]["predicted_token_agreement"] == 1
+        assert value["saved_fp16_vs_lp_in_memory"]["max_abs_logit_error"] > 0
+        assert value["saved_fp16_reloaded"]["max_abs_logit_error"] > 0
+        assert {path.name: sha256(path) for path in fp16_checkpoint.glob("*.safetensors")} == fp16_hashes
+        TinyModel.poison_fp16 = True
+        with pytest.raises(ValueError, match="Nonfinite logit diagnostic"):
+            compare(source, artifact, checkpoint, torch.tensor([[1, 2, 3, 4]]), "cpu",
+                    fp16_checkpoint=fp16_checkpoint)
     else:
         assert value["saved_vs_lp_in_memory"]["max_abs_logit_error"] == 0
         assert value["saved_reloaded"]["predicted_token_agreement"] == 1
@@ -268,6 +285,19 @@ def test_b3_fp16_materialization_preserves_upstream_qdq(tmp_path):
     assert values["comparisons"]["fp16_saved"]["rmse"] == 0
     assert not values["comparisons"]["bf16_saved"]["exact"]
     assert values["comparisons"]["bf16_saved"]["rmse"] > 0
+    import lp_llm.rtn_materialization as materialization_module
+    original_load = materialization_module.load_file
+    def changed_fp16_weight(path):
+        tensors = original_load(path)
+        if str(fp16_checkpoint) in path and "q_proj.weight" in next(iter(tensors)):
+            name = next(iter(tensors))
+            tensors[name] = tensors[name].clone()
+            tensors[name].reshape(-1)[0] += 0.5
+        return tensors
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(materialization_module, "load_file", changed_fp16_weight)
+        with pytest.raises(ValueError, match="does not exactly match"):
+            compare_weights(source, artifact, bf16_checkpoint, fp16_checkpoint, "cpu")
     with pytest.raises(ValueError, match="another reconstruction"):
         reconstruct(artifact, bf16_checkpoint, 1, checkpoint_dtype="float16")
 
@@ -329,6 +359,12 @@ def test_b3_materialization_runner_reuses_verified_results(tmp_path, monkeypatch
     monkeypatch.setattr(runner, "compare_weights", lambda *args: pytest.fail("recomputed weights"))
     monkeypatch.setattr(runner, "compare_logits", lambda *args, **kwargs: pytest.fail("recomputed logits"))
     assert runner.run(source, result_root, "cpu") == first
+    weight_path = root / "materialization_fp16" / "weights.json"
+    bad = json.loads(weight_path.read_text())
+    bad["comparisons"]["fp16_saved"]["exact"] = False
+    weight_path.write_text(json.dumps(bad))
+    with pytest.raises(ValueError, match="failed exact upstream weight validation"):
+        runner.run(source, result_root, "cpu")
 
 
 @pytest.mark.parametrize("family", ["affine_asymmetric", "autoround_plain_fp16", "autoround_plain_bf16"])

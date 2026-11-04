@@ -43,6 +43,9 @@ def run(source: Path, result_root: Path, device: str = "cuda:0") -> dict:
     else:
         weights = compare_weights(source, artifact, bf16_checkpoint, fp16_checkpoint, device)
         atomic_json(weight_path, weights)
+    if (weights.get("status") != "complete" or
+            not weights.get("comparisons", {}).get("fp16_saved", {}).get("exact")):
+        raise ValueError("B3 FP16 checkpoint failed exact upstream weight validation")
     tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
     logit_path = fp16_root / "logits.json"
     if logit_path.exists():

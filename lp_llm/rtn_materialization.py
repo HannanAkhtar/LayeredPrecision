@@ -56,6 +56,8 @@ def compare_weights(source: Path, artifact: Path, bf16_checkpoint: Path,
         raise ValueError("No eligible B3 weights")
     for row in totals.values():
         row["rmse"] = math.sqrt(row.pop("squared_error_sum") / count)
+    if not totals["fp16_saved"]["exact"]:
+        raise ValueError("FP16 checkpoint does not exactly match upstream FP16 QDQ")
     return {"status": "complete", "quantizer_family": "autoround_opt_fp16",
             "artifact_manifest_sha256": sha256(artifact / "manifest.json"),
             "source_index_sha256": sha256(source / "model.safetensors.index.json"),

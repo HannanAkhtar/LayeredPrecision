@@ -51,7 +51,7 @@ def compare(source: Path, artifact: Path, checkpoint: Path, tokens: torch.Tensor
         load_dtype = torch.float16 if variant == "saved_fp16_reloaded" else torch.bfloat16
         model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=load_dtype,
                                                        low_cpu_mem_usage=True, device_map=device)
-        if variant != "saved_reloaded":
+        if variant not in ("saved_reloaded", "saved_fp16_reloaded"):
             with torch.no_grad():
                 for name, param in model.named_parameters():
                     if not policy.eligible(name):
@@ -84,8 +84,11 @@ def compare(source: Path, artifact: Path, checkpoint: Path, tokens: torch.Tensor
         output["saved_fp16_vs_lp_in_memory"] = logit_stats(
             results["lp_in_memory"], results["saved_fp16_reloaded"], tokens)
         output["fp16_checkpoint_identity"] = _identity(fp16_checkpoint, "rtn-logit-parity-fp16")
-    if any(not math.isfinite(v["mean_token_cross_entropy"]) for v in
-           (output["upstream_in_memory"], output["lp_in_memory"], output["saved_reloaded"])):
+    checked_variants = ("upstream_in_memory", "lp_in_memory", "saved_reloaded")
+    if fp16_checkpoint is not None:
+        checked_variants += ("saved_fp16_reloaded",)
+    if any(not math.isfinite(output[name]["mean_token_cross_entropy"])
+           or not math.isfinite(output[name]["logit_rmse"]) for name in checked_variants):
         raise ValueError("Nonfinite logit diagnostic")
     return output
 
