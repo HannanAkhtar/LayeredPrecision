@@ -7,6 +7,8 @@ Apache-2.0 source fixtures. It is never needed by checkpoint decoding.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
+from functools import wraps
 import hashlib
 import sys
 import types
@@ -37,6 +39,32 @@ def _extract(path: Path, names: tuple[str, ...], namespace: dict):
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
 
 
+@contextmanager
+def _gguf_import_scope():
+    """Supply the unused imatrix helper only while a reference call runs."""
+    names = ("auto_round", "auto_round.data_type", "auto_round.data_type.gguf")
+    if "auto_round" in sys.modules:
+        # Let an installed AutoRound resolve its own import normally.
+        yield
+        return
+    absent = object()
+    original = {name: sys.modules.get(name, absent) for name in names}
+    try:
+        for name in names:
+            if name not in sys.modules:
+                module = types.ModuleType(name)
+                if name.endswith(".gguf"):
+                    module._imatrix_handle_zero = lambda *args: None
+                sys.modules[name] = module
+        yield
+    finally:
+        for name in reversed(names):
+            if original[name] is absent:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original[name]
+
+
 def functions() -> dict:
     namespace = {"torch": torch, "envs": types.SimpleNamespace(AR_SEARCH_SCALE_RATIO=None)}
     _extract(FIXTURES / "autoround_common_6c824f7.py", ("get_reciprocal",), namespace)
@@ -48,12 +76,14 @@ def functions() -> dict:
              ("search_scales", "quant_tensor_rtn_sym", "quant_tensor_opt_rtn_sym"), namespace)
     # The optimized function imports this helper unconditionally, but calls it
     # only when imatrix is supplied. Phase 1 deliberately uses imatrix=None.
-    if "auto_round.data_type.gguf" not in sys.modules:
-        sys.modules.setdefault("auto_round", types.ModuleType("auto_round"))
-        sys.modules.setdefault("auto_round.data_type", types.ModuleType("auto_round.data_type"))
-        gguf = types.ModuleType("auto_round.data_type.gguf")
-        gguf._imatrix_handle_zero = lambda *args: None
-        sys.modules["auto_round.data_type.gguf"] = gguf
+    raw_optimized = namespace["quant_tensor_opt_rtn_sym"]
+
+    @wraps(raw_optimized)
+    def optimized(*args, **kwargs):
+        with _gguf_import_scope():
+            return raw_optimized(*args, **kwargs)
+
+    namespace["quant_tensor_opt_rtn_sym"] = optimized
     return namespace
 
 
