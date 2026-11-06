@@ -21,7 +21,16 @@ LP_SOURCE="${LP_SOURCE:-$LP_ROOT/models/qwen3-8b-base}"
 RESULT_ROOT="${RESULT_ROOT:-$LP_ROOT/results/qwen3_8b_base}"
 REF_ROOT="${RRQ_REF_ROOT:-$LP_ROOT/references/rrq_w2}"
 MAT_PYTHON="${RRQ_MATGPTQ_ENV:-$LP_ROOT/envs/rrq_matgptq}/bin/python"
-export RRQ_AUTOROUND_BIN_DIR="${RRQ_AUTOROUND_ENV:-$LP_ROOT/envs/rrq_autoround}/bin"
+variant="${RRQ_AUTOROUND_VARIANT:-current}"
+case "$variant" in
+  current)
+    AUTO_SOURCE="$REF_ROOT/auto-round"
+    export RRQ_AUTOROUND_BIN_DIR="${RRQ_AUTOROUND_ENV:-$LP_ROOT/envs/rrq_autoround}/bin" ;;
+  preprint_candidate)
+    AUTO_SOURCE="$REF_ROOT/auto-round-preprint-candidate"
+    export RRQ_AUTOROUND_BIN_DIR="${RRQ_AUTOROUND_HISTORICAL_ENV:-$LP_ROOT/envs/rrq_autoround_historical}/bin" ;;
+  *) echo "ERROR: unknown AutoRound variant: $variant" >&2; exit 1 ;;
+esac
 source /opt/miniconda/etc/profile.d/conda.sh
 conda activate /shared/makhtar/lp_llm/envs/lp_llm
 source /shared/makhtar/lp_llm/env.sh
@@ -33,5 +42,5 @@ stage="${RRQ_STAGE:-screen}"
 echo "[START] $EXPERIMENT_ID stage=$stage"
 "$MAT_PYTHON" -m lp_llm.rrq_runner --experiment-id "$EXPERIMENT_ID" --source "$LP_SOURCE" \
   --result-root "$RESULT_ROOT" --matgptq-source "$REF_ROOT/MatGPTQ" \
-  --autoround-source "$REF_ROOT/auto-round" --stage "$stage"
+  --autoround-source "$AUTO_SOURCE" --autoround-variant "$variant" --stage "$stage"
 echo "[COMPLETE] $EXPERIMENT_ID stage=$stage"

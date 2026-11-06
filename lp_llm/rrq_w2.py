@@ -13,6 +13,8 @@ from . import QWEN3_MODEL_ID, QWEN3_REVISION
 
 MATGPTQ_COMMIT = "0e5bd93bc53381f7195db870f5408ae04906bb3c"
 AUTOROUND_COMMIT = "6c824f741be358983baba87aff83f9c5aa0a01e7"
+AUTOROUND_HISTORICAL_COMMIT = "24bfce00bb3bd053498232f0e8395118fe10a906"
+AUTOROUND_REVISIONS = {"current": AUTOROUND_COMMIT, "preprint_candidate": AUTOROUND_HISTORICAL_COMMIT}
 CONFIG_ROOT = Path(__file__).resolve().parent.parent / "configs" / "rrq_w2"
 MODES = {
     "j01": ("evaluation", "original", 128),
@@ -52,11 +54,18 @@ def load_config(experiment_id: str) -> dict:
         value["quantizer_configuration"] = {
             "implementation": "official_auto_round_cli", "revision": AUTOROUND_COMMIT,
             "algorithm": "plain_rtn" if mode == "plain" else "optimized_rtn_scale_search",
-            "iterations": 0, "gradient_updates": False, "calibration_samples": 0,
+            "iterations": 0, "gradient_updates": False,
+            "configured_nsamples": 1 if mode == "plain" else 128,
+            "observed_calibration_examples_consumed": None,
+            "source_audited_expected_calibration_examples": 0,
+            "calibration_evidence": "RTN zero-shot dispatch; confirm from upstream run log",
             "group_size": group, "symmetric": True, "bits": 2,
             "scheme": "W2A16" if group == 128 else f"W2A16G{group}",
-            "format": "fake", "model_input_dtype": "source_bfloat16",
-            "rounding_range": "pinned_upstream_default_recorded_in_log"}
+            "format": "fake", "model_dtype_argument": "float16",
+            "model_load_dtype": "float16_explicit_CLI",
+            "optimized_2bit_scale_search": {"index_min": -90, "index_max": 90, "step": 0.01,
+                                            "zero_index_skipped": True} if mode != "plain" else None,
+            "module_selection": "upstream_default_no_ignore_layers_no_lm_head"}
     elif kind == "hybrid":
         value["quantizer_configuration"] = {"implementation": "existing_B3_optimized_RTN",
                                                    "new_quantization": False,
@@ -64,12 +73,18 @@ def load_config(experiment_id: str) -> dict:
     return value
 
 
-def identity(config: dict, source: Path, checkpoint: Path | None = None) -> dict:
+def identity(config: dict, source: Path, checkpoint: Path | None = None,
+             *, autoround_variant: str = "current") -> dict:
     from .evaluate import _identity
     result = {"experiment_id": config["id"], "config_sha256": config["config_sha256"],
               "model_id": config["model_id"], "revision": config["model_revision"],
               "source_checkpoint": _identity(source, "rrq-source"),
-              "matgptq_commit": MATGPTQ_COMMIT, "autoround_commit": AUTOROUND_COMMIT}
+              "matgptq_commit": MATGPTQ_COMMIT}
+    if config["kind"] == "autoround":
+        if autoround_variant not in AUTOROUND_REVISIONS:
+            raise ValueError(f"Unknown AutoRound reference variant: {autoround_variant}")
+        result["autoround_variant"] = autoround_variant
+        result["autoround_commit"] = AUTOROUND_REVISIONS[autoround_variant]
     if checkpoint is not None:
         result["checkpoint"] = _identity(checkpoint, "rrq-evaluation")
     return result

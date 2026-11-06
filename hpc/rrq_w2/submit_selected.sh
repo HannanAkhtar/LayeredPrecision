@@ -15,5 +15,13 @@ for id in "$@"; do
 done
 for id in "$@"; do
   while [[ "$(squeue -h -u "$USER" -n rrq-w2 | wc -l)" -ge "$limit" ]]; do sleep 30; done
-  sbatch --export="ALL,EXPERIMENT_ID=$id,RRQ_STAGE=${RRQ_STAGE:-screen}" hpc/rrq_w2/run_experiment.sbatch
+  case "$id" in
+    j04|j05|j06|j07)
+      sbatch --mem="${RRQ_AUTOROUND_MEM:-12G}" \
+        --export="ALL,EXPERIMENT_ID=$id,RRQ_STAGE=${RRQ_STAGE:-screen},RRQ_AUTOROUND_VARIANT=${RRQ_AUTOROUND_VARIANT:-current}" \
+        hpc/rrq_w2/run_experiment.sbatch ;;
+    *)
+      sbatch --export="ALL,EXPERIMENT_ID=$id,RRQ_STAGE=${RRQ_STAGE:-screen}" \
+        hpc/rrq_w2/run_experiment.sbatch ;;
+  esac
 done

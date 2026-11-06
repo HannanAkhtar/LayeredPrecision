@@ -24,12 +24,19 @@ def aggregate(result_root: Path) -> dict:
                           value.get("configuration", {}).get("config_sha256") != config["config_sha256"]):
                 raise ValueError(f"Incomplete or inconsistent result: {path}")
         report = (diagnostic or full or {}).get("construction", {})
-        names = (report.get("identity", {}).get("restored_names") or
-                 report.get("coverage", {}).get("changed_tensor_names") or report.get("eligible_tensor_names"))
+        restored_names = report.get("identity", {}).get("restored_names")
+        configured_names = report.get("configured_module_selection", {}).get("selected_module_names")
+        changed_names = report.get("weight_change_diagnostic", {}).get("changed_tensor_names")
+        eligible_names = report.get("eligible_tensor_names")
+        coverage = (f"{len(restored_names)} restored" if restored_names is not None else
+                    f"{len(configured_names)} configured" if configured_names is not None else
+                    f"{len(changed_names)} changed (selection unavailable)" if changed_names is not None else
+                    f"{len(eligible_names)} LP eligible" if eligible_names is not None else None)
         rows.append({"id": experiment_id, "quantizer": config["mode"], "bits": config["bits"],
                      "group": config["group_size"],
-                     "coverage": f"{len(names)} tensors" if names is not None else None,
-                     "effective_bpp": report.get("effective_bits_per_total_parameter"),
+                     "coverage": coverage,
+                     "effective_bpp": report.get("estimated_effective_bits_per_total_parameter",
+                                                 report.get("effective_bits_per_total_parameter")),
                      "diagnostic_ppl": diagnostic["score"]["perplexity"] if diagnostic else None,
                      "full_ppl": full["score"]["perplexity"] if full else None,
                      "status": "unavailable" if config["kind"] == "unavailable" else
@@ -37,7 +44,7 @@ def aggregate(result_root: Path) -> dict:
     value = {"measured_results_only": True, "rows": rows}
     root.mkdir(parents=True, exist_ok=True)
     atomic_json(root / "aggregate.json", value)
-    columns = ("ID", "Quantizer", "Bits", "Group", "Coverage", "Effective bpp",
+    columns = ("ID", "Quantizer", "Bits", "Group", "Coverage", "Effective bpp (hybrid estimate)",
                "Diagnostic PPL", "Full PPL", "Status")
     markdown = "| " + " | ".join(columns) + " |\n|" + "|".join(["---"] * len(columns)) + "|\n"
     for row in rows:

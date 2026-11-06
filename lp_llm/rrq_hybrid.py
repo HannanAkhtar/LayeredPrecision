@@ -73,10 +73,27 @@ def build(source: Path, artifact: Path, base: Path, output: Path, mode: str) -> 
         filename = base_index["weight_map"][name]
         target = output / filename
         marker = output / (filename + ".done.json")
-        if marker.exists() or target.exists():
-            if (not marker.exists() or not target.exists() or
-                    json.loads(marker.read_text()).get("sha256") != sha256(target)):
+        if marker.exists():
+            done = json.loads(marker.read_text())
+            if (not target.exists() or done.get("name") != name or
+                    done.get("restored") is not (name in names) or
+                    done.get("sha256") != sha256(target)):
                 raise ValueError(f"Incomplete or corrupt hybrid tensor: {name}")
+            continue
+        if target.exists():
+            if name in names:
+                original = read_tensor(source, source_map, name)
+                with torch.inference_mode():
+                    saved = load_file(str(target))
+                valid = (set(saved) == {name} and saved[name].dtype == torch.bfloat16 and
+                         torch.equal(saved[name], original))
+            else:
+                base_marker = json.loads((base / f".done-{record['tensor_id']:04d}.json").read_text())
+                valid = (base_marker.get("name") == name and
+                         sha256(base / filename) == base_marker.get("sha256") == sha256(target))
+            if not valid:
+                raise ValueError(f"Orphaned hybrid shard differs from expected tensor: {name}")
+            atomic_json(marker, {"name": name, "sha256": sha256(target), "restored": name in names})
             continue
         if name in names:
             original = read_tensor(source, source_map, name)
@@ -112,18 +129,25 @@ def build(source: Path, artifact: Path, base: Path, output: Path, mode: str) -> 
     restored_safetensors_bytes = sum((output / base_index["weight_map"][name]).stat().st_size for name in names)
     compact = (compact_base - replaced_stream_bytes + restored_safetensors_bytes +
                compact_manifest_path.stat().st_size)
+    qdq_bytes = sum((output / filename).stat().st_size for filename in set(base_index["weight_map"].values()))
+    checkpoint_metadata_bytes = index_path.stat().st_size + sum(
+        (output / Path(sidecar).name).stat().st_size for sidecar in manifest["sidecars"])
     value = {"status": "complete", "identity": identity, "restored_parameters": restored,
              "restored_fraction": restored / total, "remaining_2bit_parameters": manifest["eligible_parameters"] - restored,
              "remaining_2bit_tensor_names": sorted(r["name"] for r in manifest["tensors"]
                                                    if r["eligible"] and r["name"] not in names),
              "excluded_tensor_names": sorted(r["name"] for r in manifest["tensors"] if not r["eligible"]),
-             "hybrid_compact_storage_bytes": compact, "effective_bits_per_total_parameter": 8 * compact / total,
+             "estimated_logical_compact_bytes": compact,
+             "estimated_effective_bits_per_total_parameter": 8 * compact / total,
+             "logical_compact_basis": "referenced_B3_decoder_files_plus_restored_shards_and_hybrid_manifest",
+             "independently_deployable_compressed_bytes": None,
+             "independent_package_requirement": "copy_needed_B3_streams_shared_tensors_sidecars_and_manifest_plus_restored_shards_and_hybrid_manifest",
              "removed_B3_stream_bytes": replaced_stream_bytes,
              "restored_BF16_bytes": restored * 2,
              "restored_safetensors_bytes": restored_safetensors_bytes,
              "compact_manifest_bytes": compact_manifest_path.stat().st_size,
-             "qdq_checkpoint_safetensors_bytes": sum((output / filename).stat().st_size
-                                                   for filename in set(base_index["weight_map"].values())),
+             "actual_qdq_checkpoint_safetensors_bytes": qdq_bytes,
+             "actual_checkpoint_metadata_bytes": checkpoint_metadata_bytes,
              "index_sha256": sha256(index_path), "restored_checkpoint_dtype": "bfloat16",
              "base_checkpoint_dtype": "float16", "inference_dtype": "float16"}
     complete = output / "HYBRID_COMPLETE.json"

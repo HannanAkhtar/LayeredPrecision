@@ -6,17 +6,19 @@ This branch prepares J01–J14. It contains no new Qwen3-8B measurements. RRQ's 
 
 The [pinned MatGPTQ evaluator](https://github.com/IST-DASLab/MatGPTQ/tree/0e5bd93bc53381f7195db870f5408ae04906bb3c) supplies the official full evaluation. It uses WikiText-2 raw test, `"\n\n"` concatenation, the slow tokenizer, no special tokens, 2048-token nonoverlapping blocks, drops the tail, and scores 2047 predictions per block at FP16 inference. Its script prints perplexity to **two decimal places**; the stored cross-entropy is `log` of this rounded number, with that limitation labeled in JSON. J01 separately runs an independent scorer over the same checkpoint and token construction; the official and independent values must be interpreted at the official display precision. The source model revision in all configs is `49e3418fbbbca6ecbdf9608b4d22e5a407081db4`; checkpoint content hashes and token hashes are recorded at execution.
 
-The [pinned AutoRound revision](https://github.com/intel/auto-round/tree/6c824f741be358983baba87aff83f9c5aa0a01e7) provides the actual `auto-round-rtn` and `auto-round-opt-rtn` CLI recipes. These generate independent fake-format QDQ checkpoints. `W2A16` is the G128 scheme, while `W2A16G64` and `W2A16G32` set the smaller groups. Plain RTN uses no scale optimization or calibration; optimized RTN uses AutoRound's scale-search path and no gradient updates. The runner records the upstream CLI command and changed versus unchanged tensor names by exact FP16 comparison with the source. This reports observed coverage; a weight that happens to survive quantization exactly cannot be distinguished by this method alone. Review the AutoRound log and coverage before interpreting J04/J05 as matched to the seven-projection LP policy.
+The default [AutoRound revision](https://github.com/intel/auto-round/commit/6c824f741be358983baba87aff83f9c5aa0a01e7) is dated **November 3, 2026**, after the August RRQ preprint. It remains the validated low-level B3 reference and is labeled a *current official AutoRound reproduction*, not a historical RRQ implementation. A separate [July 6, 2026 `v0.14.0` revision](https://github.com/intel/auto-round/commit/24bfce00bb3bd053498232f0e8395118fe10a906) supports the plain and optimized RTN CLI recipes with W2A16 and fake export. It is offered as `preprint_candidate`; it predates the preprint but has not been established as RRQ's exact revision or GPU-validated with Qwen3-8B. Its results use separate `j04/preprint_candidate/` through `j07/preprint_candidate/` directories.
+
+Both revisions expose `auto-round-rtn` and `auto-round-opt-rtn`. `W2A16` is G128; `W2A16G64` and `W2A16G32` set the smaller groups. Commands explicitly fix zero tuning iterations, the recipe's configured `nsamples` (1 plain, 128 optimized), FP16 model loading, and fake QDQ export. The upstream RTN zero-shot path is expected to consume no calibration examples; `nsamples` is **not** an observed consumption count, and runtime consumption remains unverified until logs are inspected. Optimized symmetric 2-bit RTN uses the source's ±90 index scale search at 0.01 increments. The runner records actual checkpoint tensor dtypes, upstream exported module-selection metadata when present, and a separate changed-versus-unchanged FP16 weight diagnostic. The weight diagnostic alone cannot prove the selected module set: an eligible weight can remain exactly unchanged after quantization. If fake export omits module-selection metadata, the result explicitly reports that limitation. Review the AutoRound log and coverage before interpreting J04/J05 as matched to the seven-projection LP policy.
 
 J08 is **unavailable**. The exact RRQ SignRoundV2 calibration dataset, sample count, iterations, learning rate, optimizer, coverage, and historical implementation recipe could not be established. Its proposal is to use an isolated pinned official AutoRound calibration workflow only after those fields and adequate GPU/host memory have been verified. No substitute quantizer is run as an RRQ reproduction.
 
-J09–J14 restore selected original BF16 tensors into the verified B3 FP16 QDQ checkpoint, without re-quantizing the remaining B3 tensors. Their default screen is the existing eight-block diagnostic, which is distinct from the optional full MatGPTQ evaluation. The compact hybrid footprint counts the B3 files still needed for decoding, the restored BF16 Safetensors files (including headers), and the hybrid reference manifest. The on-disk full QDQ checkpoint footprint is reported separately. The hybrids have mixed effective precision and must not be described as uniformly 2-bit.
+J09–J14 restore selected original BF16 tensors into the verified B3 FP16 QDQ checkpoint, without re-quantizing the remaining B3 tensors. Their default screen is the existing eight-block diagnostic, distinct from optional full MatGPTQ evaluation. `estimated_logical_compact_bytes` counts referenced B3 decoder files, restored BF16 Safetensors shards, and the hybrid reference manifest. It is a **logical estimate**, not a physically measured self-contained compressed package. Actual QDQ checkpoint Safetensors and metadata bytes are reported separately. An independently deployable compressed representation would require copying its selected B3 streams, shared tensors, sidecars, base manifest, restored shards, and hybrid manifest into one package and measuring that package; this branch does not build one. The hybrids have mixed effective precision and must not be described as uniformly 2-bit.
 
 Official AutoRound's `fake` export is a QDQ checkpoint, so it has a measured QDQ Safetensors footprint but no claimed packed effective bpp. Its result table cell remains empty until an independent packed representation is built and measured. The dataset loader in the historical MatGPTQ script does not pin a Hub revision; the run records the resolved dataset version and fingerprint instead.
 
 ## Deploy and verify
 
-Run these commands **on AWS**; they have not been run locally. The setup script clones the LP environment into separate AutoRound and MatGPTQ environments, then installs each pinned upstream dependency set only into its clone. The batch runner and official evaluator use the MatGPTQ clone, while the AutoRound CLI uses its own clone. The original LP environment is untouched.
+Run these commands **on AWS**; they have not been run locally. The setup script clones the LP environment into separate MatGPTQ and optional AutoRound environments, then installs each upstream dependency set only into its clone. J01–J03 need only MatGPTQ; set `RRQ_SETUP_AUTOROUND=0` for their setup. The batch runner and evaluator use the MatGPTQ clone; AutoRound CLI uses its own clone. The original LP environment is untouched.
 
 ```bash
 export LP_ROOT=/shared/makhtar/lp_llm
@@ -33,14 +35,15 @@ conda activate /shared/makhtar/lp_llm/envs/lp_llm
 source /shared/makhtar/lp_llm/env.sh
 unset TRANSFORMERS_CACHE
 python -m pytest tests -q
-bash hpc/rrq_w2/setup_reference_env.sh
+RRQ_SETUP_AUTOROUND=0 bash hpc/rrq_w2/setup_reference_env.sh
 "$LP_ROOT/envs/rrq_matgptq/bin/python" -m pytest tests/test_rrq_w2.py -q
 git -C "$LP_ROOT/references/rrq_w2/MatGPTQ" rev-parse HEAD
+# Install current official AutoRound separately before J04/J05:
+bash hpc/rrq_w2/setup_reference_env.sh
 git -C "$LP_ROOT/references/rrq_w2/auto-round" rev-parse HEAD
-bash hpc/rrq_w2/preflight.sh
 ```
 
-Run the preflight on a GPU allocation, for example `srun --account=acc-makhtar --partition=gpu --gres=gpu:1 --mem=12G --time=00:15:00 --pty bash`, or let the batch script run it within each allocation. It requires at least 18 GB free GPU memory by default; raise `RRQ_MIN_GPU_FREE_MB` for a larger model or recipe. Use `sbatch --mem=... --cpus-per-task=... --time=...` to override the 12 GB, 4 CPU, 12 hour defaults per job when preflight or resource monitoring indicates more is needed. Check QoS limits before increasing time. AutoRound's full 8B export may need more than 12 GB host memory; the default preserves the established A10G allocation and is intentionally overridden when required.
+The batch script runs preflight within its allocation. It checks the relevant reference environment, pinned source, 20 GB free GPU memory, and a host allocation of at least 12 GB. All jobs start from the previously successful **12 GB** request because A10G host RAM is limited. AutoRound 8B export may require more: set `RRQ_AUTOROUND_MEM` and `RRQ_MIN_HOST_MEMORY_MB` only after confirming the node can offer the requested memory. CPU, memory, and wall time can also be overridden with `sbatch` options within QoS limits. Neither preflight nor these defaults prove the 8B run will fit.
 
 J01–J05 establish evaluation and official pipeline comparability. Inspect them before interpreting J06–J14. J03 evaluates the **existing** BF16 B3 checkpoint using official MatGPTQ; it does not rerun the previously submitted LP B3 full evaluator.
 
@@ -48,7 +51,7 @@ J01–J05 establish evaluation and official pipeline comparability. Inspect them
 cd /shared/makhtar/lp_llm/code
 RRQ_CONCURRENCY=2 bash hpc/rrq_w2/submit_selected.sh j01 j02 j03 j04 j05
 # equivalent single job:
-sbatch --export=ALL,EXPERIMENT_ID=j04 hpc/rrq_w2/run_experiment.sbatch
+sbatch --mem=12G --export=ALL,EXPERIMENT_ID=j04 hpc/rrq_w2/run_experiment.sbatch
 squeue -u "$USER" -o '%.18i %.24j %.2t %.10M %R'
 ls -lh /shared/makhtar/lp_llm/logs/rrq-w2-*.out
 python -m lp_llm.rrq_aggregate --result-root "$RESULT_ROOT"
@@ -65,6 +68,13 @@ To resume, submit the **same** job ID and stage again. Valid completed stage mar
 
 ```bash
 sbatch --export=ALL,EXPERIMENT_ID=j09,RRQ_STAGE=full hpc/rrq_w2/run_experiment.sbatch
+```
+
+J01–J07 always create one `full.json` identity even if `RRQ_STAGE=screen` is supplied; rerunning with `RRQ_STAGE=full` resumes that result. J09–J14 retain separate `diagnostic.json` and `full.json`. To try the separate July AutoRound candidate after installing its isolated environment, run:
+
+```bash
+RRQ_SETUP_AUTOROUND=0 RRQ_SETUP_HISTORICAL=1 bash hpc/rrq_w2/setup_reference_env.sh
+sbatch --mem=12G --export=ALL,EXPERIMENT_ID=j04,RRQ_AUTOROUND_VARIANT=preprint_candidate hpc/rrq_w2/run_experiment.sbatch
 ```
 
 Each job writes under `$RESULT_ROOT/rrq_w2_reproduction/jNN/`. Inspect `run.json`, `encoding_complete.json` where applicable, `diagnostic.json`, `full.json`, `autoround.log`, and `matgptq.log`. Aggregate with:
