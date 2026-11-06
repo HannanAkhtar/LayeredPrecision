@@ -1,5 +1,7 @@
 # Layered Precision Reproducibility Code
 
+The RRQ 2-bit Qwen3 reproduction branch has an [AWS execution guide](docs/rrq_w2_reproduction.md) with pinned upstream revisions, experiment mappings, and selected-job submission commands. No new full-model results are included in the branch.
+
 This directory contains the minimal code used for the paper's post-training
 Layered Precision (LP) experiments on ImageNet classification and per-signal
 NGP image/audio models. Exploratory numerical formats, BN folding and

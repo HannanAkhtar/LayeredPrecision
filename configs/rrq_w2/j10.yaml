@@ -1,0 +1,11 @@
+id: j10
+kind: hybrid
+mode: v_proj,o_proj
+model_id: Qwen/Qwen3-8B-Base
+model_revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
+bits: 2
+group_size: 128
+symmetric: true
+checkpoint_dtype: mixed_bfloat16_float16
+inference_dtype: float16
+evaluation_protocol: matgptq_wikitext2_2048_slow
