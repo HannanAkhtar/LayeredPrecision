@@ -13,9 +13,8 @@ from .storage import atomic_json
 def aggregate(result_root: Path) -> dict:
     root = Path(result_root) / "rrq_w2_reproduction"
     rows = []
-    for experiment_id in MODES:
-        config = load_config(experiment_id)
-        job = root / experiment_id
+    def add_row(experiment_id: str, config: dict, job: Path,
+                reference_variant: str = "current") -> None:
         diagnostic_path, full_path = job / "diagnostic.json", job / "full.json"
         diagnostic = json.loads(diagnostic_path.read_text()) if diagnostic_path.exists() else None
         full = json.loads(full_path.read_text()) if full_path.exists() else None
@@ -23,6 +22,9 @@ def aggregate(result_root: Path) -> dict:
             if value and (value.get("status") != "complete" or
                           value.get("configuration", {}).get("config_sha256") != config["config_sha256"]):
                 raise ValueError(f"Incomplete or inconsistent result: {path}")
+            if value and config["kind"] == "autoround" and value.get("identity", {}).get(
+                    "autoround_variant") != reference_variant:
+                raise ValueError(f"Wrong AutoRound reference variant: {path}")
         report = (diagnostic or full or {}).get("construction", {})
         restored_names = report.get("identity", {}).get("restored_names")
         configured_names = report.get("configured_module_selection", {}).get("selected_module_names")
@@ -32,8 +34,15 @@ def aggregate(result_root: Path) -> dict:
                     f"{len(configured_names)} configured" if configured_names is not None else
                     f"{len(changed_names)} changed (selection unavailable)" if changed_names is not None else
                     f"{len(eligible_names)} LP eligible" if eligible_names is not None else None)
-        rows.append({"id": experiment_id, "quantizer": config["mode"], "bits": config["bits"],
-                     "group": config["group_size"],
+        rows.append({"id": experiment_id if reference_variant == "current" else
+                     f"{experiment_id}/{reference_variant}",
+                     "reference_variant": reference_variant if config["kind"] == "autoround" else None,
+                     "quantizer": ("original checkpoint" if experiment_id == "j01" else
+                                   "B3 optimized RTN + BF16 restoration" if config["kind"] == "hybrid" else
+                                   config["mode"]),
+                     "bits": None if experiment_id == "j01" else
+                             "mixed (2/BF16)" if config["kind"] == "hybrid" else config["bits"],
+                     "group": None if experiment_id == "j01" else config["group_size"],
                      "coverage": coverage,
                      "effective_bpp": report.get("estimated_effective_bits_per_total_parameter",
                                                  report.get("effective_bits_per_total_parameter")),
@@ -41,6 +50,13 @@ def aggregate(result_root: Path) -> dict:
                      "full_ppl": full["score"]["perplexity"] if full else None,
                      "status": "unavailable" if config["kind"] == "unavailable" else
                      "full_complete" if full else "screen_complete" if diagnostic else "pending"})
+    for experiment_id in MODES:
+        config = load_config(experiment_id)
+        job = root / experiment_id
+        add_row(experiment_id, config, job)
+        historical = job / "preprint_candidate"
+        if config["kind"] == "autoround" and historical.exists():
+            add_row(experiment_id, config, historical, "preprint_candidate")
     value = {"measured_results_only": True, "rows": rows}
     root.mkdir(parents=True, exist_ok=True)
     atomic_json(root / "aggregate.json", value)

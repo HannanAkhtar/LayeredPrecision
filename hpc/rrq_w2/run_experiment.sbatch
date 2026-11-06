@@ -20,15 +20,13 @@ LP_CODE="${LP_CODE:-$LP_ROOT/code}"
 LP_SOURCE="${LP_SOURCE:-$LP_ROOT/models/qwen3-8b-base}"
 RESULT_ROOT="${RESULT_ROOT:-$LP_ROOT/results/qwen3_8b_base}"
 REF_ROOT="${RRQ_REF_ROOT:-$LP_ROOT/references/rrq_w2}"
-MAT_PYTHON="${RRQ_MATGPTQ_ENV:-$LP_ROOT/envs/rrq_matgptq}/bin/python"
+LP_PYTHON="${RRQ_PYTHON:-$LP_ROOT/envs/lp_llm/bin/python}"
 variant="${RRQ_AUTOROUND_VARIANT:-current}"
 case "$variant" in
   current)
-    AUTO_SOURCE="$REF_ROOT/auto-round"
-    export RRQ_AUTOROUND_BIN_DIR="${RRQ_AUTOROUND_ENV:-$LP_ROOT/envs/rrq_autoround}/bin" ;;
+    AUTO_SOURCE="$REF_ROOT/auto-round" ;;
   preprint_candidate)
-    AUTO_SOURCE="$REF_ROOT/auto-round-preprint-candidate"
-    export RRQ_AUTOROUND_BIN_DIR="${RRQ_AUTOROUND_HISTORICAL_ENV:-$LP_ROOT/envs/rrq_autoround_historical}/bin" ;;
+    AUTO_SOURCE="$REF_ROOT/auto-round-preprint-candidate" ;;
   *) echo "ERROR: unknown AutoRound variant: $variant" >&2; exit 1 ;;
 esac
 source /opt/miniconda/etc/profile.d/conda.sh
@@ -40,7 +38,7 @@ cd "$LP_CODE"
 bash hpc/rrq_w2/preflight.sh
 stage="${RRQ_STAGE:-screen}"
 echo "[START] $EXPERIMENT_ID stage=$stage"
-"$MAT_PYTHON" -m lp_llm.rrq_runner --experiment-id "$EXPERIMENT_ID" --source "$LP_SOURCE" \
+"$LP_PYTHON" -m lp_llm.rrq_runner --experiment-id "$EXPERIMENT_ID" --source "$LP_SOURCE" \
   --result-root "$RESULT_ROOT" --matgptq-source "$REF_ROOT/MatGPTQ" \
   --autoround-source "$AUTO_SOURCE" --autoround-variant "$variant" --stage "$stage"
 echo "[COMPLETE] $EXPERIMENT_ID stage=$stage"

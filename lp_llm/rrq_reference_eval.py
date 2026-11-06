@@ -13,13 +13,14 @@ import torch
 
 from .rrq_w2 import MATGPTQ_COMMIT
 from .rrq_process import run_logged
+from .rrq_runtime import probe
 
 
 def check_revision(checkout: Path, expected: str = MATGPTQ_COMMIT) -> str:
     actual = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
     if actual != expected:
         raise ValueError(f"Upstream checkout {checkout} is {actual}; expected {expected}")
-    if subprocess.run(["git", "-C", str(checkout), "diff", "--quiet"], check=False).returncode:
+    if subprocess.run(["git", "-C", str(checkout), "diff", "--quiet", "HEAD"], check=False).returncode:
         raise ValueError(f"Upstream checkout has modified tracked files: {checkout}")
     return actual
 
@@ -137,11 +138,14 @@ def run(checkout: Path, checkpoint: Path, log: Path, *, python: str | None = Non
     if not (checkout / "eval_ppl.py").is_file():
         raise FileNotFoundError(checkout / "eval_ppl.py")
     cmd = command(checkout, checkpoint, python)
+    runtime = probe(cmd[0], ["torch", "transformers", "datasets", "accelerate", "safetensors", "numpy"])
     execution = run_logged(cmd, log, cwd=checkout)
     if execution["returncode"]:
         raise RuntimeError(f"MatGPTQ evaluator failed ({execution['returncode']}); see {log}")
     ppl = parse_perplexity(log.read_text(encoding="utf-8"))
     return {"implementation": "official_matgptq", "revision": MATGPTQ_COMMIT,
+            "runtime_dependency_mode": "official_source_with_existing_LP_environment",
+            "source_checkout": str(checkout.resolve()), "runtime_imports": runtime,
             "command": cmd, "log": str(log), "execution": execution, "perplexity": ppl,
             "cross_entropy": math.log(ppl), "reported_precision": "perplexity rounded to 2 decimal places by upstream script",
             "cross_entropy_precision": "derived from rounded upstream perplexity"}

@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from lp_llm.rrq_hybrid import build, selected_names
 from lp_llm.rrq_reference_eval import (aggregate, blocks, check_revision, command,
                                        local_score, parse_perplexity)
 from lp_llm.rrq_process import run_logged
+from lp_llm.rrq_runtime import probe, source_environment
+from lp_llm.rrq_overlay import planned_packages, install as install_overlay
 from lp_llm.rrq_w2 import (AUTOROUND_COMMIT, AUTOROUND_HISTORICAL_COMMIT,
                            MODES, completion_matches, load_config)
 
@@ -30,7 +33,9 @@ def test_all_explicit_mappings_and_upstream_commands(tmp_path):
         assert config["bits"] == 2 and config["symmetric"] is True
         if kind == "autoround":
             args = autoround_command(config, Path("/model"), Path("/out"))
-            assert args[0].endswith("auto-round-rtn" if mode == "plain" else "auto-round-opt-rtn")
+            assert args[0] == sys.executable and args[1] == "-c"
+            function = "run_rtn" if mode == "plain" else "run_opt_rtn"
+            assert args[2] == f"from auto_round.cli.main import {function}; {function}()"
             assert args[args.index("--scheme") + 1] == ("W2A16" if group == 128 else f"W2A16G{group}")
             assert args[args.index("--format") + 1] == "fake"
             assert args[args.index("--iters") + 1] == "0"
@@ -43,6 +48,82 @@ def test_all_explicit_mappings_and_upstream_commands(tmp_path):
     assert "--use_fast_tokenizer" not in args
     assert args[args.index("--sequence_length") + 1] == "2048"
     assert load_config("j08")["availability"] == "blocked"
+
+
+def test_source_pythonpath_and_actual_import_resolution(tmp_path):
+    checkout = tmp_path / "auto-round"
+    overlay = tmp_path / "extra_deps"
+    module = checkout / "auto_round"
+    module.mkdir(parents=True)
+    (module / "__init__.py").write_text("__version__ = 'test-source'\n")
+    overlay.mkdir()
+    env = source_environment(checkout, overlay, base={"PYTHONPATH": "existing"})
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(checkout.resolve()),
+                                                     str(overlay.resolve()), "existing"]
+    runtime = probe(sys.executable, ["auto_round"], env=source_environment(checkout, overlay))
+    assert Path(runtime["modules"]["auto_round"]["file"]).resolve().is_relative_to(checkout)
+    assert runtime["modules"]["auto_round"]["version"] == "test-source"
+
+
+def test_source_based_autoround_help_invocation(tmp_path):
+    checkout = tmp_path / "upstream"
+    cli = checkout / "auto_round/cli"
+    cli.mkdir(parents=True)
+    (cli.parent / "__init__.py").write_text("")
+    (cli / "__init__.py").write_text("")
+    (cli / "main.py").write_text("import sys\n"
+                                "def run_rtn(): print('plain', sys.argv[1:])\n"
+                                "def run_opt_rtn(): print('optimized', sys.argv[1:])\n")
+    for mode, expected in (("plain", "plain"), ("optimized", "optimized")):
+        args = autoround_command(load_config("j04" if mode == "plain" else "j05"),
+                                 Path("/model"), Path("/out"))
+        result = run_logged(args[:3] + ["--help"], tmp_path / f"{mode}.log",
+                            env=source_environment(checkout))
+        assert result["returncode"] == 0
+        assert expected in (tmp_path / f"{mode}.log").read_text()
+
+
+def test_overlay_plans_only_missing_supplemental_packages(monkeypatch):
+    import lp_llm.rrq_overlay as overlay
+    present = {"filelock", "requests", "typing_extensions", "charset_normalizer",
+               "idna", "urllib3", "certifi"}
+    monkeypatch.setattr(overlay, "available", lambda module: module in present)
+    pins = planned_packages()
+    assert "pydantic==2.12.5" in pins and "pydantic-core==2.41.5" in pins
+    assert "py-cpuinfo==9.0.0" in pins
+    assert not any(pin.startswith(("torch", "transformers", "numpy", "requests", "filelock")) for pin in pins)
+
+
+def test_overlay_install_is_targeted_atomic_and_idempotent(tmp_path, monkeypatch):
+    import lp_llm.rrq_overlay as overlay
+    commands = []
+    core_version = ["2.41.5"]
+    monkeypatch.setattr(overlay, "planned_packages", lambda: ["pydantic==2.12.5", "pydantic-core==2.41.5"])
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return type("Done", (), {"returncode": 0, "stderr": ""})()
+    monkeypatch.setattr(overlay.subprocess, "run", fake_run)
+    def fake_probe(_python, modules, *, env):
+        root = Path(env["PYTHONPATH"].split(os.pathsep)[0])
+        return {"modules": {name: {"file": str(root / name / "__init__.py"),
+                                    "version": "2.12.5" if name == "pydantic" else
+                                    core_version[0] if name == "pydantic_core" else "unknown"}
+                            for name in modules}}
+    monkeypatch.setattr(overlay, "probe", fake_probe)
+    target = tmp_path / "extra_deps"
+    assert install_overlay(target)["status"] == "complete"
+    assert (target / "OVERLAY_COMPLETE.json").exists()
+    assert "--target" in commands[0] and "--no-deps" in commands[0]
+    assert "--only-binary=:all:" in commands[0]
+    assert install_overlay(target)["status"] == "already_complete"
+    assert len(commands) == 1
+    core_version[0] = "2.41.4"
+    with pytest.raises(ValueError, match="did not resolve"):
+        install_overlay(target)
+    core_version[0] = "2.41.5"
+    (target / "OVERLAY_COMPLETE.json").unlink()
+    with pytest.raises(ValueError, match="Incomplete"):
+        install_overlay(target)
 
 
 def test_reference_blocks_loss_weighting_and_printed_result():
@@ -150,6 +231,30 @@ def test_official_runner_refuses_to_replace_partial_checkpoint(tmp_path, monkeyp
     with pytest.raises(ValueError, match="overwrite"):
         autoround_run(load_config("j04"), tmp_path / "source", output,
                       tmp_path / "upstream", tmp_path / "log")
+
+
+def test_missing_autoround_dependency_fails_before_quantization(tmp_path, monkeypatch):
+    import lp_llm.rrq_autoround as upstream
+    monkeypatch.setattr(upstream, "check_revision", lambda *args: None)
+    monkeypatch.setattr(upstream, "verify_upstream_recipe", lambda *args: {"recipe_name": "rtn"})
+    monkeypatch.setattr(upstream, "probe", lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("No module named pydantic")))
+    monkeypatch.setattr(upstream, "run_logged", lambda *args, **kwargs: pytest.fail("quantization launched"))
+    with pytest.raises(RuntimeError, match="pydantic"):
+        autoround_run(load_config("j04"), tmp_path / "source", tmp_path / "output",
+                      tmp_path / "upstream", tmp_path / "log")
+
+
+def test_incomplete_overlay_fails_before_autoround_import(tmp_path, monkeypatch):
+    import lp_llm.rrq_autoround as upstream
+    overlay = tmp_path / "extra_deps"
+    overlay.mkdir()
+    monkeypatch.setattr(upstream, "check_revision", lambda *args: None)
+    monkeypatch.setattr(upstream, "verify_upstream_recipe", lambda *args: {"recipe_name": "rtn"})
+    monkeypatch.setattr(upstream, "probe", lambda *args, **kwargs: pytest.fail("import probe started"))
+    with pytest.raises(ValueError, match="Incomplete"):
+        autoround_run(load_config("j04"), tmp_path / "source", tmp_path / "output",
+                      tmp_path / "upstream", tmp_path / "log", overlay=overlay)
 
 
 def test_unavailable_recipe_fails_before_any_model_access(tmp_path):
@@ -347,7 +452,23 @@ def test_aggregate_reports_only_measured_values(tmp_path):
     rows = report(tmp_path)["rows"]
     assert len(rows) == 14
     assert rows[0]["full_ppl"] is None
+    assert rows[0]["bits"] is None and rows[0]["group"] is None
+    assert next(row for row in rows if row["id"] == "j09")["bits"] == "mixed (2/BF16)"
     assert next(row for row in rows if row["id"] == "j08")["status"] == "unavailable"
+
+
+def test_aggregate_includes_historical_reference_without_relabeling_current(tmp_path):
+    path = tmp_path / "rrq_w2_reproduction/j04/preprint_candidate/full.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"status": "complete", "identity": {
+        "autoround_variant": "preprint_candidate"},
+        "configuration": {"config_sha256": load_config("j04")["config_sha256"]},
+        "construction": {}, "score": {"perplexity": 10.0}}))
+    rows = report(tmp_path)["rows"]
+    assert len(rows) == 15
+    current = next(row for row in rows if row["id"] == "j04")
+    historical = next(row for row in rows if row["id"] == "j04/preprint_candidate")
+    assert current["status"] == "pending" and historical["full_ppl"] == 10.0
 
 
 def test_slurm_scripts_are_explicit_and_do_not_submit_on_import():
@@ -365,3 +486,6 @@ def test_slurm_scripts_are_explicit_and_do_not_submit_on_import():
     assert 'RRQ_SETUP_AUTOROUND:-1' in setup and 'RRQ_SETUP_HISTORICAL:-0' in setup
     assert 'j04|j05|j06|j07)' in preflight
     assert 'RRQ_AUTOROUND_MEM:-12G' in helper
+    assert "conda create" not in setup and "pip install" not in setup
+    assert 'RRQ_PYTHON:-$LP_ROOT/envs/lp_llm/bin/python' in batch
+    assert "rrq_matgptq" not in batch and "auto-round-rtn" not in preflight

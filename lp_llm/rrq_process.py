@@ -17,12 +17,13 @@ def gpu_used_mb() -> int | None:
         return None
 
 
-def run_logged(command: list[str], log: Path, *, cwd: Path | None = None) -> dict:
+def run_logged(command: list[str], log: Path, *, cwd: Path | None = None,
+               env: dict[str, str] | None = None) -> dict:
     log.parent.mkdir(parents=True, exist_ok=True)
     begun = time.monotonic()
     peak = None
     with log.open("w", encoding="utf-8") as handle:
-        process = subprocess.Popen(command, cwd=cwd, text=True, stdout=handle,
+        process = subprocess.Popen(command, cwd=cwd, env=env, text=True, stdout=handle,
                                    stderr=subprocess.STDOUT)
         while process.poll() is None:
             used = gpu_used_mb()

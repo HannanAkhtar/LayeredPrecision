@@ -5,26 +5,27 @@ from __future__ import annotations
 import ast
 import json
 import math
-import os
-import subprocess
+import sys
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
 from .rrq_reference_eval import check_revision
+from .rrq_overlay import validate_overlay
 from .rrq_process import run_logged
+from .rrq_runtime import probe, source_environment
 from .rrq_w2 import AUTOROUND_COMMIT
 from .storage import atomic_json, sha256
 
 
-def command(config: dict, source: Path, output: Path) -> list[str]:
+def command(config: dict, source: Path, output: Path, *, python: str | None = None) -> list[str]:
     if config["kind"] != "autoround":
         raise ValueError("Expected official AutoRound configuration")
-    executable = "auto-round-rtn" if config["mode"] == "plain" else "auto-round-opt-rtn"
-    executable = str(Path(os.environ.get("RRQ_AUTOROUND_BIN_DIR", "")) / executable)
+    function = "run_rtn" if config["mode"] == "plain" else "run_opt_rtn"
+    entry = f"from auto_round.cli.main import {function}; {function}()"
     scheme = "W2A16" if config["group_size"] == 128 else f"W2A16G{config['group_size']}"
-    return [executable, "--model", str(source), "--scheme", scheme,
+    return [python or sys.executable, "-c", entry, "--model", str(source), "--scheme", scheme,
             "--iters", "0", "--nsamples", "1" if config["mode"] == "plain" else "128",
             "--model_dtype", "float16",
             "--format", "fake", "--output_dir", str(output)]
@@ -122,13 +123,24 @@ def compare_coverage(source: Path, checkpoint: Path) -> dict:
 
 
 def run(config: dict, source: Path, output: Path, checkout: Path, log: Path,
-        *, revision: str = AUTOROUND_COMMIT) -> dict:
+        *, revision: str = AUTOROUND_COMMIT, python: str | None = None,
+        overlay: Path | None = None) -> dict:
     check_revision(checkout, revision)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Refusing to overwrite existing official output: {output}")
     upstream_recipe = verify_upstream_recipe(checkout, config)
-    cmd = command(config, source, output)
-    execution = run_logged(cmd, log)
+    selected_overlay = overlay if overlay is not None else checkout.parent / "extra_deps"
+    env = source_environment(checkout, selected_overlay)
+    cmd = command(config, source, output, python=python)
+    if selected_overlay.exists():
+        validate_overlay(selected_overlay, cmd[0])
+    runtime = probe(cmd[0], ["auto_round", "auto_round.cli.main", "pydantic", "cpuinfo",
+                             "filelock", "requests", "torch", "transformers", "datasets",
+                             "accelerate", "numpy"], env=env)
+    imported = runtime["modules"]["auto_round.cli.main"]["file"]
+    if not imported or not Path(imported).resolve().is_relative_to(checkout.resolve()):
+        raise RuntimeError(f"AutoRound import resolved outside pinned checkout: {imported}")
+    execution = run_logged(cmd, log, env=env)
     if execution["returncode"]:
         raise RuntimeError(f"Official AutoRound failed ({execution['returncode']}); see {log}")
     checkpoint = validate_output(output)
@@ -140,6 +152,8 @@ def run(config: dict, source: Path, output: Path, checkout: Path, log: Path,
             "reference_class": "post_preprint_current_official" if revision == AUTOROUND_COMMIT
                                else "preprint_era_candidate_not_confirmed_RRQ_revision",
             "command": cmd, "log": str(log), "execution": execution, "checkpoint": checkpoint,
+            "source_checkout": str(checkout.resolve()), "dependency_overlay": str(selected_overlay.resolve()),
+            "runtime_imports": runtime,
             "upstream_recipe": upstream_recipe,
             "resolved_recipe": config["quantizer_configuration"],
             "source_config_torch_dtype": source_config.get("torch_dtype"),

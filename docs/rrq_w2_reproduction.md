@@ -8,7 +8,7 @@ The [pinned MatGPTQ evaluator](https://github.com/IST-DASLab/MatGPTQ/tree/0e5bd9
 
 The default [AutoRound revision](https://github.com/intel/auto-round/commit/6c824f741be358983baba87aff83f9c5aa0a01e7) is dated **November 3, 2026**, after the August RRQ preprint. It remains the validated low-level B3 reference and is labeled a *current official AutoRound reproduction*, not a historical RRQ implementation. A separate [July 6, 2026 `v0.14.0` revision](https://github.com/intel/auto-round/commit/24bfce00bb3bd053498232f0e8395118fe10a906) supports the plain and optimized RTN CLI recipes with W2A16 and fake export. It is offered as `preprint_candidate`; it predates the preprint but has not been established as RRQ's exact revision or GPU-validated with Qwen3-8B. Its results use separate `j04/preprint_candidate/` through `j07/preprint_candidate/` directories.
 
-Both revisions expose `auto-round-rtn` and `auto-round-opt-rtn`. `W2A16` is G128; `W2A16G64` and `W2A16G32` set the smaller groups. Commands explicitly fix zero tuning iterations, the recipe's configured `nsamples` (1 plain, 128 optimized), FP16 model loading, and fake QDQ export. The upstream RTN zero-shot path is expected to consume no calibration examples; `nsamples` is **not** an observed consumption count, and runtime consumption remains unverified until logs are inspected. Optimized symmetric 2-bit RTN uses the source's ±90 index scale search at 0.01 increments. The runner records actual checkpoint tensor dtypes, upstream exported module-selection metadata when present, and a separate changed-versus-unchanged FP16 weight diagnostic. The weight diagnostic alone cannot prove the selected module set: an eligible weight can remain exactly unchanged after quantization. If fake export omits module-selection metadata, the result explicitly reports that limitation. Review the AutoRound log and coverage before interpreting J04/J05 as matched to the seven-projection LP policy.
+Both revisions expose `run_rtn()` and `run_opt_rtn()` from `auto_round.cli.main`. The runner invokes those upstream functions in a **subprocess**, with the selected source checkout first on `PYTHONPATH`; no AutoRound package installation is required. `W2A16` is G128; `W2A16G64` and `W2A16G32` set the smaller groups. Commands explicitly fix zero tuning iterations, the recipe's configured `nsamples` (1 plain, 128 optimized), FP16 model loading, and fake QDQ export. The upstream RTN zero-shot path is expected to consume no calibration examples; `nsamples` is **not** an observed consumption count, and runtime consumption remains unverified until logs are inspected. Optimized symmetric 2-bit RTN uses the source's ±90 index scale search at 0.01 increments. The runner records the actual imported AutoRound file, runtime package versions, checkpoint dtypes, upstream exported module-selection metadata when present, and a separate changed-versus-unchanged FP16 weight diagnostic. The weight diagnostic alone cannot prove the selected module set: an eligible weight can remain exactly unchanged after quantization. If fake export omits module-selection metadata, the result explicitly reports that limitation. Review the AutoRound log and coverage before interpreting J04/J05 as matched to the seven-projection LP policy.
 
 J08 is **unavailable**. The exact RRQ SignRoundV2 calibration dataset, sample count, iterations, learning rate, optimizer, coverage, and historical implementation recipe could not be established. Its proposal is to use an isolated pinned official AutoRound calibration workflow only after those fields and adequate GPU/host memory have been verified. No substitute quantizer is run as an RRQ reproduction.
 
@@ -18,7 +18,11 @@ Official AutoRound's `fake` export is a QDQ checkpoint, so it has a measured QDQ
 
 ## Deploy and verify
 
-Run these commands **on AWS**; they have not been run locally. The setup script clones the LP environment into separate MatGPTQ and optional AutoRound environments, then installs each upstream dependency set only into its clone. J01–J03 need only MatGPTQ; set `RRQ_SETUP_AUTOROUND=0` for their setup. The batch runner and evaluator use the MatGPTQ clone; AutoRound CLI uses its own clone. The original LP environment is untouched.
+Run these commands **on AWS**; they have not been run locally. All jobs use `/shared/makhtar/lp_llm/envs/lp_llm/bin/python` by default (`RRQ_PYTHON` overrides it for compatibility testing). Setup fetches and checks source revisions and imports only. It never clones an environment or installs packages. The official MatGPTQ script runs from its pinned source using the LP environment's runtime dependencies. This reproduces the historical **source protocol**, not MatGPTQ's original dependency environment. Its `--help` import succeeds in the confirmed LP environment; full data loading, numerical parity and inference remain to be checked on AWS.
+
+AutoRound's requirements include `pydantic`, `py-cpuinfo`, `filelock`, and `requests`. Check which are actually missing; the known missing package is `pydantic`. The explicit overlay installer uses pinned binary wheels and `pip --target` under `$LP_ROOT/references/rrq_w2/extra_deps`, with `--no-deps` to avoid installing or shadowing Torch, Transformers, CUDA, NumPy, or other working packages. It installs required Pydantic companions only where needed, validates imports, then atomically marks the overlay complete. It never writes to the LP environment. The interrupted `$LP_ROOT/envs/rrq_matgptq` directory is left untouched.
+
+If the source import still fails because of a real dependency conflict, stop and record the import error. A manual fallback is a small `venv --system-site-packages` made with the LP Python, followed by installation of only the conflicting supplemental packages there and an import probe. Verify that it can see the LP Torch/CUDA packages before use. Do not clone the full Conda environment or silently switch reference implementations.
 
 ```bash
 export LP_ROOT=/shared/makhtar/lp_llm
@@ -36,14 +40,18 @@ source /shared/makhtar/lp_llm/env.sh
 unset TRANSFORMERS_CACHE
 python -m pytest tests -q
 RRQ_SETUP_AUTOROUND=0 bash hpc/rrq_w2/setup_reference_env.sh
-"$LP_ROOT/envs/rrq_matgptq/bin/python" -m pytest tests/test_rrq_w2.py -q
+python -m pytest tests/test_rrq_w2.py -q
 git -C "$LP_ROOT/references/rrq_w2/MatGPTQ" rev-parse HEAD
-# Install current official AutoRound separately before J04/J05:
+# J01–J03 can now be submitted without any AutoRound dependencies.
+# Fetch the AutoRound checkout before J04/J05:
 bash hpc/rrq_w2/setup_reference_env.sh
 git -C "$LP_ROOT/references/rrq_w2/auto-round" rev-parse HEAD
+python -m lp_llm.rrq_overlay check --target "$LP_ROOT/references/rrq_w2/extra_deps"
+# Only if the check reports missing packages, explicitly install the overlay:
+python -m lp_llm.rrq_overlay install --target "$LP_ROOT/references/rrq_w2/extra_deps"
 ```
 
-The batch script runs preflight within its allocation. It checks the relevant reference environment, pinned source, 20 GB free GPU memory, and a host allocation of at least 12 GB. All jobs start from the previously successful **12 GB** request because A10G host RAM is limited. AutoRound 8B export may require more: set `RRQ_AUTOROUND_MEM` and `RRQ_MIN_HOST_MEMORY_MB` only after confirming the node can offer the requested memory. CPU, memory, and wall time can also be overridden with `sbatch` options within QoS limits. Neither preflight nor these defaults prove the 8B run will fit.
+The batch script runs preflight within its allocation. It checks the selected source revision and imports, the allocated GPU's free memory (20 GB default), and at least 12 GB host allocation. J01–J03 do not inspect AutoRound or its overlay. All jobs start from the previously successful **12 GB** request because A10G host RAM is limited. AutoRound 8B export may require more: set `RRQ_AUTOROUND_MEM` and `RRQ_MIN_HOST_MEMORY_MB` only after confirming the node can offer the requested memory. CPU, memory, and wall time can also be overridden with `sbatch` options within QoS limits. No installation occurs in GPU jobs. Neither preflight nor these defaults prove the 8B run will fit.
 
 J01–J05 establish evaluation and official pipeline comparability. Inspect them before interpreting J06–J14. J03 evaluates the **existing** BF16 B3 checkpoint using official MatGPTQ; it does not rerun the previously submitted LP B3 full evaluator.
 
@@ -70,7 +78,7 @@ To resume, submit the **same** job ID and stage again. Valid completed stage mar
 sbatch --export=ALL,EXPERIMENT_ID=j09,RRQ_STAGE=full hpc/rrq_w2/run_experiment.sbatch
 ```
 
-J01–J07 always create one `full.json` identity even if `RRQ_STAGE=screen` is supplied; rerunning with `RRQ_STAGE=full` resumes that result. J09–J14 retain separate `diagnostic.json` and `full.json`. To try the separate July AutoRound candidate after installing its isolated environment, run:
+J01–J07 always create one `full.json` identity even if `RRQ_STAGE=screen` is supplied; rerunning with `RRQ_STAGE=full` resumes that result. J09–J14 retain separate `diagnostic.json` and `full.json`. To try the separate July AutoRound candidate after fetching its pinned source, run:
 
 ```bash
 RRQ_SETUP_AUTOROUND=0 RRQ_SETUP_HISTORICAL=1 bash hpc/rrq_w2/setup_reference_env.sh

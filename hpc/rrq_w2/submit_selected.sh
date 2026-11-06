@@ -3,6 +3,7 @@ set -euo pipefail
 
 [[ "$#" -ge 1 ]] || { echo 'Usage: submit_selected.sh j01 [j02 ...]' >&2; exit 2; }
 limit="${RRQ_CONCURRENCY:-2}"
+lp_python="${RRQ_PYTHON:-${LP_ROOT:-/shared/makhtar/lp_llm}/envs/lp_llm/bin/python}"
 [[ "$limit" =~ ^[1-9][0-9]*$ ]] || { echo 'ERROR: RRQ_CONCURRENCY must be positive' >&2; exit 2; }
 declare -A seen=()
 for id in "$@"; do
@@ -18,10 +19,10 @@ for id in "$@"; do
   case "$id" in
     j04|j05|j06|j07)
       sbatch --mem="${RRQ_AUTOROUND_MEM:-12G}" \
-        --export="ALL,EXPERIMENT_ID=$id,RRQ_STAGE=${RRQ_STAGE:-screen},RRQ_AUTOROUND_VARIANT=${RRQ_AUTOROUND_VARIANT:-current}" \
+        --export="ALL,EXPERIMENT_ID=$id,RRQ_STAGE=${RRQ_STAGE:-screen},RRQ_AUTOROUND_VARIANT=${RRQ_AUTOROUND_VARIANT:-current},RRQ_PYTHON=$lp_python" \
         hpc/rrq_w2/run_experiment.sbatch ;;
     *)
-      sbatch --export="ALL,EXPERIMENT_ID=$id,RRQ_STAGE=${RRQ_STAGE:-screen}" \
+      sbatch --export="ALL,EXPERIMENT_ID=$id,RRQ_STAGE=${RRQ_STAGE:-screen},RRQ_PYTHON=$lp_python" \
         hpc/rrq_w2/run_experiment.sbatch ;;
   esac
 done
