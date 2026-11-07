@@ -184,7 +184,9 @@ def test_official_output_requires_an_existing_index_and_never_generates_one(tmp_
     assert value["resolved_checkpoint_path"] == str(tmp_path.resolve())
 
 
-def _tiny_official_export(tmp_path, *, nested=True, job_id="j04"):
+def _tiny_official_export(tmp_path, *, nested=True, job_id="j04",
+                          source_dtype=torch.float16, export_dtype=torch.float16,
+                          mixed=False):
     source = tmp_path / "source"
     export_root = tmp_path / "rrq_w2_reproduction" / job_id / "checkpoint"
     checkpoint = export_root / "source-w2g128" if nested else export_root
@@ -196,14 +198,17 @@ def _tiny_official_export(tmp_path, *, nested=True, job_id="j04"):
     torch.manual_seed(7)
     projections = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
     originals = {f"model.layers.0.{('mlp' if name in projections[-3:] else 'self_attn')}.{name}.weight":
-                 torch.randn(3, 130, dtype=torch.float16) for name in projections}
-    originals["model.embed_tokens.weight"] = torch.randn(3, 130, dtype=torch.float16)
+                 torch.randn(3, 130, dtype=source_dtype) for name in projections}
+    originals["model.embed_tokens.weight"] = torch.randn(3, 130, dtype=source_dtype)
     save_file(originals, str(source / "model.safetensors"))
     (source / "model.safetensors.index.json").write_text(json.dumps({
         "weight_map": {name: "model.safetensors" for name in originals}}))
-    decoded = {name: (weight.clone() if "embed_tokens" in name else
-                      (torch.clamp(torch.round(weight / 0.25), -2, 1) * 0.25).half())
-               for name, weight in originals.items()}
+    decoded = {}
+    for number, (name, weight) in enumerate(originals.items()):
+        stored_dtype = torch.float16 if mixed and number % 2 else export_dtype
+        decoded[name] = (weight.to(stored_dtype) if "embed_tokens" in name else
+                         (torch.clamp(torch.round(weight.float() / 0.25), -2, 1) *
+                          0.25).to(stored_dtype))
     names = sorted(decoded)
     mapping = {}
     for number, chunk in enumerate((names[:4], names[4:]), start=1):
@@ -232,6 +237,25 @@ def test_official_export_discovery_inventory_and_group_levels(tmp_path, nested):
         assert any(sample["length"] == 2 for sample in check["samples"])
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+def test_bf16_and_mixed_exports_record_actual_dtypes_and_pass_w2_checks(tmp_path, mixed):
+    source, export_root, checkpoint = _tiny_official_export(
+        tmp_path, source_dtype=torch.bfloat16, export_dtype=torch.bfloat16, mixed=mixed)
+    result = validate_output(export_root, source)
+    expected = {"BF16": 4, "F16": 4} if mixed else {"BF16": 8}
+    assert result["tensor_dtype_counts"] == expected
+    assert result["element_dtype_counts"] == {dtype: count * 3 * 130
+                                               for dtype, count in expected.items()}
+    assert result["checkpoint_dtypes"] == sorted(expected)
+    coverage = compare_coverage(source, checkpoint, group_size=128)
+    assert len(coverage["changed_tensor_names"]) == 7
+    assert coverage["unchanged_tensor_names"] == ["model.embed_tokens.weight"]
+    for check in coverage["representative_group_checks"].values():
+        assert all(sample["max_grid_residual"] <= sample["max_grid_tolerance"] and
+                   sample["stored_dtype"] in ("torch.bfloat16", "torch.float16")
+                   for sample in check["samples"])
+
+
 def test_official_group_check_rejects_four_arbitrary_levels(tmp_path):
     source, _, checkpoint = _tiny_official_export(tmp_path)
     mapping = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
@@ -242,6 +266,29 @@ def test_official_group_check_rejects_four_arbitrary_levels(tmp_path):
     save_file(tensors, str(shard))
     with pytest.raises(ValueError, match="scale grid"):
         compare_coverage(source, checkpoint, group_size=128)
+
+
+def test_bf16_group_check_still_rejects_arbitrary_levels(tmp_path):
+    source, _, checkpoint = _tiny_official_export(
+        tmp_path, source_dtype=torch.bfloat16, export_dtype=torch.bfloat16)
+    mapping = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
+    name = "model.layers.0.self_attn.q_proj.weight"
+    shard = checkpoint / mapping[name]
+    tensors = {key: value.clone() for key, value in load_file(str(shard)).items()}
+    tensors[name][0, :128] = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.bfloat16).repeat(32)
+    save_file(tensors, str(shard))
+    with pytest.raises(ValueError, match="scale grid"):
+        compare_coverage(source, checkpoint, group_size=128)
+
+
+def test_bf16_grid_tolerance_covers_one_stored_ulp():
+    from lp_llm.rrq_autoround import _w2_grid_check
+    values = torch.tensor([-1.0, -0.5, 0.0, 0.5], dtype=torch.bfloat16)
+    values[-1] = torch.nextafter(values[-1], torch.tensor(float("inf"), dtype=torch.bfloat16))
+    result = _w2_grid_check(values)
+    assert result["stored_dtype"] == "torch.bfloat16"
+    assert result["max_grid_residual"] > 0.002  # The former fixed FP16 bound rejected this.
+    assert result["max_grid_residual"] <= result["max_grid_tolerance"]
 
 
 def test_official_export_rejects_ambiguity_missing_shard_and_nonfinite(tmp_path):
@@ -262,15 +309,44 @@ def test_official_export_rejects_ambiguity_missing_shard_and_nonfinite(tmp_path)
     first = next(iter(tensors))
     tensors[first].reshape(-1)[0] = float("nan")
     save_file(tensors, str(shard))
-    with pytest.raises(ValueError, match="nonfinite"):
+    with pytest.raises(ValueError, match="Nonfinite"):
+        validate_output(export_root, source)
+
+
+@pytest.mark.parametrize("stored_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf")])
+def test_export_rejects_nonfinite_values_in_both_dtypes(tmp_path, stored_dtype, invalid):
+    source, export_root, checkpoint = _tiny_official_export(
+        tmp_path, source_dtype=torch.bfloat16, export_dtype=stored_dtype)
+    shard = checkpoint / "model-00001-of-00002.safetensors"
+    tensors = {name: value.clone() for name, value in load_file(str(shard)).items()}
+    tensors[next(iter(tensors))].reshape(-1)[0] = invalid
+    save_file(tensors, str(shard))
+    with pytest.raises(ValueError, match="Nonfinite"):
+        validate_output(export_root, source)
+
+
+def test_export_rejects_unsupported_dtype(tmp_path):
+    source, export_root, checkpoint = _tiny_official_export(tmp_path)
+    shard = checkpoint / "model-00001-of-00002.safetensors"
+    tensors = {name: value.clone() for name, value in load_file(str(shard)).items()}
+    first = next(iter(tensors))
+    tensors[first] = tensors[first].to(torch.int16)
+    save_file(tensors, str(shard))
+    with pytest.raises(ValueError, match="Unsupported"):
         validate_output(export_root, source)
 
 
 @pytest.mark.parametrize("job_id", ["j04", "j05"])
-def test_existing_nested_export_recovers_and_resumes_without_quantization(tmp_path, monkeypatch, job_id):
+@pytest.mark.parametrize("dtype_mode", ["fp16", "bf16", "mixed"])
+def test_existing_nested_export_recovers_and_resumes_without_quantization(
+        tmp_path, monkeypatch, job_id, dtype_mode):
     import lp_llm.rrq_runner as runner
     import lp_llm.rrq_autoround as upstream
-    source, export_root, checkpoint = _tiny_official_export(tmp_path, job_id=job_id)
+    source_dtype = torch.float16 if dtype_mode == "fp16" else torch.bfloat16
+    source, export_root, checkpoint = _tiny_official_export(
+        tmp_path, job_id=job_id, source_dtype=source_dtype,
+        export_dtype=source_dtype, mixed=dtype_mode == "mixed")
     job = export_root.parent
     (job / "run.json").write_text(json.dumps(runner.identity(load_config(job_id), source)))
     log = job / "autoround.log"
@@ -298,11 +374,20 @@ def test_existing_nested_export_recovers_and_resumes_without_quantization(tmp_pa
     marker = json.loads((job / "encoding_complete.json").read_text())
     assert marker["recovered_from_existing_export"] is True
     assert marker["recovery_provenance"]["log_evidence"]["upstream_exit_code"] is None
+    expected_dtypes = {"BF16": 4, "F16": 4} if dtype_mode == "mixed" else {
+        "F16" if dtype_mode == "fp16" else "BF16": 8}
+    assert marker["exported_checkpoint_tensor_dtypes"] == expected_dtypes
+    assert marker["requested_cli_model_dtype"] == "float16"
+    assert first["checkpoint_tensor_dtypes"] == expected_dtypes
+    assert first["inference_dtype"] == "float16"
+    assert first["configured_checkpoint_dtype_role"].startswith("YAML expectation")
     assert not (job / "diagnostic.json").exists()
     legacy = json.loads(json.dumps(marker))
     legacy.pop("checkpoint_path")
     legacy["checkpoint"].pop("resolved_checkpoint_path")
     legacy["checkpoint"].pop("tensor_payload_bytes")
+    legacy["checkpoint"].pop("tensor_dtype_counts")
+    legacy["checkpoint"].pop("element_dtype_counts")
     (job / "encoding_complete.json").write_text(json.dumps(legacy))
     assert runner.run(job_id, source, tmp_path, tmp_path, tmp_path,
                       reuse_export_only=True) == first
@@ -359,6 +444,28 @@ def test_official_coverage_uses_actual_weight_differences(tmp_path):
     coverage = compare_coverage(source, output)
     assert coverage["changed_tensor_names"] == ["b.weight"]
     assert coverage["unchanged_tensor_names"] == ["a.weight"]
+
+
+def test_bf16_coverage_avoids_fp16_overflow_and_retains_finite_error(tmp_path):
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    selected = "model.layers.0.self_attn.q_proj.weight"
+    excluded = "model.layers.0.post_attention_layernorm.weight"
+    original = {selected: torch.full((2, 128), 65536, dtype=torch.bfloat16),
+                excluded: torch.full((2,), 1.0, dtype=torch.bfloat16)}
+    exported = {selected: torch.full((2, 128), 66048, dtype=torch.bfloat16),
+                excluded: original[excluded].clone()}
+    for folder, tensors in ((source, original), (output, exported)):
+        save_file(tensors, str(folder / "model.safetensors"))
+        (folder / "model.safetensors.index.json").write_text(json.dumps({
+            "weight_map": {name: "model.safetensors" for name in tensors}}))
+    assert torch.equal(original[selected].half(), exported[selected].half())
+    coverage = compare_coverage(source, output, group_size=128)
+    assert coverage["changed_tensor_names"] == [selected]
+    assert coverage["unchanged_tensor_names"] == [excluded]
+    sample = coverage["representative_group_checks"]["q_proj"]["samples"][0]
+    assert sample["mse"] == 512 ** 2
 
 
 def test_upstream_module_metadata_is_distinct_from_weight_change(tmp_path):

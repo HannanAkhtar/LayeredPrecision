@@ -171,6 +171,7 @@ def run(experiment_id: str, source: Path, result_root: Path, matgptq_source: Pat
              "source_model_revision": config["model_revision"], "git_commit": _git_revision(),
              "checkpoint_path": str(checkpoint), "checkpoint_identity": _identity(checkpoint, "rrq-result"),
              "construction": construction, "configured_checkpoint_dtype": config["checkpoint_dtype"],
+             "configured_checkpoint_dtype_role": "YAML expectation; actual Safetensors dtypes are measured below",
              "checkpoint_tensor_dtypes": _checkpoint_dtypes(checkpoint),
              "inference_dtype": config["inference_dtype"], "score": score,
              "runtime_seconds": time.monotonic() - begun,

@@ -125,6 +125,8 @@ def validate_output(export_root: Path, source: Path | None = None) -> dict:
                 for name in handle.keys():
                     source_shapes[name] = tuple(handle.get_slice(name).get_shape())
     total_bytes = 0
+    dtype_counts: dict[str, int] = {}
+    dtype_elements: dict[str, int] = {}
     for shard in sorted(shards):
         with safe_open(checkpoint / shard, framework="pt", device="cpu") as handle:
             assigned = {name for name, filename in mapping.items() if filename == shard}
@@ -132,10 +134,15 @@ def validate_output(export_root: Path, source: Path | None = None) -> dict:
                 raise ValueError(f"AutoRound Safetensors index differs from {shard}")
             for name in assigned:
                 tensor = handle.get_tensor(name)
-                if tensor.dtype != torch.float16 or not torch.isfinite(tensor).all():
-                    raise ValueError(f"Non-FP16 or nonfinite AutoRound tensor: {name}")
+                if tensor.dtype not in (torch.float16, torch.bfloat16):
+                    raise ValueError(f"Unsupported AutoRound tensor dtype for {name}: {tensor.dtype}")
+                if not torch.isfinite(tensor).all():
+                    raise ValueError(f"Nonfinite AutoRound tensor: {name}")
                 if source_shapes is not None and tuple(tensor.shape) != source_shapes[name]:
                     raise ValueError(f"AutoRound tensor shape differs from original: {name}")
+                dtype = "F16" if tensor.dtype == torch.float16 else "BF16"
+                dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+                dtype_elements[dtype] = dtype_elements.get(dtype, 0) + tensor.numel()
                 total_bytes += tensor.numel() * tensor.element_size()
     declared_size = indexed.get("metadata", {}).get("total_size")
     if declared_size is not None and declared_size != total_bytes:
@@ -143,32 +150,48 @@ def validate_output(export_root: Path, source: Path | None = None) -> dict:
     return {"resolved_checkpoint_path": str(checkpoint),
             "config_sha256": sha256(config), "index_sha256": sha256(index),
             "shard_sha256": {s: sha256(checkpoint / s) for s in sorted(shards)},
-            "tensor_names": sorted(mapping), "checkpoint_dtypes": ["F16"],
+            "tensor_names": sorted(mapping), "checkpoint_dtypes": sorted(dtype_counts),
+            "tensor_dtype_counts": dtype_counts, "element_dtype_counts": dtype_elements,
             "tensor_payload_bytes": total_bytes,
             "qdq_checkpoint_safetensors_bytes": sum((checkpoint / s).stat().st_size for s in shards),
             "packed_representation_bytes": None}
 
 
 def _w2_grid_check(values: torch.Tensor) -> dict:
-    """Check that an FP16 QDQ group lies on one signed two-bit scale grid."""
-    values = values.float()
+    """Bound grid residual by the BF16/FP16 rounding of a value and scale anchor."""
+    observed = values.float()
     nonzero = torch.unique(values[values != 0].abs())
     if not nonzero.numel():
-        return {"scale": 0.0, "max_grid_residual": 0.0, "code_range": [-2, 1]}
-    tolerance = max(1e-7, 0.002 * float(nonzero.max()))
+        return {"scale": 0.0, "max_grid_residual": 0.0, "max_grid_tolerance": 0.0,
+                "code_range": [-2, 1], "stored_dtype": str(values.dtype)}
+    def spacing(items: torch.Tensor) -> torch.Tensor:
+        upward = torch.nextafter(items, torch.full_like(items, float("inf"))).float()
+        downward = torch.nextafter(items, torch.full_like(items, float("-inf"))).float()
+        middle = items.float()
+        upper_gap, lower_gap = (upward - middle).abs(), (middle - downward).abs()
+        return torch.maximum(torch.where(torch.isfinite(upper_gap), upper_gap, lower_gap),
+                             torch.where(torch.isfinite(lower_gap), lower_gap, upper_gap))
+    value_spacing = spacing(values)
+    arithmetic_margin = 4 * torch.finfo(torch.float32).eps * float(observed.abs().max())
     best = None
-    for scale in (float(value) / divisor for value in nonzero for divisor in (1, 2)):
-        if scale <= 0:
-            continue
-        for low, high in ((-2, 1), (-1, 2)):
-            codes = torch.clamp(torch.round(values / scale), low, high)
-            error = float(torch.max(torch.abs(values - codes * scale)))
-            if best is None or error < best[0]:
-                best = (error, scale, low, high)
+    for anchor in nonzero:
+        for divisor in (1, 2):
+            scale = float(anchor) / divisor
+            anchor_spacing = float(spacing(anchor))
+            for low, high in ((-2, 1), (-1, 2)):
+                codes = torch.clamp(torch.round(observed / scale), low, high)
+                residual = (observed - codes * scale).abs()
+                tolerance = (0.5 * value_spacing + 0.5 * codes.abs() *
+                             anchor_spacing / divisor + arithmetic_margin)
+                ratio = float((residual / tolerance.clamp_min(torch.finfo(torch.float32).tiny)).max())
+                if best is None or ratio < best[0]:
+                    best = (ratio, float(residual.max()), float(tolerance.max()), scale, low, high)
     assert best is not None
-    if best[0] > tolerance:
-        raise ValueError(f"AutoRound group is not on a signed W2 scale grid: residual={best[0]}")
-    return {"scale": best[1], "max_grid_residual": best[0], "code_range": [best[2], best[3]]}
+    if best[0] > 1:
+        raise ValueError(f"AutoRound group is not on a signed W2 scale grid: residual={best[1]}")
+    return {"scale": best[3], "max_grid_residual": best[1],
+            "max_grid_tolerance": best[2], "code_range": [best[4], best[5]],
+            "stored_dtype": str(values.dtype)}
 
 
 def compare_coverage(source: Path, checkpoint: Path, *, group_size: int | None = None) -> dict:
@@ -182,12 +205,12 @@ def compare_coverage(source: Path, checkpoint: Path, *, group_size: int | None =
     group_checks = {}
     for name in sorted(source_map):
         with safe_open(source / source_map[name], framework="pt", device="cpu") as handle:
-            original = handle.get_tensor(name).to(torch.float16)
+            original = handle.get_tensor(name)
         with safe_open(checkpoint / output_map[name], framework="pt", device="cpu") as handle:
             materialized = handle.get_tensor(name)
         if original.shape != materialized.shape or not torch.isfinite(materialized).all():
             raise ValueError(f"Nonfinite official output tensor: {name}")
-        different = not torch.equal(original, materialized.to(torch.float16))
+        different = not torch.equal(original, materialized)
         (changed if different else unchanged).append(name)
         projection = next((part for part in projections if name.endswith(f".{part}.weight")), None)
         if projection is not None:
@@ -225,7 +248,7 @@ def compare_coverage(source: Path, checkpoint: Path, *, group_size: int | None =
             "eligible_projection_types": sorted(eligible_seen),
             "changed_eligible_projection_types": sorted(eligible_changed),
             "representative_group_checks": group_checks,
-            "coverage_method": "exact_FP16_comparison_to_original_not_module_selection_metadata"}
+            "coverage_method": "native_value_comparison_to_original_not_module_selection_metadata"}
 
 
 def _inspect_export(config: dict, source: Path, export_root: Path) -> tuple[Path, dict, dict]:
@@ -277,6 +300,9 @@ def recover(config: dict, source: Path, export_root: Path, checkout: Path, log: 
                 "cli_verification": "run.json identity, pinned recipe, log mode/model and W2 group export name; "
                                     "original subprocess argv and exit code were not persisted"},
             "checkpoint_path": str(resolved), "checkpoint": checkpoint,
+            "requested_cli_model_dtype": config["quantizer_configuration"]["model_dtype_argument"],
+            "exported_checkpoint_tensor_dtypes": checkpoint["tensor_dtype_counts"],
+            "exported_checkpoint_elements_by_dtype": checkpoint["element_dtype_counts"],
             "source_checkout": str(checkout.resolve()),
             "upstream_recipe": upstream_recipe,
             "resolved_recipe": config["quantizer_configuration"],
@@ -314,6 +340,9 @@ def run(config: dict, source: Path, output: Path, checkout: Path, log: Path,
                                else "preprint_era_candidate_not_confirmed_RRQ_revision",
             "command": cmd, "log": str(log), "execution": execution, "checkpoint": checkpoint,
             "checkpoint_path": str(resolved), "recovered_from_existing_export": False,
+            "requested_cli_model_dtype": config["quantizer_configuration"]["model_dtype_argument"],
+            "exported_checkpoint_tensor_dtypes": checkpoint["tensor_dtype_counts"],
+            "exported_checkpoint_elements_by_dtype": checkpoint["element_dtype_counts"],
             "source_checkout": str(checkout.resolve()), "dependency_overlay": str(selected_overlay.resolve()),
             "runtime_imports": runtime,
             "upstream_recipe": upstream_recipe,
