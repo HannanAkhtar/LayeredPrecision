@@ -32,18 +32,20 @@ case "${EXPERIMENT_ID:-}" in
       echo "ERROR: wrong AutoRound revision at $AUTO_SOURCE" >&2; exit 1;
     }
     git -C "$AUTO_SOURCE" diff --quiet HEAD || { echo 'ERROR: modified AutoRound source' >&2; exit 1; }
-    [[ ! -d "$OVERLAY" || -f "$OVERLAY/OVERLAY_COMPLETE.json" ]] || {
-      echo "ERROR: incomplete dependency overlay: $OVERLAY" >&2; exit 1;
-    }
-    if [[ -d "$OVERLAY" ]]; then
-      "$LP_PYTHON" -m lp_llm.rrq_overlay check --target "$OVERLAY" >/dev/null || {
-        echo "ERROR: dependency overlay validation failed: $OVERLAY" >&2; exit 1;
+    if [[ "${RRQ_REUSE_EXPORT_ONLY:-0}" != 1 ]]; then
+      [[ ! -d "$OVERLAY" || -f "$OVERLAY/OVERLAY_COMPLETE.json" ]] || {
+        echo "ERROR: incomplete dependency overlay: $OVERLAY" >&2; exit 1;
       }
-    fi
-    export RRQ_AUTO_SOURCE="$AUTO_SOURCE"
-    export PYTHONPATH="$AUTO_SOURCE:$OVERLAY${PYTHONPATH:+:$PYTHONPATH}"
-    "$LP_PYTHON" -c 'from auto_round.cli.main import run_rtn, run_opt_rtn; import auto_round, pathlib, os; expected=pathlib.Path(os.environ["RRQ_AUTO_SOURCE"]).resolve(); actual=pathlib.Path(auto_round.__file__).resolve(); assert actual.is_relative_to(expected), f"Wrong AutoRound import: {actual}"; print(actual)' \
-      || { echo 'ERROR: pinned AutoRound import failed; check extra_deps' >&2; exit 1; } ;;
+      if [[ -d "$OVERLAY" ]]; then
+        "$LP_PYTHON" -m lp_llm.rrq_overlay check --target "$OVERLAY" >/dev/null || {
+          echo "ERROR: dependency overlay validation failed: $OVERLAY" >&2; exit 1;
+        }
+      fi
+      export RRQ_AUTO_SOURCE="$AUTO_SOURCE"
+      export PYTHONPATH="$AUTO_SOURCE:$OVERLAY${PYTHONPATH:+:$PYTHONPATH}"
+      "$LP_PYTHON" -c 'from auto_round.cli.main import run_rtn, run_opt_rtn; import auto_round, pathlib, os; expected=pathlib.Path(os.environ["RRQ_AUTO_SOURCE"]).resolve(); actual=pathlib.Path(auto_round.__file__).resolve(); assert actual.is_relative_to(expected), f"Wrong AutoRound import: {actual}"; print(actual)' \
+        || { echo 'ERROR: pinned AutoRound import failed; check extra_deps' >&2; exit 1; }
+    fi ;;
 esac
 command -v nvidia-smi >/dev/null || { echo 'ERROR: GPU driver absent' >&2; exit 1; }
 nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader

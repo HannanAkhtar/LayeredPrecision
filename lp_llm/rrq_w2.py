@@ -56,9 +56,16 @@ def load_config(experiment_id: str) -> dict:
             "algorithm": "plain_rtn" if mode == "plain" else "optimized_rtn_scale_search",
             "iterations": 0, "gradient_updates": False,
             "configured_nsamples": 1 if mode == "plain" else 128,
-            "observed_calibration_examples_consumed": None,
-            "source_audited_expected_calibration_examples": 0,
-            "calibration_evidence": "RTN zero-shot dispatch; confirm from upstream run log",
+            "observed_calibration_examples_prepared": (0 if experiment_id == "j04" else
+                                                        128 if experiment_id == "j05" else None),
+            "observed_calibration_data_used": (False if experiment_id == "j04" else
+                                               True if experiment_id == "j05" else None),
+            "observed_calibration_examples_consumed": 0 if experiment_id == "j04" else None,
+            "source_audited_expected_calibration_examples": 0 if mode == "plain" else 128,
+            "calibration_evidence": ("J04 zero-shot RTN without calibration" if experiment_id == "j04" else
+                                     "J05 log: NeelNanda/pile-10k, 128 prepared samples, cached block "
+                                     "inputs, OptimizedRTNQuantizer" if experiment_id == "j05" else
+                                     "optimized recipe configured 128; verify when this job runs"),
             "group_size": group, "symmetric": True, "bits": 2,
             "scheme": "W2A16" if group == 128 else f"W2A16G{group}",
             "format": "fake", "model_dtype_argument": "float16",

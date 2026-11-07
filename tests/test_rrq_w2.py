@@ -42,7 +42,12 @@ def test_all_explicit_mappings_and_upstream_commands(tmp_path):
             assert args[args.index("--nsamples") + 1] == ("1" if mode == "plain" else "128")
             assert args[args.index("--model_dtype") + 1] == "float16"
             assert config["quantizer_configuration"]["configured_nsamples"] == (1 if mode == "plain" else 128)
-            assert config["quantizer_configuration"]["observed_calibration_examples_consumed"] is None
+            assert config["quantizer_configuration"]["observed_calibration_examples_prepared"] == (
+                0 if job == "j04" else 128 if job == "j05" else None)
+            assert config["quantizer_configuration"]["observed_calibration_data_used"] == (
+                False if job == "j04" else True if job == "j05" else None)
+            assert config["quantizer_configuration"]["observed_calibration_examples_consumed"] == (
+                0 if job == "j04" else None)
     args = command(Path("/upstream"), Path("/checkpoint"))
     assert "--quant_weights_path" not in args
     assert "--use_fast_tokenizer" not in args
@@ -164,14 +169,178 @@ def test_revision_and_resume_reject_wrong_identity(tmp_path, monkeypatch):
         completion_matches(path, {"x": 2})
 
 
-def test_official_output_requires_valid_qdq_and_can_index_single_shard(tmp_path):
-    with pytest.raises(ValueError, match="did not produce"):
+def test_official_output_requires_an_existing_index_and_never_generates_one(tmp_path):
+    with pytest.raises(ValueError, match="Expected one"):
         validate_output(tmp_path)
     (tmp_path / "config.json").write_text('{"model_type":"qwen3"}')
-    save_file({"x.weight": torch.ones(2, 2)}, str(tmp_path / "model.safetensors"))
+    save_file({"x.weight": torch.ones(2, 2, dtype=torch.float16)}, str(tmp_path / "model.safetensors"))
+    with pytest.raises(ValueError, match="Incomplete indexed"):
+        validate_output(tmp_path)
+    assert not (tmp_path / "model.safetensors.index.json").exists()
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 8}, "weight_map": {"x.weight": "model.safetensors"}}))
     value = validate_output(tmp_path)
     assert value["tensor_names"] == ["x.weight"]
-    assert (tmp_path / "model.safetensors.index.json").exists()
+    assert value["resolved_checkpoint_path"] == str(tmp_path.resolve())
+
+
+def _tiny_official_export(tmp_path, *, nested=True, job_id="j04"):
+    source = tmp_path / "source"
+    export_root = tmp_path / "rrq_w2_reproduction" / job_id / "checkpoint"
+    checkpoint = export_root / "source-w2g128" if nested else export_root
+    source.mkdir(parents=True)
+    checkpoint.mkdir(parents=True)
+    config = {"model_type": "qwen3", "hidden_size": 4, "num_hidden_layers": 1}
+    for folder in (source, checkpoint):
+        (folder / "config.json").write_text(json.dumps(config))
+    torch.manual_seed(7)
+    projections = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+    originals = {f"model.layers.0.{('mlp' if name in projections[-3:] else 'self_attn')}.{name}.weight":
+                 torch.randn(3, 130, dtype=torch.float16) for name in projections}
+    originals["model.embed_tokens.weight"] = torch.randn(3, 130, dtype=torch.float16)
+    save_file(originals, str(source / "model.safetensors"))
+    (source / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {name: "model.safetensors" for name in originals}}))
+    decoded = {name: (weight.clone() if "embed_tokens" in name else
+                      (torch.clamp(torch.round(weight / 0.25), -2, 1) * 0.25).half())
+               for name, weight in originals.items()}
+    names = sorted(decoded)
+    mapping = {}
+    for number, chunk in enumerate((names[:4], names[4:]), start=1):
+        filename = f"model-{number:05d}-of-00002.safetensors"
+        save_file({name: decoded[name] for name in chunk}, str(checkpoint / filename))
+        mapping.update({name: filename for name in chunk})
+    (checkpoint / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": sum(value.numel() * 2 for value in decoded.values())},
+        "weight_map": mapping}))
+    return source, export_root, checkpoint
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_official_export_discovery_inventory_and_group_levels(tmp_path, nested):
+    source, export_root, checkpoint = _tiny_official_export(tmp_path, nested=nested)
+    result = validate_output(export_root, source)
+    assert result["resolved_checkpoint_path"] == str(checkpoint.resolve())
+    assert result["checkpoint_dtypes"] == ["F16"] and len(result["tensor_names"]) == 8
+    coverage = compare_coverage(source, checkpoint, group_size=128)
+    assert len(coverage["changed_tensor_names"]) == 7
+    assert coverage["unchanged_tensor_names"] == ["model.embed_tokens.weight"]
+    assert len(coverage["representative_group_checks"]) == 7
+    for check in coverage["representative_group_checks"].values():
+        assert all(sample["levels"] <= 4 and sample["max_grid_residual"] <= 0.002 and
+                   sample["mse"] >= 0 for sample in check["samples"])
+        assert any(sample["length"] == 2 for sample in check["samples"])
+
+
+def test_official_group_check_rejects_four_arbitrary_levels(tmp_path):
+    source, _, checkpoint = _tiny_official_export(tmp_path)
+    mapping = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
+    name = "model.layers.0.self_attn.q_proj.weight"
+    shard = checkpoint / mapping[name]
+    tensors = {key: value.clone() for key, value in load_file(str(shard)).items()}
+    tensors[name][0, :128] = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float16).repeat(32)
+    save_file(tensors, str(shard))
+    with pytest.raises(ValueError, match="scale grid"):
+        compare_coverage(source, checkpoint, group_size=128)
+
+
+def test_official_export_rejects_ambiguity_missing_shard_and_nonfinite(tmp_path):
+    source, export_root, checkpoint = _tiny_official_export(tmp_path)
+    extra = export_root / "second"
+    extra.mkdir()
+    (extra / "config.json").write_text('{"model_type":"qwen3"}')
+    with pytest.raises(ValueError, match="Expected one"):
+        validate_output(export_root, source)
+    (extra / "config.json").unlink()
+    shard = checkpoint / "model-00001-of-00002.safetensors"
+    original_bytes = shard.read_bytes()
+    shard.unlink()
+    with pytest.raises(ValueError, match="Incomplete"):
+        validate_output(export_root, source)
+    shard.write_bytes(original_bytes)
+    tensors = {name: value.clone() for name, value in load_file(str(shard)).items()}
+    first = next(iter(tensors))
+    tensors[first].reshape(-1)[0] = float("nan")
+    save_file(tensors, str(shard))
+    with pytest.raises(ValueError, match="nonfinite"):
+        validate_output(export_root, source)
+
+
+@pytest.mark.parametrize("job_id", ["j04", "j05"])
+def test_existing_nested_export_recovers_and_resumes_without_quantization(tmp_path, monkeypatch, job_id):
+    import lp_llm.rrq_runner as runner
+    import lp_llm.rrq_autoround as upstream
+    source, export_root, checkpoint = _tiny_official_export(tmp_path, job_id=job_id)
+    job = export_root.parent
+    (job / "run.json").write_text(json.dumps(runner.identity(load_config(job_id), source)))
+    log = job / "autoround.log"
+    extra = "OptimizedRTNQuantizer NeelNanda/pile-10k 128 prepared samples\n" if job_id == "j05" else "plain RTN zero-shot\n"
+    log.write_text(f"start to quantize {source}\n{extra}")
+    monkeypatch.setattr(runner, "check_revision", lambda *args: None)
+    monkeypatch.setattr(upstream, "check_revision", lambda *args: None)
+    monkeypatch.setattr(upstream, "verify_upstream_recipe", lambda *args: {"recipe_name": "rtn"})
+    monkeypatch.setattr(runner, "run_autoround", lambda *args, **kwargs: pytest.fail("quantizer launched"))
+    monkeypatch.setattr(upstream, "run_logged", lambda *args, **kwargs: pytest.fail("subprocess launched"))
+    monkeypatch.setattr(runner, "_git_revision", lambda: "test")
+    evaluated = []
+    monkeypatch.setattr(runner, "corpus_identity", lambda path: {"scored_tokens": 2047,
+                                                                  "token_sha256": "abc"})
+    def evaluate(_matgptq, path, _log):
+        evaluated.append(path)
+        return {"perplexity": 7.0, "cross_entropy": 1.94}
+    monkeypatch.setattr(runner, "run_reference", evaluate)
+    first = runner.run(job_id, source, tmp_path, tmp_path, tmp_path,
+                       reuse_export_only=True)
+    second = runner.run(job_id, source, tmp_path, tmp_path, tmp_path,
+                        stage="full", reuse_export_only=True)
+    assert first == second and evaluated == [checkpoint.resolve()]
+    assert first["checkpoint_path"] == str(checkpoint.resolve())
+    marker = json.loads((job / "encoding_complete.json").read_text())
+    assert marker["recovered_from_existing_export"] is True
+    assert marker["recovery_provenance"]["log_evidence"]["upstream_exit_code"] is None
+    assert not (job / "diagnostic.json").exists()
+    legacy = json.loads(json.dumps(marker))
+    legacy.pop("checkpoint_path")
+    legacy["checkpoint"].pop("resolved_checkpoint_path")
+    legacy["checkpoint"].pop("tensor_payload_bytes")
+    (job / "encoding_complete.json").write_text(json.dumps(legacy))
+    assert runner.run(job_id, source, tmp_path, tmp_path, tmp_path,
+                      reuse_export_only=True) == first
+    index = checkpoint / "model.safetensors.index.json"
+    index.write_text(index.read_text() + " ")
+    with pytest.raises(ValueError, match="checkpoint changed"):
+        runner.run(job_id, source, tmp_path, tmp_path, tmp_path, reuse_export_only=True)
+    assert len(evaluated) == 1
+
+
+def test_recovery_rejects_wrong_run_identity_and_missing_log(tmp_path, monkeypatch):
+    import lp_llm.rrq_runner as runner
+    import lp_llm.rrq_autoround as upstream
+    source, export_root, _ = _tiny_official_export(tmp_path)
+    job = export_root.parent
+    wrong = runner.identity(load_config("j04"), source)
+    wrong["revision"] = "wrong"
+    (job / "run.json").write_text(json.dumps(wrong))
+    monkeypatch.setattr(runner, "check_revision", lambda *args: None)
+    monkeypatch.setattr(upstream, "check_revision", lambda *args: None)
+    monkeypatch.setattr(upstream, "verify_upstream_recipe", lambda *args: {"recipe_name": "rtn"})
+    monkeypatch.setattr(runner, "run_autoround", lambda *args, **kwargs: pytest.fail("quantizer launched"))
+    with pytest.raises(ValueError, match="different identity"):
+        runner.run("j04", source, tmp_path, tmp_path, tmp_path, reuse_export_only=True)
+    (job / "run.json").write_text(json.dumps(runner.identity(load_config("j04"), source)))
+    with pytest.raises(ValueError, match="log is absent"):
+        runner.run("j04", source, tmp_path, tmp_path, tmp_path, reuse_export_only=True)
+    assert not (job / "encoding_complete.json").exists()
+
+
+def test_reuse_export_only_refuses_missing_export(tmp_path, monkeypatch):
+    import lp_llm.rrq_runner as runner
+    source, _, _ = _tiny_official_export(tmp_path)
+    monkeypatch.setattr(runner, "check_revision", lambda *args: None)
+    monkeypatch.setattr(runner, "run_autoround", lambda *args, **kwargs: pytest.fail("quantizer launched"))
+    with pytest.raises(ValueError, match="No existing AutoRound export"):
+        runner.run("j04", source, tmp_path / "new_results", tmp_path, tmp_path,
+                   reuse_export_only=True)
 
 
 def test_official_coverage_uses_actual_weight_differences(tmp_path):
@@ -455,6 +624,15 @@ def test_aggregate_reports_only_measured_values(tmp_path):
     assert rows[0]["bits"] is None and rows[0]["group"] is None
     assert next(row for row in rows if row["id"] == "j09")["bits"] == "mixed (2/BF16)"
     assert next(row for row in rows if row["id"] == "j08")["status"] == "unavailable"
+
+
+def test_aggregate_distinguishes_unverified_export_from_unattempted_job(tmp_path):
+    job = tmp_path / "rrq_w2_reproduction/j04"
+    (job / "checkpoint/source-w2g128").mkdir(parents=True)
+    (job / "run.json").write_text("{}")
+    rows = report(tmp_path)["rows"]
+    assert next(row for row in rows if row["id"] == "j04")["status"] == "export_unverified"
+    assert next(row for row in rows if row["id"] == "j05")["status"] == "pending"
 
 
 def test_aggregate_includes_historical_reference_without_relabeling_current(tmp_path):

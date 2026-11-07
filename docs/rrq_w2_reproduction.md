@@ -8,7 +8,7 @@ The [pinned MatGPTQ evaluator](https://github.com/IST-DASLab/MatGPTQ/tree/0e5bd9
 
 The default [AutoRound revision](https://github.com/intel/auto-round/commit/6c824f741be358983baba87aff83f9c5aa0a01e7) is dated **November 3, 2026**, after the August RRQ preprint. It remains the validated low-level B3 reference and is labeled a *current official AutoRound reproduction*, not a historical RRQ implementation. A separate [July 6, 2026 `v0.14.0` revision](https://github.com/intel/auto-round/commit/24bfce00bb3bd053498232f0e8395118fe10a906) supports the plain and optimized RTN CLI recipes with W2A16 and fake export. It is offered as `preprint_candidate`; it predates the preprint but has not been established as RRQ's exact revision or GPU-validated with Qwen3-8B. Its results use separate `j04/preprint_candidate/` through `j07/preprint_candidate/` directories.
 
-Both revisions expose `run_rtn()` and `run_opt_rtn()` from `auto_round.cli.main`. The runner invokes those upstream functions in a **subprocess**, with the selected source checkout first on `PYTHONPATH`; no AutoRound package installation is required. `W2A16` is G128; `W2A16G64` and `W2A16G32` set the smaller groups. Commands explicitly fix zero tuning iterations, the recipe's configured `nsamples` (1 plain, 128 optimized), FP16 model loading, and fake QDQ export. The upstream RTN zero-shot path is expected to consume no calibration examples; `nsamples` is **not** an observed consumption count, and runtime consumption remains unverified until logs are inspected. Optimized symmetric 2-bit RTN uses the source's ±90 index scale search at 0.01 increments. The runner records the actual imported AutoRound file, runtime package versions, checkpoint dtypes, upstream exported module-selection metadata when present, and a separate changed-versus-unchanged FP16 weight diagnostic. The weight diagnostic alone cannot prove the selected module set: an eligible weight can remain exactly unchanged after quantization. If fake export omits module-selection metadata, the result explicitly reports that limitation. Review the AutoRound log and coverage before interpreting J04/J05 as matched to the seven-projection LP policy.
+Both revisions expose `run_rtn()` and `run_opt_rtn()` from `auto_round.cli.main`. The runner invokes those upstream functions in a **subprocess**, with the selected source checkout first on `PYTHONPATH`; no AutoRound package installation is required. `W2A16` is G128; `W2A16G64` and `W2A16G32` set the smaller groups. Commands explicitly fix zero tuning iterations, the recipe's configured `nsamples` (1 plain, 128 optimized), FP16 model loading, and fake QDQ export. Zero iterations means no gradient updates. The completed J04 log shows zero-shot RTN without calibration. The completed J05 log shows `NeelNanda/pile-10k` loading, 128 prepared samples, cached block inputs, and `OptimizedRTNQuantizer`; J05 used calibration data despite zero gradient updates. The exact count consumed inside the quantizer was not persisted separately. Optimized symmetric 2-bit RTN uses the source's ±90 index scale search at 0.01 increments. The runner records the actual imported AutoRound file, runtime package versions, checkpoint dtypes, upstream exported module-selection metadata when present, and a separate changed-versus-unchanged FP16 weight diagnostic. The weight diagnostic alone cannot prove the selected module set: an eligible weight can remain exactly unchanged after quantization. Fake weight-only QDQ export may omit `quantization_config`; its absence does not invalidate the checkpoint. If fake export omits module-selection metadata, the result explicitly reports that limitation. Review the AutoRound log and coverage before interpreting J04/J05 as matched to the seven-projection LP policy.
 
 J08 is **unavailable**. The exact RRQ SignRoundV2 calibration dataset, sample count, iterations, learning rate, optimizer, coverage, and historical implementation recipe could not be established. Its proposal is to use an isolated pinned official AutoRound calibration workflow only after those fields and adequate GPU/host memory have been verified. No substitute quantizer is run as an RRQ reproduction.
 
@@ -72,6 +72,37 @@ For J06–J14, J08 remains blocked and must be excluded:
 RRQ_CONCURRENCY=2 bash hpc/rrq_w2/submit_selected.sh j06 j07 j09 j10 j11 j12 j13 j14
 ```
 
+### Recover the completed J04/J05 exports
+
+The first J04/J05 runs finished upstream export, then the old runner failed because it expected checkpoint files directly inside `checkpoint/`. AutoRound placed each checkpoint in `checkpoint/qwen3-8b-base-w2g128/`. Recovery validates the existing `run.json` source/config/revision identity, pinned source recipe, original log, nested index, all tensors and shards, FP16 dtype and finiteness, original model inventory/shapes, observed eligible-weight changes, and representative W2 groups. It writes `encoding_complete.json` only after these checks. It does not alter any exported weight shard. The marker records that the checkpoint was recovered; the old subprocess exit code, runtime and GPU measurements were not persisted and are not invented. The same allocation then evaluates the resolved nested directory with MatGPTQ. `RRQ_REUSE_EXPORT_ONLY=1` makes missing or invalid exports fail without starting quantization; preflight does not require AutoRound imports in this mode.
+
+Run these commands on AUS after reviewing the existing J04/J05 Slurm and AutoRound logs:
+
+```bash
+export LP_ROOT=/shared/makhtar/lp_llm
+export LP_CODE="$LP_ROOT/code"
+export RESULT_ROOT="$LP_ROOT/results/qwen3_8b_base"
+cd "$LP_CODE"
+git fetch origin experiment/rrq-w2-reproduction
+git switch experiment/rrq-w2-reproduction
+git pull --ff-only origin experiment/rrq-w2-reproduction
+source /opt/miniconda/etc/profile.d/conda.sh
+conda activate "$LP_ROOT/envs/lp_llm"
+source "$LP_ROOT/env.sh"
+unset TRANSFORMERS_CACHE
+for id in j04 j05; do
+  job="$RESULT_ROOT/rrq_w2_reproduction/$id"
+  test -f "$job/run.json" && test -s "$job/autoround.log" && \
+    test -f "$job/checkpoint/qwen3-8b-base-w2g128/model.safetensors.index.json" || exit 1
+done
+sbatch --export=ALL,EXPERIMENT_ID=j04,RRQ_REUSE_EXPORT_ONLY=1 hpc/rrq_w2/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=j05,RRQ_REUSE_EXPORT_ONLY=1 hpc/rrq_w2/run_experiment.sbatch
+squeue -u "$USER" -o '%.18i %.24j %.2t %.10M %R'
+ls -lh "$LP_ROOT"/logs/rrq-w2-*.out
+python -m lp_llm.rrq_aggregate --result-root "$RESULT_ROOT"
+cat "$RESULT_ROOT/rrq_w2_reproduction/aggregate.md"
+```
+
 To resume, submit the **same** job ID and stage again. Valid completed stage markers and content identities are reused. An incomplete or corrupt official AutoRound export stops with an explicit error and requires inspection; it is never overwritten automatically. Hybrid tensor markers are checked before reuse. To request a hybrid full evaluation after its diagnostic:
 
 ```bash
@@ -92,4 +123,4 @@ bash hpc/rrq_w2/collect_results.sh
 cat "$RESULT_ROOT/rrq_w2_reproduction/aggregate.md"
 ```
 
-Null table cells mean no measurement exists. The JSON results retain config hashes, checkpoint identities, dataset fingerprint and token hash where full evaluation ran, inference/checkpoint dtype, logs, elapsed time, and sampled GPU memory usage. The `nvidia-smi` sample includes other processes on the busiest GPU and is distinct from the runner's PyTorch allocation counter.
+Null table cells mean no measurement exists. The status distinguishes a never-attempted job from an unverified export, a validated encoding awaiting evaluation, and a completed full evaluation. The JSON results retain config hashes, checkpoint identities, dataset fingerprint and token hash where full evaluation ran, inference/checkpoint dtype, logs, elapsed time, and sampled GPU memory usage when those measurements were actually captured. The `nvidia-smi` sample includes other processes on the busiest GPU and is distinct from the runner's PyTorch allocation counter.

@@ -13,7 +13,7 @@ import torch
 from safetensors import safe_open
 
 from .evaluate import _identity
-from .rrq_autoround import run as run_autoround, validate_output
+from .rrq_autoround import recover as recover_autoround, run as run_autoround, validate_output
 from .rrq_hybrid import build as build_hybrid
 from .rrq_reference_eval import (check_revision, corpus_identity, local_evaluate,
                                  run as run_reference)
@@ -37,7 +37,8 @@ def _checkpoint_dtypes(checkpoint: Path) -> dict[str, int]:
 
 
 def _checkpoint(config: dict, source: Path, result_root: Path, job: Path,
-                autoround_source: Path, autoround_variant: str = "current") -> tuple[Path, dict]:
+                autoround_source: Path, autoround_variant: str = "current",
+                reuse_export_only: bool = False) -> tuple[Path, dict]:
     kind, mode = config["kind"], config["mode"]
     if kind == "evaluation":
         if config["id"] == "j01":
@@ -59,23 +60,34 @@ def _checkpoint(config: dict, source: Path, result_root: Path, job: Path,
             details["quantizer_spec"] = manifest["identity"].get("quantizer_spec")
         return checkpoint, details
     if kind == "autoround":
-        checkpoint = job / "checkpoint"
+        export_root = job / "checkpoint"
         marker = job / "encoding_complete.json"
         revision = AUTOROUND_REVISIONS[autoround_variant]
         expected = {"config_sha256": config["config_sha256"], "source": _identity(source, "rrq-original"),
                     "autoround_variant": autoround_variant, "autoround_commit": revision}
         old = completion_matches(marker, expected)
         if old:
-            if old.get("checkpoint") != validate_output(checkpoint):
+            inspected = validate_output(export_root, source)
+            recorded = old.get("checkpoint")
+            required = {"config_sha256", "index_sha256", "shard_sha256", "tensor_names",
+                        "checkpoint_dtypes"}
+            if (not isinstance(recorded, dict) or not required.issubset(recorded) or
+                    any(inspected.get(key) != value for key, value in recorded.items()) or
+                    old.get("checkpoint_path", inspected["resolved_checkpoint_path"]) !=
+                    inspected["resolved_checkpoint_path"]):
                 raise ValueError("Previously completed AutoRound checkpoint changed")
-            return checkpoint, old
-        if checkpoint.exists() and any(checkpoint.iterdir()):
-            raise ValueError(f"Incomplete official AutoRound output requires manual inspection: {checkpoint}")
-        output = run_autoround(config, source, checkpoint, autoround_source, job / "autoround.log",
-                              revision=revision)
+            return Path(inspected["resolved_checkpoint_path"]), old
+        if export_root.exists() and any(export_root.iterdir()):
+            output = recover_autoround(config, source, export_root, autoround_source,
+                                       job / "autoround.log", revision=revision)
+        else:
+            if reuse_export_only:
+                raise ValueError(f"No existing AutoRound export to recover: {export_root}")
+            output = run_autoround(config, source, export_root, autoround_source,
+                                  job / "autoround.log", revision=revision)
         value = {"status": "complete", "identity": expected, **output}
         atomic_json(marker, value)
-        return checkpoint, value
+        return Path(output["checkpoint_path"]), value
     if kind == "hybrid":
         base_dir = result_root / "rtn_reproduction/b3_opt_fp16"
         checkpoint = job / "checkpoint"
@@ -86,7 +98,8 @@ def _checkpoint(config: dict, source: Path, result_root: Path, job: Path,
 
 
 def run(experiment_id: str, source: Path, result_root: Path, matgptq_source: Path,
-        autoround_source: Path, *, stage: str = "screen", autoround_variant: str = "current") -> dict:
+        autoround_source: Path, *, stage: str = "screen", autoround_variant: str = "current",
+        reuse_export_only: bool = False) -> dict:
     if stage not in ("screen", "full"):
         raise ValueError("stage must be screen or full")
     config = load_config(experiment_id)
@@ -94,6 +107,8 @@ def run(experiment_id: str, source: Path, result_root: Path, matgptq_source: Pat
         raise ValueError(f"Unknown AutoRound reference variant: {autoround_variant}")
     if config["kind"] != "autoround" and autoround_variant != "current":
         raise ValueError("Historical AutoRound variant applies only to J04–J07")
+    if reuse_export_only and config["kind"] != "autoround":
+        raise ValueError("Export-only recovery applies only to official AutoRound jobs")
     if config["kind"] == "autoround":
         config["quantizer_configuration"]["revision"] = AUTOROUND_REVISIONS[autoround_variant]
         config["quantizer_configuration"]["reference_variant"] = autoround_variant
@@ -118,7 +133,7 @@ def run(experiment_id: str, source: Path, result_root: Path, matgptq_source: Pat
     if config["kind"] == "autoround":
         check_revision(autoround_source, AUTOROUND_REVISIONS[autoround_variant])
     checkpoint, construction = _checkpoint(config, source, result_root, job, autoround_source,
-                                            autoround_variant)
+                                            autoround_variant, reuse_export_only)
     canonical_stage = stage if config["kind"] == "hybrid" else "full"
     eval_identity = identity(config, source, checkpoint, autoround_variant=autoround_variant)
     eval_identity["stage"] = canonical_stage
@@ -173,10 +188,13 @@ def main() -> None:
     parser.add_argument("--autoround-source", type=Path, required=True)
     parser.add_argument("--stage", choices=("screen", "full"), default="screen")
     parser.add_argument("--autoround-variant", choices=tuple(AUTOROUND_REVISIONS), default="current")
+    parser.add_argument("--reuse-export-only", action="store_true",
+                        help="Recover or resume an existing AutoRound export; never launch quantization")
     args = parser.parse_args()
     print(json.dumps(run(args.experiment_id, args.source, args.result_root,
                          args.matgptq_source, args.autoround_source, stage=args.stage,
-                         autoround_variant=args.autoround_variant), indent=2))
+                         autoround_variant=args.autoround_variant,
+                         reuse_export_only=args.reuse_export_only), indent=2))
 
 
 if __name__ == "__main__":

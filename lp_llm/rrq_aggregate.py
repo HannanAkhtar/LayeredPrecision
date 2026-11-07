@@ -16,8 +16,10 @@ def aggregate(result_root: Path) -> dict:
     def add_row(experiment_id: str, config: dict, job: Path,
                 reference_variant: str = "current") -> None:
         diagnostic_path, full_path = job / "diagnostic.json", job / "full.json"
+        encoding_path = job / "encoding_complete.json"
         diagnostic = json.loads(diagnostic_path.read_text()) if diagnostic_path.exists() else None
         full = json.loads(full_path.read_text()) if full_path.exists() else None
+        encoding = json.loads(encoding_path.read_text()) if encoding_path.exists() else None
         for path, value in ((diagnostic_path, diagnostic), (full_path, full)):
             if value and (value.get("status") != "complete" or
                           value.get("configuration", {}).get("config_sha256") != config["config_sha256"]):
@@ -25,7 +27,11 @@ def aggregate(result_root: Path) -> dict:
             if value and config["kind"] == "autoround" and value.get("identity", {}).get(
                     "autoround_variant") != reference_variant:
                 raise ValueError(f"Wrong AutoRound reference variant: {path}")
-        report = (diagnostic or full or {}).get("construction", {})
+        if encoding and (encoding.get("status") != "complete" or
+                         encoding.get("identity", {}).get("config_sha256") != config["config_sha256"] or
+                         encoding.get("identity", {}).get("autoround_variant") != reference_variant):
+            raise ValueError(f"Incomplete or inconsistent encoding marker: {encoding_path}")
+        report = (diagnostic or full or {}).get("construction", {}) or encoding or {}
         restored_names = report.get("identity", {}).get("restored_names")
         configured_names = report.get("configured_module_selection", {}).get("selected_module_names")
         changed_names = report.get("weight_change_diagnostic", {}).get("changed_tensor_names")
@@ -49,7 +55,12 @@ def aggregate(result_root: Path) -> dict:
                      "diagnostic_ppl": diagnostic["score"]["perplexity"] if diagnostic else None,
                      "full_ppl": full["score"]["perplexity"] if full else None,
                      "status": "unavailable" if config["kind"] == "unavailable" else
-                     "full_complete" if full else "screen_complete" if diagnostic else "pending"})
+                     "full_complete" if full else "screen_complete" if diagnostic else
+                     "encoding_complete" if encoding else
+                     "export_unverified" if config["kind"] == "autoround" and
+                     (job / "checkpoint").exists() else
+                     "attempted_incomplete" if (job / "run.json").exists() or
+                     (job / "autoround.log").exists() else "pending"})
     for experiment_id in MODES:
         config = load_config(experiment_id)
         job = root / experiment_id

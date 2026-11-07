@@ -38,7 +38,11 @@ cd "$LP_CODE"
 bash hpc/rrq_w2/preflight.sh
 stage="${RRQ_STAGE:-screen}"
 echo "[START] $EXPERIMENT_ID stage=$stage"
+recovery_args=()
+if [[ "${RRQ_REUSE_EXPORT_ONLY:-0}" == 1 ]]; then
+  recovery_args+=(--reuse-export-only)
+fi
 "$LP_PYTHON" -m lp_llm.rrq_runner --experiment-id "$EXPERIMENT_ID" --source "$LP_SOURCE" \
   --result-root "$RESULT_ROOT" --matgptq-source "$REF_ROOT/MatGPTQ" \
-  --autoround-source "$AUTO_SOURCE" --autoround-variant "$variant" --stage "$stage"
+  --autoround-source "$AUTO_SOURCE" --autoround-variant "$variant" --stage "$stage" "${recovery_args[@]}"
 echo "[COMPLETE] $EXPERIMENT_ID stage=$stage"
