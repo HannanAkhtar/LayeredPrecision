@@ -141,8 +141,15 @@ def validate_resolved(config: dict, path: Path, checkout: Path) -> dict:
     else:
         expected_class = "SignRoundV2Quantizer" if config["id"] == "s01" else "OptimizedRTNQuantizer"
         settings = record.get("resolved_algorithm", {})
+        iterations = settings.get("iters")
+        # OptimizedRTNConfig deliberately has no ``iters`` attribute. Existing
+        # R01/R02 resolved records therefore contain JSON null; the verified
+        # zero-iteration dispatch below supplies the missing semantic value.
+        if (config["id"] in ("r01", "r02") and iterations is None and
+                record.get("resolved_config_class") == "OptimizedRTNConfig"):
+            iterations = 0
         if (record.get("resolved_quantizer_class") != expected_class or
-                settings.get("iters") != config["iterations"] or
+                iterations != config["iterations"] or
                 settings.get("bits") != 2 or settings.get("group_size") != 128 or
                 settings.get("sym") is not config["symmetric"] or
                 settings.get("enable_neuqi") is not config["enable_neuqi"]):

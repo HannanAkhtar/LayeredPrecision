@@ -179,12 +179,26 @@ def test_resolved_neuqi_identity_rejects_plain_fallback(tmp_path):
     imported.write_text("")
     path = tmp_path / "resolved.json"
     config = load_config("r02")
-    record = {"reference_module": str(imported), "resolved_quantizer_class": "OptimizedRTNQuantizer",
+    record = {"reference_module": str(imported), "resolved_config_class": "OptimizedRTNConfig",
+              "resolved_quantizer_class": "OptimizedRTNQuantizer",
               "selected_quant_function": "opt_rtn_int_asym", "neuqi_grid": {"coarse": 256, "fine": 64, "backend": "auto"},
               "resolved_algorithm": {"iters": 0, "bits": 2, "group_size": 128,
                  "sym": False, "enable_neuqi": True, "disable_opt_rtn": False}}
     atomic_json(path, record)
     assert validate_resolved(config, path, checkout) == record
+    record["resolved_algorithm"]["iters"] = None  # Actual pinned OptimizedRTNConfig record.
+    atomic_json(path, record)
+    assert validate_resolved(config, path, checkout) == record
+    record["resolved_config_class"] = "SignRoundV2Config"
+    atomic_json(path, record)
+    with pytest.raises(ValueError, match="resolved configuration"):
+        validate_resolved(config, path, checkout)
+    record["resolved_config_class"] = "OptimizedRTNConfig"
+    record["resolved_algorithm"]["iters"] = 1
+    atomic_json(path, record)
+    with pytest.raises(ValueError, match="resolved configuration"):
+        validate_resolved(config, path, checkout)
+    record["resolved_algorithm"]["iters"] = None
     record["selected_quant_function"] = "rtn_int_asym"
     atomic_json(path, record)
     with pytest.raises(ValueError, match="NeUQI"):
@@ -214,6 +228,29 @@ def test_gptq_subprocess_gets_separate_conda_prefix(tmp_path):
     assert Path(env["CONDA_PREFIX"]) == selected.parent.parent
     assert env["PATH"].split(__import__("os").pathsep)[0] == str(selected.parent)
     assert env["PYTHONPATH"].split(__import__("os").pathsep)[0] == str(checkout.resolve())
+
+
+def test_read_only_excluded_audit_quantifies_head_and_other_tensors(tmp_path):
+    from lp_llm.quantizer_followups_audit import audit
+    source = tmp_path / "source"
+    export = tmp_path / "export/nested"
+    original = {"lm_head.weight": torch.tensor([[1., 2., 3., 4.]], dtype=torch.bfloat16),
+                "model.embed_tokens.weight": torch.tensor([[1., 2., 3., 4.]], dtype=torch.bfloat16),
+                "model.norm.weight": torch.tensor([1., 1.], dtype=torch.bfloat16),
+                "model.layers.0.self_attn.q_proj.weight": torch.ones(1, 128, dtype=torch.bfloat16)}
+    changed = {name: tensor.to(torch.float16) for name, tensor in original.items()}
+    changed["lm_head.weight"] = torch.tensor([[1., 2.5, 3., 4.]], dtype=torch.float16)
+    changed["model.layers.0.self_attn.q_proj.weight"] = torch.zeros(1, 128, dtype=torch.float16)
+    _checkpoint(source, original)
+    _checkpoint(export, changed)
+    report = audit(source, export.parent)
+    assert report["changed_excluded_names"] == ["lm_head.weight"]
+    assert report["lm_head"]["changed"] == 1
+    assert report["lm_head"]["changed_fraction"] == 0.25
+    assert report["lm_head"]["max_abs_error_after_cast"] == 0.5
+    assert report["lm_head"]["rmse_after_cast"] == 0.25
+    assert report["head_vs_embeddings"]["source"]["different_elements"] == 0
+    assert report["head_vs_embeddings"]["export"]["different_elements"] == 1
 
 
 def test_recover_successful_export_without_requantization_and_resume_eval(tmp_path, monkeypatch):
