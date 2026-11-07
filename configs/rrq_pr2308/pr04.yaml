@@ -1,0 +1,9 @@
+id: pr04
+purpose: J05 versus packed PR base weights and MatGPTQ full PPL
+model_id: Qwen/Qwen3-8B-Base
+model_revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
+rrq_commit: 7985c1b0f4eef65fb717511668fda7e347e584c3
+matgptq_commit: 0e5bd93bc53381f7195db870f5408ae04906bb3c
+evaluation_protocol: matgptq_wikitext2_2048_nonoverlap_slow_tokenizer_fp16
+expected_token_sha256: 8ffcee84dd4b684ec631cb52845e18c9c181ce6fdb8b26d65a4ffdc3d35fbda3
+compute: one_full_8b_checkpoint_materialization_and_evaluation

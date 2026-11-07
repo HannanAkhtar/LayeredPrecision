@@ -1,0 +1,15 @@
+required:
+  - {id: pr01, priority: 1, relative_compute: negligible, prerequisite: none}
+  - {id: pr02, priority: 2, relative_compute: negligible, prerequisite: pr01}
+  - {id: pr03, priority: 3, relative_compute: high, prerequisite: pr02}
+  - {id: pr04, priority: 4, relative_compute: medium, prerequisite: pr03}
+conditional:
+  - {id: pr05, trigger: PR03 weights differ from J05, question: calibration replay, relative_compute: high}
+  - {id: pr06, trigger: mismatch remains after matched calibration, question: weight and scale dtype sensitivity, relative_compute: low_first}
+  - {id: pr07, trigger: module sets differ, question: module coverage parity, relative_compute: low}
+  - {id: pr08, trigger: packed and QDQ evaluations disagree, question: packing and loading, relative_compute: medium}
+  - {id: pr09, trigger: base parity established and full RRQ base invariance needed, question: four_plane_base_parity, relative_compute: high}
+  - {id: pr10, trigger: calibrated base reproduced and sample count sensitivity needed, question: 128_vs_512_samples, relative_compute: high}
+  - {id: pr11, trigger: isolate contribution of imatrix, question: calibration_free_control_reuse_J03, relative_compute: negligible_if_reused}
+  - {id: pr12, trigger: authoritative historical recipe or checkpoint acquired, question: paper_era_reproduction, relative_compute: high}
+stopping_rule: Do not run conditional experiments without their trigger and a documented reason.

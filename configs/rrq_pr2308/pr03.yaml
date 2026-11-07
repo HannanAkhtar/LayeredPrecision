@@ -1,0 +1,21 @@
+id: pr03
+purpose: Official PR base and one residual plane export
+model_id: Qwen/Qwen3-8B-Base
+model_revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
+rrq_commit: 7985c1b0f4eef65fb717511668fda7e347e584c3
+algorithm: rrq_calibrated_optimized_rtn
+scheme: W2A16
+group_size: 128
+symmetric: true
+iterations: 0
+residual_planes: 1
+calibration:
+  dataset: NeelNanda/pile-10k
+  nsamples: 128
+  seqlen: 2048
+  batch_size: 8
+  seed: 42
+requested_model_dtype: float16
+requested_scale_dtype: float16
+format: auto_round:rrq
+compute: one_full_8b_quantization

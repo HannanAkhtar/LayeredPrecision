@@ -579,3 +579,6 @@ and task quality still require AWS validation. The local synthetic tests
 exercise streaming behavior but cannot prove the 16 GB host RAM target or the
 22 GiB GPU target. Huffman coding, other quantizer families, Llama selection,
 and activation quantization are deferred.
+
+For the pinned official RRQ PR #2308 base-plane reproduction and its staged
+PR01–PR04 Slurm commands, see [the RRQ PR reproduction guide](docs/rrq_pr2308_reproduction.md).
