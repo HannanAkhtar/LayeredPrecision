@@ -582,3 +582,7 @@ and activation quantization are deferred.
 
 For the pinned official RRQ PR #2308 base-plane reproduction and its staged
 PR01–PR04 Slurm commands, see [the RRQ PR reproduction guide](docs/rrq_pr2308_reproduction.md).
+
+# Qwen3-8B quantizer follow-ups
+
+The pinned S01/R01/R02/R03 SignRoundV2, NeUQI and GPTQ experiments, AUS setup, smoke checks, and two-job submission procedure are documented in [docs/quantizer_followups/README.md](docs/quantizer_followups/README.md).

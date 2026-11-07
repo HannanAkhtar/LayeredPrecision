@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import ast
+import json
+import sys
+import types
+from pathlib import Path
+
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from lp_llm.quantizer_followups import (_grid, _check_all_w2_groups, _read_marker, aggregate, load_config,
+                                         validate_checkpoint, validate_resolved,
+                                         verify_original_checkpoint, PR_COMMIT, GPTQ_COMMIT)
+from lp_llm.rrq_pr2308 import PR_COMMIT as EXISTING_PR_COMMIT
+from lp_llm.storage import atomic_json
+from lp_llm.rrq_reference_eval import command as matgptq_command
+
+
+ROOT = Path(__file__).resolve().parents[1]
+AUTO = ROOT / "outputs/rrq_pr2308_source/auto_round"
+GPTQ = ROOT / "outputs/gptqmodel_source/gptqmodel"
+PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+
+def test_pinned_configs_and_shared_reference():
+    configs = [load_config(id_) for id_ in ("s01", "r01", "r02", "r03")]
+    assert PR_COMMIT == EXISTING_PR_COMMIT
+    assert all(c["autoround_commit"] == PR_COMMIT for c in configs[:3])
+    assert configs[3]["gptqmodel_commit"] == GPTQ_COMMIT
+    assert configs[1]["neuqi_coarse"] == configs[2]["neuqi_coarse"] == 256
+    assert configs[1]["neuqi_fine"] == configs[2]["neuqi_fine"] == 64
+    assert configs[1]["neuqi_backend"] == configs[2]["neuqi_backend"] == "auto"
+    assert configs[1]["symmetric"] and not configs[2]["symmetric"]
+    assert configs[1]["enable_neuqi"] and configs[2]["enable_neuqi"]
+    cmd = matgptq_command(Path("/reference"), Path("/checkpoint"), "python")
+    assert cmd[2:] == ["--model_name_or_path", str(Path("/checkpoint")),
+                       "--sequence_length", "2048", "--eval_datasets", "wikitext2",
+                       "--eval_batch_size", "1", "--dtype", "float16"]
+
+
+def test_effective_upstream_dispatch_contract():
+    registry = (AUTO / "algorithms/registry.py").read_text()
+    v2 = (AUTO / "algorithms/quantization/sign_roundv2/quantizer.py").read_text()
+    dispatch = (AUTO / "data_type/utils.py").read_text()
+    neuqi = (AUTO / "data_type/neuqi.py").read_text()
+    assert "def resolve_pipeline_member(config:" in registry
+    assert "@register_quantizer(SignRoundV2Config)\nclass SignRoundV2Quantizer" in v2
+    assert 'f"{rtn_data_type}_sym_neuqi"' in dispatch
+    assert 'if not enable_neuqi and not sym:' in dispatch
+    assert '@register_dtype("opt_rtn_int_asym")' in neuqi
+    assert '@register_dtype("opt_rtn_int_sym_neuqi")' in neuqi
+    assert "class Qwen3QModel" in (GPTQ / "models/definitions/qwen3.py").read_text()
+    source = (GPTQ / "quantization/config.py").read_text()
+    assert "class GPTQConfig" in source and "true_sequential: bool = field(default=True)" in source
+    assert "def dequantize_model(model:" in (GPTQ / "nn_modules/qlinear/torch.py").read_text()
+
+
+def test_actual_pinned_dispatch_function(monkeypatch):
+    source = (AUTO / "data_type/utils.py").read_text()
+    function = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
+                    and node.name == "get_quant_func")
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(AUTO / "data_type/utils.py"), "exec"),
+         namespace)
+    package = types.ModuleType("auto_round")
+    package.__path__ = []
+    data_type = types.ModuleType("auto_round.data_type")
+    data_type.QUANT_FUNC_WITH_DTYPE = {name: (lambda: None) for name in (
+        "opt_rtn_int_sym_neuqi", "opt_rtn_int_asym", "rtn_int_asym", "opt_rtn_int_sym")}
+    monkeypatch.setitem(sys.modules, "auto_round", package)
+    monkeypatch.setitem(sys.modules, "auto_round.data_type", data_type)
+    get = namespace["get_quant_func"]
+    assert get("int", 2, True, group_size=128, iters=0, enable_neuqi=True)[1] == "opt_rtn_int_sym_neuqi"
+    assert get("int", 2, False, group_size=128, iters=0, enable_neuqi=True)[1] == "opt_rtn_int_asym"
+    assert get("int", 2, False, group_size=128, iters=0, enable_neuqi=False)[1] == "rtn_int_asym"
+
+
+def test_two_bit_grid_and_nonfinite_rejection():
+    symmetric = torch.tensor([-2., -1., 0., 1.] * 32, dtype=torch.float16) * 0.25
+    asymmetric = torch.tensor([-1., 0., 1., 2.] * 32, dtype=torch.float16) * 0.5
+    assert _grid(symmetric, True)["code_range"] in ([-2, 1], [-1, 2])
+    assert _grid(asymmetric, False)["levels"] == 4
+    with pytest.raises(ValueError):
+        _grid(torch.arange(5, dtype=torch.float16), False)
+    partial = torch.tensor([-.5, -.25, 0., .25, -.5, 0., .5], dtype=torch.float16)[None, :]
+    assert _check_all_w2_groups(partial, group_size=4) == 2
+    bad = torch.tensor([0., 1., 2., 4.], dtype=torch.float16)[None, :]
+    with pytest.raises(ValueError, match="affine"):
+        _check_all_w2_groups(bad, group_size=4)
+
+
+def test_pinned_gptq_symmetric_w2_qdq_arithmetic():
+    tree = ast.parse((GPTQ / "quantization/quantizer.py").read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and
+                 node.name in {"_replace_zero_scale", "quantize"}]
+    namespace = {"torch": torch}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "pinned_gptq_quantizer.py", "exec"),
+         namespace)
+    source = torch.tensor([-1.2, -0.8, -0.1, 0.4, 1.2], dtype=torch.float32)
+    scale = torch.tensor(0.5)
+    zero = torch.tensor(2.0)
+    codes = torch.clamp(torch.round(source / scale) + zero, 0, 3)
+    assert set(codes.tolist()) <= {0, 1, 2, 3}
+    decoded = namespace["quantize"](source, scale, zero, 3, False)
+    assert torch.equal(decoded, scale * (codes - zero))
+    assert torch.equal(namespace["quantize"](torch.zeros(4), torch.tensor(0.),
+                                              torch.tensor(float("nan")), 3, False), torch.zeros(4))
+
+
+def _checkpoint(directory: Path, weights: dict[str, torch.Tensor]) -> None:
+    directory.mkdir(parents=True)
+    save_file(weights, directory / "model.safetensors")
+    atomic_json(directory / "config.json", {"model_type": "qwen3", "hidden_size": 4096,
+                 "num_hidden_layers": 36, "vocab_size": 151936,
+                 "intermediate_size": 12288, "num_attention_heads": 32,
+                 "num_key_value_heads": 8})
+    atomic_json(directory / "model.safetensors.index.json", {
+        "metadata": {"total_size": sum(t.numel() * t.element_size() for t in weights.values())},
+        "weight_map": {name: "model.safetensors" for name in weights}})
+
+
+def _fixture(tmp_path: Path, asym: bool = False):
+    source_weights, output_weights = {}, {}
+    original = (torch.arange(128, dtype=torch.float32).remainder(11) / 7 - 0.7).to(torch.bfloat16)[None, :]
+    code = torch.tensor([-1., 0., 1., 2.] if asym else [-2., -1., 0., 1.], dtype=torch.float16)
+    quantized = code.repeat(32)[None, :] * 0.25
+    for layer in range(36):
+        for kind in PROJECTIONS:
+            prefix = "self_attn" if kind in PROJECTIONS[:4] else "mlp"
+            name = f"model.layers.{layer}.{prefix}.{kind}.weight"
+            source_weights[name] = original.clone()
+            output_weights[name] = quantized.clone()
+    source_weights["model.embed_tokens.weight"] = torch.tensor([1.125], dtype=torch.bfloat16)
+    output_weights["model.embed_tokens.weight"] = source_weights["model.embed_tokens.weight"].to(torch.float16)
+    source = tmp_path / "source"
+    export = tmp_path / "export"
+    _checkpoint(source, source_weights)
+    _checkpoint(export / "qwen3-8b-base-w2g128", output_weights)
+    return source, export
+
+
+@pytest.mark.parametrize("experiment_id,asym", [("r01", False), ("r02", True)])
+def test_nested_qdq_validation_and_corruption(tmp_path, experiment_id, asym):
+    source, export = _fixture(tmp_path, asym)
+    config = load_config(experiment_id)
+    record = validate_checkpoint(config, source, export)
+    assert record["quantized_projection_count"] == 252
+    assert record["unchanged_tensor_count"] == 1
+    assert record["scale_and_zero_point_bytes"] == "unavailable_in_fake_qdq"
+    assert len(record["shard_sha256"]) == 1
+    shard = export / "qwen3-8b-base-w2g128/model.safetensors"
+    shard.unlink()
+    with pytest.raises(ValueError):
+        validate_checkpoint(config, source, export)
+
+
+def test_resume_identity_and_aggregate(tmp_path):
+    marker = tmp_path / "marker.json"
+    expected = {"id": "r01"}
+    atomic_json(marker, {"status": "completed_validated", "identity": expected})
+    assert _read_marker(marker, expected)["status"] == "completed_validated"
+    with pytest.raises(ValueError):
+        _read_marker(marker, {"id": "r02"})
+    root = tmp_path / "quantizer_followups"
+    (root / "s01").mkdir(parents=True)
+    atomic_json(root / "s01/run.json", {"status": "started"})
+    statuses = {row["id"]: row["status"] for row in aggregate(root)["experiments"]}
+    assert statuses == {"s01": "incomplete_or_failed", "r01": "not_started",
+                        "r02": "not_started", "r03": "not_started"}
+
+
+def test_resolved_neuqi_identity_rejects_plain_fallback(tmp_path):
+    checkout = tmp_path / "source"
+    checkout.mkdir()
+    imported = checkout / "auto_round/__init__.py"
+    imported.parent.mkdir()
+    imported.write_text("")
+    path = tmp_path / "resolved.json"
+    config = load_config("r02")
+    record = {"reference_module": str(imported), "resolved_quantizer_class": "OptimizedRTNQuantizer",
+              "selected_quant_function": "opt_rtn_int_asym", "neuqi_grid": {"coarse": 256, "fine": 64, "backend": "auto"},
+              "resolved_algorithm": {"iters": 0, "bits": 2, "group_size": 128,
+                 "sym": False, "enable_neuqi": True, "disable_opt_rtn": False}}
+    atomic_json(path, record)
+    assert validate_resolved(config, path, checkout) == record
+    record["selected_quant_function"] = "rtn_int_asym"
+    atomic_json(path, record)
+    with pytest.raises(ValueError, match="NeUQI"):
+        validate_resolved(config, path, checkout)
+
+
+def test_source_must_match_existing_j05_identity(tmp_path):
+    result = tmp_path / "qwen3_8b_base/quantizer_followups/r01"
+    prior = tmp_path / "qwen3_8b_base/rrq_w2_reproduction/j05/run.json"
+    current = {key: {"x": "a"} for key in ("shard_sha256", "sidecar_sha256")}
+    current.update({"checkpoint": "original", "config_sha256": "cfg", "index_sha256": "idx"})
+    atomic_json(prior, {"source_checkpoint": current})
+    verify_original_checkpoint(current, result)
+    changed = dict(current, index_sha256="other")
+    with pytest.raises(ValueError, match="differs"):
+        verify_original_checkpoint(changed, result)
+
+
+def test_gptq_subprocess_gets_separate_conda_prefix(tmp_path):
+    from lp_llm.quantizer_followups import reference_environment
+    checkout = tmp_path / "reference"
+    checkout.mkdir()
+    selected = tmp_path / "gptq_env/bin/python"
+    selected.parent.mkdir(parents=True)
+    selected.write_text("")
+    env = reference_environment(checkout, None, str(selected))
+    assert Path(env["CONDA_PREFIX"]) == selected.parent.parent
+    assert env["PATH"].split(__import__("os").pathsep)[0] == str(selected.parent)
+    assert env["PYTHONPATH"].split(__import__("os").pathsep)[0] == str(checkout.resolve())
+
+
+def test_recover_successful_export_without_requantization_and_resume_eval(tmp_path, monkeypatch):
+    import lp_llm.quantizer_followups as module
+    config = load_config("r01")
+    result = tmp_path / "r01"
+    export = result / "export/model-w2g128"
+    export.mkdir(parents=True)
+    (export / "model.safetensors").write_bytes(b"fixture")
+    (result / "quantization.log").write_text("upstream complete")
+    atomic_json(result / "quantization_process.json", {"returncode": 0})
+    atomic_json(result / "resolved_config.json", {"selected_quant_function": "opt_rtn_int_sym_neuqi"})
+    identity = {"id": "r01", "config_sha256": config["config_sha256"], "source": {}}
+    atomic_json(result / "run.json", {"identity": identity})
+    monkeypatch.setattr(module, "audit_source", lambda *args: {"revision": PR_COMMIT})
+    monkeypatch.setattr(module, "check_revision", lambda *args: None)
+    monkeypatch.setattr(module, "identity", lambda *args: identity)
+    monkeypatch.setattr(module, "verify_original_checkpoint", lambda *args: None)
+    monkeypatch.setattr(module, "validate_resolved", lambda *args: {})
+    checkpoint = {"resolved_checkpoint_path": str(export), "shard_sha256": {"model.safetensors": "hash"}}
+    monkeypatch.setattr(module, "validate_checkpoint", lambda *args: checkpoint)
+    monkeypatch.setattr(module, "corpus_identity", lambda *args: {
+        "token_sha256": module.TOKEN_SHA256, "scored_tokens": 298862})
+    monkeypatch.setattr(module, "run_logged", lambda *args, **kwargs: pytest.fail("quantizer relaunched"))
+    calls = []
+
+    def evaluate(checkout, checkpoint_path, log, *, python):
+        calls.append(checkpoint_path)
+        log.write_text("wikitext2: 20.00")
+        return {"perplexity": 20.0}
+
+    monkeypatch.setattr(module, "evaluate_matgptq", evaluate)
+    first = module.run_one(config, tmp_path / "source", result, tmp_path / "upstream",
+                           tmp_path / "matgptq", "python")
+    assert first["evaluation"]["perplexity"] == 20.0
+    assert json.loads((result / "encoding_complete.json").read_text())["recovered_after_successful_export"]
+    assert len(calls) == 1
+    second = module.run_one(config, tmp_path / "source", result, tmp_path / "upstream",
+                            tmp_path / "matgptq", "python")
+    assert second == first and len(calls) == 1
+
+
+def test_unverified_export_never_requantizes(tmp_path, monkeypatch):
+    import lp_llm.quantizer_followups as module
+    config = load_config("r01")
+    result = tmp_path / "r01"
+    (result / "export").mkdir(parents=True)
+    (result / "export/partial.safetensors").write_bytes(b"partial")
+    identity = {"id": "r01", "source": {}}
+    atomic_json(result / "run.json", {"identity": identity})
+    monkeypatch.setattr(module, "audit_source", lambda *args: {})
+    monkeypatch.setattr(module, "check_revision", lambda *args: None)
+    monkeypatch.setattr(module, "identity", lambda *args: identity)
+    monkeypatch.setattr(module, "verify_original_checkpoint", lambda *args: None)
+    monkeypatch.setattr(module, "validate_resolved", lambda *args: {})
+    monkeypatch.setattr(module, "run_logged", lambda *args, **kwargs: pytest.fail("quantizer relaunched"))
+    with pytest.raises(ValueError, match="Unmarked export"):
+        module.run_one(config, tmp_path / "source", result, tmp_path / "upstream",
+                       tmp_path / "matgptq", "python")

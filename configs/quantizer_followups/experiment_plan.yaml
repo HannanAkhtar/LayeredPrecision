@@ -1,0 +1,6 @@
+result_subdir: quantizer_followups
+first_pair: [s01, r01]
+second_pair: [r02, r03]
+maximum_concurrent_gpu_jobs: 2
+evaluation: official_matgptq_wikitext2_fp16_2048_nonoverlap
+token_sha256: 8ffcee84dd4b684ec631cb52845e18c9c181ce6fdb8b26d65a4ffdc3d35fbda3
