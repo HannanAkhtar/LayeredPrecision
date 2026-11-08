@@ -212,6 +212,11 @@ def run(branch: str, bits: int, source: Path, result: Path, checkout: Path,
                     repair.get("quantized_projection_byte_identical") is not True):
                 raise ValueError("Recovered control projection hashes differ from pre-repair")
             encoded = {"status": "completed_validated", "identity": ident,
+                       "quota_status": ("unknown_operator_authorized" if
+                           os.environ.get("LP_MATRIX_ALLOW_UNKNOWN_QUOTA") == "1" and
+                           not os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else
+                           "site_confirmed" if os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else
+                           "unknown_unapproved"),
                        "checkpoint_validation": checkpoint, "repair": repair,
                        "quantization_log_sha256": sha256(result / "quantization.log")}
             atomic_json(marker, encoded)
@@ -234,6 +239,7 @@ def run(branch: str, bits: int, source: Path, result: Path, checkout: Path,
             raise ValueError("Control evaluation dataset differs")
         measurement = evaluate_matgptq(matgptq, checkpoint_path, result / "evaluation.log", python=python)
         full = {"status": "completed_validated", "identity": ident,
+                "quota_status": encoded["quota_status"],
                 "checkpoint_validation": encoded["checkpoint_validation"],
                 "corpus": corpus, "evaluation": measurement,
                 "evaluation_log_sha256": sha256(result / "evaluation.log")}

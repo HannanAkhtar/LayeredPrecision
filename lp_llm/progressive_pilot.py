@@ -13,6 +13,7 @@ import torch
 from .progressive_lp import (BRANCHES, encode_layer, identity,
                              validate_repaired_base, verified_layers)
 from .storage import atomic_json
+from .progressive_resources import quota_status
 
 
 def run(branch: str, source: Path, base: Path, root: Path, report_path: Path,
@@ -39,6 +40,7 @@ def run(branch: str, source: Path, base: Path, root: Path, report_path: Path,
     ident = identity(branch, source, base)
     verified_layers(root, 2, ident, pilot=True)
     report = {"status": "pilot_validated", "branch": branch, "code_sha": code_sha,
+              "quota_status": quota_status(),
               "identity": ident, "source_layer": 0, "projection_names": sorted(names),
               "base_checkpoint_source_exact_exclusions": True,
               "base_zero_enhancement_exact": True,

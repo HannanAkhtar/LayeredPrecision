@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from lp_llm.progressive_plan import main, plan, submit
+from lp_llm.progressive_plan import admit_submission, main, plan, submit
 
 
 def test_matrix_has_twelve_points_and_scientific_dependencies(tmp_path):
@@ -48,6 +48,13 @@ def test_submit_uses_afterok_lane_dependencies_and_resumes(tmp_path, monkeypatch
     assert submit(report, tmp_path / "run_point.sbatch", manifest) == completed
     assert len(commands) == 12
     assert json.loads(manifest.read_text())["job_ids"] == completed["job_ids"]
+    three = plan(tmp_path, "a" * 40, slots=3)
+    other = submit(three, tmp_path / "run_point.sbatch", tmp_path / "three.json")
+    assert other["max_concurrent_gpu_jobs"] == 3
+    assert len(other["job_ids"]) == 12
+    assert {point["lane"] for point in other["points"]} == {0, 1, 2}
+    assert "--dependency=afterok:1013" in commands[13]
+    assert "--dependency=afterok:1019" in commands[19]
 
 
 def test_submit_requires_explicit_review(tmp_path, monkeypatch):
@@ -68,3 +75,23 @@ def test_dry_run_cannot_replace_submitted_manifest(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError, match="cannot overwrite"):
         main()
     assert json.loads(output.read_text()) == prior
+
+
+def test_submission_quota_override_only_skips_formal_quota(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr("lp_llm.progressive_plan.estimate",
+                        lambda *_args, **_kwargs: {"new_matrix_shared_floor_bytes": 100})
+    monkeypatch.setattr("lp_llm.progressive_plan.shutil.disk_usage",
+                        lambda _: SimpleNamespace(free=200))
+    monkeypatch.delenv("LP_MATRIX_SHARED_QUOTA_FREE_GIB", raising=False)
+    monkeypatch.delenv("LP_MATRIX_ALLOW_UNKNOWN_QUOTA", raising=False)
+    with pytest.raises(ValueError, match="quota or"):
+        admit_submission(tmp_path, tmp_path, 3)
+    monkeypatch.setenv("LP_MATRIX_ALLOW_UNKNOWN_QUOTA", "1")
+    report = admit_submission(tmp_path, tmp_path, 3)
+    assert report["quota_status"] == "unknown_operator_authorized"
+    assert report["declared_quota_bytes"] is None and report["slots"] == 3
+    monkeypatch.setattr("lp_llm.progressive_plan.shutil.disk_usage",
+                        lambda _: SimpleNamespace(free=99))
+    with pytest.raises(ValueError, match="Actual shared"):
+        admit_submission(tmp_path, tmp_path, 3)

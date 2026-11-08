@@ -252,6 +252,11 @@ def encode_layer(branch: str, depth: int, source: Path, base: Path, root: Path,
     if not complete and limit_tensors is None:
         raise ValueError("LP layer omitted projections")
     report = {"status": "completed_validated" if complete else "pilot_validated",
+              "quota_status": ("unknown_operator_authorized" if
+                  os.environ.get("LP_MATRIX_ALLOW_UNKNOWN_QUOTA") == "1" and
+                  not os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else
+                  "site_confirmed" if os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else
+                  "unknown_unapproved"),
               "identity": current_identity, "depth": depth, "code_sha": code_sha,
               "quantizer": QUANTIZER,
               "pilot_tensor_limit": limit_tensors,

@@ -72,13 +72,16 @@ removing that job-owned copy; its shared floor therefore includes one dense
 checkpoint plus 5 GiB. It
 requires 12 GiB Slurm host allocation, 20 GiB free A10G memory, 2 GiB local
 scratch, shared capacity and an explicitly confirmed *remaining* project
-quota. NFS `df` does not establish quota. Neither the tiny tests nor these
-floors predict full-model peaks.
+quota, or the explicit `LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1` operator override.
+The override records `unknown_operator_authorized` and bypasses only the
+formal quota check. Actual filesystem free space, GPU, host RAM, scratch,
+pilot, and checkpoint checks still apply. NFS `df` does not establish quota.
+Neither the tiny tests nor these floors predict full-model peaks.
 The matrix submission checks the entire remaining matrix floor once. Each
 running point checks its own remaining output and temporary checkpoint floor,
-so prior completed points do not cause a false quota failure. The declared
-quota is the site-confirmed value at submission; external concurrent writes
-can invalidate that reservation and require a fresh capacity review.
+so prior completed points do not cause a false quota failure. Under the
+unknown-quota override, external concurrent writes remain an unmeasured risk;
+the actual filesystem free-space check is repeated for each point.
 
 ## AUS pilot sequence
 
@@ -87,13 +90,14 @@ not start any full-model point:
 
 ```bash
 cd /shared/makhtar/lp_llm/code
+set -euo pipefail
 git pull --ff-only origin experiment/rrq-w2-reproduction
 CODE_SHA=$(git rev-parse HEAD)
 LP_ROOT=/shared/makhtar/lp_llm
 RESULT_ROOT="$LP_ROOT/results/qwen3_8b_base"
 mkdir -p "$LP_ROOT/logs" "$RESULT_ROOT/progressive_llm/pilots"
-read -r -p 'Site-confirmed available shared quota (GiB): ' LP_MATRIX_SHARED_QUOTA_FREE_GIB
-export LP_MATRIX_SHARED_QUOTA_FREE_GIB
+unset LP_MATRIX_SHARED_QUOTA_FREE_GIB
+export LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1
 sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_BRANCH=s01 \
   hpc/progressive_llm/pilot.sbatch
 sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_BRANCH=r02 \
@@ -102,16 +106,52 @@ PYTHONPATH="$LP_ROOT/references/rrq_pr2308/auto-round:$PWD" \
   "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_support \
   --checkout "$LP_ROOT/references/rrq_pr2308/auto-round" \
   --output "$RESULT_ROOT/progressive_llm/pilots/control_support.json" --code-sha "$CODE_SHA"
-for id in s01_w4 s01_w6 s01_w8 r02_w4 r02_w6 r02_w8; do
-  sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_CONTROL_ID="$id" \
-    hpc/progressive_llm/control_pilot.sbatch || break
+ids=(s01_w4 s01_w6 s01_w8 r02_w4 r02_w6 r02_w8)
+declare -a lane_job=()
+declare -a pilot_jobs=()
+for index in "${!ids[@]}"; do
+  lane=$((index % 3))
+  dependency=()
+  if [[ -n "${lane_job[$lane]:-}" ]]; then
+    dependency=("--dependency=afterok:${lane_job[$lane]}")
+  fi
+  lane_job[$lane]=$(sbatch --parsable "${dependency[@]}" \
+    --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_CONTROL_ID="${ids[$index]}" \
+    hpc/progressive_llm/control_pilot.sbatch)
+  pilot_jobs+=("${lane_job[$lane]}")
+  echo "${ids[$index]} pilot job ${lane_job[$lane]} lane $lane"
+done
+squeue -u "$USER" -o '%.18i %.30j %.2t %.20R'
+pilot_job_ids=$(IFS=,; echo "${pilot_jobs[*]}")
+# Run the following only after the six pilots have finished (check squeue).
+sacct -j "$pilot_job_ids" --format=JobID,State,ExitCode
+# Inspect all eight JSON reports before enabling full submission:
+for id in "${ids[@]}"; do
+  cat "$RESULT_ROOT/progressive_llm/pilots/$id.json"
+done
+for branch in s01 r02; do
+  cat "$RESULT_ROOT/progressive_llm/pilots/$branch/report.json"
+  cat "$RESULT_ROOT/progressive_llm/pilots/$branch/base_parity/base_parity.json"
 done
 "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_plan verify-pilots \
   --source "$LP_ROOT/models/qwen3-8b-base" --result-root "$RESULT_ROOT" \
   --code-sha "$CODE_SHA"
 "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_plan dry-run \
-  --result-root "$RESULT_ROOT" --code-sha "$CODE_SHA" \
+  --result-root "$RESULT_ROOT" --code-sha "$CODE_SHA" --slots 3 \
   --manifest "$RESULT_ROOT/progressive_llm/planned_jobs.json"
+```
+
+After all eight pilot reports have been inspected and `verify-pilots` succeeds,
+explicitly enable the twelve full points in three GPU lanes. The planner
+checks the existing QoS 15-job limit and records each job ID and admission:
+
+```bash
+export LP_MATRIX_SUBMIT=1 LP_MATRIX_PILOTS_REVIEWED=1
+"$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_plan submit \
+  --source "$LP_ROOT/models/qwen3-8b-base" --result-root "$RESULT_ROOT" \
+  --code-sha "$CODE_SHA" --slots 3 \
+  --manifest "$RESULT_ROOT/progressive_llm/planned_jobs.json" \
+  --script hpc/progressive_llm/run_point.sbatch
 ```
 
 The first two pilots use all seven real first-layer matrices, independently

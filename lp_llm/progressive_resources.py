@@ -14,6 +14,12 @@ from .r03_resources import GIB, _headers
 from .progressive_lp import ELIGIBLE_PARAMETERS, TOTAL_PARAMETERS
 
 
+def quota_status() -> str:
+    if os.environ.get("LP_MATRIX_ALLOW_UNKNOWN_QUOTA") == "1" and not os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB"):
+        return "unknown_operator_authorized"
+    return "site_confirmed" if os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else "unknown_unapproved"
+
+
 def estimate(source: Path, *, slots: int = 2) -> dict:
     if slots not in (2, 3):
         raise ValueError("LP matrix GPU cap must be two or three")
@@ -67,10 +73,11 @@ def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
              sizes["new_matrix_shared_floor_bytes"])
     if quota_gib is None:
         raw = os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB", "")
-        try:
-            quota_gib = float(raw)
-        except ValueError:
-            quota_gib = None
+        if raw:
+            try:
+                quota_gib = float(raw)
+            except ValueError as exc:
+                raise ValueError("Invalid declared shared quota") from exc
     quota_bytes = int(quota_gib * GIB) if quota_gib is not None and math.isfinite(quota_gib) and quota_gib > 0 else None
     if gpu_free_bytes is None:
         output = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.free",
@@ -82,8 +89,10 @@ def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
         host_limit_bytes = int(os.environ.get("SLURM_MEM_PER_NODE", "0")) * 1024**2
     shared_free = shutil.disk_usage(shared).free
     scratch_free = shutil.disk_usage(scratch).free
+    allow_unknown = (os.environ.get("LP_MATRIX_ALLOW_UNKNOWN_QUOTA") == "1" and
+                     not os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") and quota_bytes is None)
     checks = {"shared_filesystem_floor": shared_free >= floor,
-              "site_confirmed_shared_quota": quota_bytes is not None and quota_bytes >= floor,
+              "site_confirmed_shared_quota": allow_unknown or (quota_bytes is not None and quota_bytes >= floor),
               "local_scratch_2_gib": scratch_free >= 2 * GIB,
               "host_allocation_12_gib": host_limit_bytes >= 12 * GIB,
               "a10g_free_20_gib": gpu_free_bytes >= 20 * GIB}
@@ -92,6 +101,8 @@ def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
             "shared_path": str(shared), "shared_free_bytes": shared_free,
             "scratch_path": str(scratch), "scratch_free_bytes": scratch_free,
             "quota_free_bytes_declared": quota_bytes, "shared_floor_bytes": floor,
+            "quota_status": "unknown_operator_authorized" if allow_unknown else
+                            "site_confirmed" if quota_bytes is not None else "unknown_unapproved",
             "gpu_free_bytes": gpu_free_bytes, "host_limit_bytes": host_limit_bytes,
             "checks": checks,
             "scope": "read-only capacity gate; no measured full-model peak or verified site quota"}

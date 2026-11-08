@@ -19,6 +19,7 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
     from .progressive_lp import _files
     from .rrq_pr2308_compare import _get, _weight_map
     from .storage import atomic_json
+    from .progressive_resources import quota_status
 
     if os.environ.get("LP_CONTROL_PILOT") != "1" or report.exists() or len(code_sha) != 40:
         raise ValueError("Control pilot requires a new report, guard and pinned code SHA")
@@ -64,6 +65,7 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
                           "sampled_group_levels": int(torch.unique(sample).numel())}
         del value, original
     report_value = {"status": "control_layer_pilot_validated", "branch": branch, "bits": bits,
+                    "quota_status": quota_status(),
                     "code_sha": code_sha, "reference_module": str(Path(auto_round.__file__).resolve()),
                     "source": _files(source),
                     "recipe": recipe, "source_layer": 0, "projection_count": len(measured),

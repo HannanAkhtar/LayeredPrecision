@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import math
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
 from .progressive_lp import BRANCHES, _files, identity, verified_layers
-from .progressive_resources import estimate
+from .progressive_resources import estimate, quota_status
 from .quantizer_followups import PR_COMMIT
 from .storage import atomic_json
 
@@ -120,6 +122,7 @@ def plan(root: Path, code_sha: str, *, slots: int = 2) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", code_sha):
         raise ValueError("Invalid pinned code SHA")
     return {"status": "dry_run_not_submitted", "code_sha": code_sha,
+            "quota_status": quota_status(),
             "max_concurrent_gpu_jobs": slots, "qos_submit_jobs_count": 12,
             "point_count": 12, "points": points(root, slots),
             "dependency_rule": "afterok scientific predecessor plus prior job in same GPU lane"}
@@ -168,6 +171,28 @@ def submit(manifest: dict, script: Path, output: Path) -> dict:
     return submitted
 
 
+def admit_submission(source: Path, result_root: Path, slots: int) -> dict:
+    from .r03_resources import GIB
+    floor = estimate(source, slots=slots)["new_matrix_shared_floor_bytes"]
+    free = shutil.disk_usage(result_root).free
+    if free < floor:
+        raise ValueError("Actual shared filesystem free space is below matrix floor")
+    quota = os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB")
+    if quota:
+        try:
+            quota_bytes = float(quota) * GIB
+        except ValueError as exc:
+            raise ValueError("Invalid declared shared quota") from exc
+        if not math.isfinite(quota_bytes) or quota_bytes < floor:
+            raise ValueError("Declared remaining shared quota is below matrix floor")
+    elif os.environ.get("LP_MATRIX_ALLOW_UNKNOWN_QUOTA") != "1":
+        raise ValueError("Site-confirmed quota or LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1 is required")
+    return {"quota_status": "site_confirmed" if quota else "unknown_operator_authorized",
+            "declared_quota_bytes": quota_bytes if quota else None,
+            "actual_filesystem_free_bytes": free, "matrix_floor_bytes": floor,
+            "slots": slots}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("dry-run", "verify-pilots", "submit"))
@@ -189,13 +214,7 @@ def main() -> None:
         if args.source is None or args.manifest is None:
             parser.error("submit requires --source and --manifest")
         verify_pilots(args.source, args.result_root, args.code_sha)
-        try:
-            quota = float(os.environ["LP_MATRIX_SHARED_QUOTA_FREE_GIB"])
-        except (KeyError, ValueError) as exc:
-            raise ValueError("Site-confirmed LP_MATRIX_SHARED_QUOTA_FREE_GIB is required") from exc
-        from .r03_resources import GIB
-        if quota * GIB < estimate(args.source, slots=args.slots)["new_matrix_shared_floor_bytes"]:
-            raise ValueError("Declared remaining shared quota is below matrix floor")
+        manifest["admission"] = admit_submission(args.source, args.result_root, args.slots)
         actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         if actual != args.code_sha:
             raise ValueError("Submission code SHA differs from current checkout")

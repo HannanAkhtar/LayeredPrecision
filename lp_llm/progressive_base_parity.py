@@ -13,6 +13,7 @@ from .progressive_run import TOKEN_SHA, materialize
 from .rrq_reference_eval import check_revision, corpus_identity, run as evaluate_matgptq
 from .rrq_w2 import MATGPTQ_COMMIT
 from .storage import atomic_json, sha256
+from .progressive_resources import quota_status
 
 
 def run(branch: str, source: Path, base: Path, root: Path, result: Path,
@@ -45,6 +46,7 @@ def run(branch: str, source: Path, base: Path, root: Path, result: Path,
         if round(measurement["perplexity"], 2) != {"s01": 12.47, "r02": 32.22}[branch]:
             raise ValueError("Independent W2 materialization lost perplexity parity")
         record = {"status": "base_parity_validated", "identity": ident,
+                  "quota_status": quota_status(),
                   "code_sha": code_sha, "checkpoint_validation": reconstructed,
                   "corpus": corpus, "evaluation": measurement,
                   "evaluation_log_sha256": sha256(result / "evaluation.log")}

@@ -64,6 +64,27 @@ def test_matrix_preflight_fails_unknown_quota_even_when_df_reports_space(tmp_pat
         strict_source=False)["shared_floor_bytes"]
 
 
+def test_unknown_quota_override_keeps_every_other_capacity_gate(tmp_path, monkeypatch):
+    source = _source(tmp_path)
+    monkeypatch.delenv("LP_MATRIX_SHARED_QUOTA_FREE_GIB", raising=False)
+    monkeypatch.setenv("LP_MATRIX_ALLOW_UNKNOWN_QUOTA", "1")
+    monkeypatch.setattr("lp_llm.progressive_resources.shutil.disk_usage",
+                        lambda _: SimpleNamespace(free=1000 * GIB))
+    kwargs = dict(mode="pilot", quota_gib=None, gpu_free_bytes=22 * GIB,
+                  host_limit_bytes=12 * GIB, strict_source=False)
+    accepted = assess(source, tmp_path, tmp_path, **kwargs)
+    assert accepted["status"] == "capacity_floor_passed"
+    assert accepted["quota_status"] == "unknown_operator_authorized"
+    assert accepted["quota_free_bytes_declared"] is None
+    assert assess(source, tmp_path, tmp_path, **dict(kwargs, gpu_free_bytes=1))["status"] == "capacity_floor_failed"
+    assert assess(source, tmp_path, tmp_path, **dict(kwargs, host_limit_bytes=1))["status"] == "capacity_floor_failed"
+    monkeypatch.setattr("lp_llm.progressive_resources.shutil.disk_usage",
+                        lambda _: SimpleNamespace(free=1))
+    low_disk = assess(source, tmp_path, tmp_path, **kwargs)
+    assert not low_disk["checks"]["shared_filesystem_floor"]
+    assert not low_disk["checks"]["local_scratch_2_gib"]
+
+
 def test_aggregate_reports_all_pending_points_without_invented_measurements(tmp_path):
     source = _source(tmp_path)
     report = write(source, tmp_path, tmp_path / "aggregate")

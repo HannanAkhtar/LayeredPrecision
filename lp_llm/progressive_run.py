@@ -131,6 +131,11 @@ def evaluate(branch: str, depth: int, source: Path, base: Path, root: Path,
             raise ValueError("LP MatGPTQ corpus identity differs")
         measurement = evaluate_matgptq(matgptq, checkpoint, result / "evaluation.log", python=python)
         record = {"status": "completed_validated", "identity": ident, "depth": depth,
+                  "quota_status": ("unknown_operator_authorized" if
+                      os.environ.get("LP_MATRIX_ALLOW_UNKNOWN_QUOTA") == "1" and
+                      not os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else
+                      "site_confirmed" if os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB")
+                      else "unknown_unapproved"),
                   "code_sha": os.environ.get("FOLLOWUP_CODE_SHA"),
                   "materialization": materialization, "corpus": corpus,
                   "evaluation": measurement,
