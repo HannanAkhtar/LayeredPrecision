@@ -50,18 +50,8 @@ if [[ -n "$missing_output" ]]; then
   mapfile -t extras <<< "$missing_output"
   "$PYTHON" -m pip install --no-deps "${extras[@]}"
 fi
-if ! "$PYTHON" - "$GPTQ_ENV" <<'PY'
-import importlib.metadata as m
-import sys
-from pathlib import Path
-try:
-    dist = m.distribution("gptqmodel")
-    assert dist.version == "5.7.0"
-    assert Path(dist.locate_file("")).resolve().is_relative_to(Path(sys.argv[1]).resolve())
-except (m.PackageNotFoundError, AssertionError):
-    raise SystemExit(1)
-PY
-then
+if ! "$PYTHON" "$CHECK" installed --env "$GPTQ_ENV" --lp-env "$LP_ENV" \
+  --source "$GPTQ_SOURCE" --pins "$PINS" --mode "$GPTQ_ENV_MODE"; then
   "$PYTHON" -m pip install --no-deps --no-build-isolation --editable "$GPTQ_SOURCE"
 fi
 "$PYTHON" -m pip check || { echo "ERROR: isolated GPTQ environment has dependency conflicts" >&2; exit 1; }

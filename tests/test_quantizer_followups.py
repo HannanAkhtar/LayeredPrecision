@@ -72,7 +72,7 @@ def test_gptq_lightweight_dependency_selection_and_marker_gate(tmp_path, monkeyp
         module.missing_extras(source, pins)
     setup = (ROOT / "hpc/quantizer_followups/setup_gptq_env.sh").read_text()
     assert '[[ -f "$GPTQ_ENV/quantizer_followups_ready.json"' in setup
-    assert "[GPTQ ENV RESUME]" in setup and "dist.version == \"5.7.0\"" in setup
+    assert "[GPTQ ENV RESUME]" in setup and '"$CHECK" installed' in setup
     assert '"$CHECK" verify' in setup and '"$CHECK" initialize' in setup
 
 
@@ -89,6 +89,33 @@ def test_device_smi_pin_matches_pinned_gptq_package_metadata():
     assert "0.5.3" in requirement.specifier
     assert "0.5.7" in pin.specifier
     assert "0.5.2" not in requirement.specifier
+
+
+def test_pep660_editable_dist_info_stays_in_venv_while_source_is_external(tmp_path, monkeypatch):
+    import importlib.util
+    module_path = ROOT / "hpc/quantizer_followups/gptq_env_check.py"
+    spec = importlib.util.spec_from_file_location("gptq_env_check_editable_test", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    environment = tmp_path / "venv"
+    site = environment / "lib/python3.11/site-packages"
+    dist_info = site / "gptqmodel-5.7.0.dist-info"
+    dist_info.mkdir(parents=True)
+    source = tmp_path / "source/GPTQModel"
+    source.mkdir(parents=True)
+    (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: gptqmodel\nVersion: 5.7.0\n")
+    (dist_info / "direct_url.json").write_text(json.dumps({
+        "url": source.resolve().as_uri(), "dir_info": {"editable": True}}))
+    monkeypatch.setattr(module.sys, "prefix", str(environment))
+    monkeypatch.setattr(module.sysconfig, "get_path", lambda name: str(site))
+    installed, actual_site = module.editable_distribution(environment, source)
+    assert installed.version == "5.7.0" and actual_site == site.resolve()
+    with pytest.raises(RuntimeError, match="source differs"):
+        module.editable_distribution(environment, tmp_path / "different")
+    (dist_info / "direct_url.json").write_text(json.dumps({
+        "url": source.resolve().as_uri(), "dir_info": {"editable": False}}))
+    with pytest.raises(RuntimeError, match="PEP 660"):
+        module.editable_distribution(environment, source)
 
 
 def test_followup_batches_stage_commit_before_preflight():

@@ -5,17 +5,43 @@ import argparse
 import importlib.metadata as metadata
 import inspect
 import json
+import subprocess
 import sys
+import sysconfig
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 LP environments
     import tomli as tomllib
 from pathlib import Path
+from urllib.parse import urlparse, unquote
+from urllib.request import url2pathname
 
 from packaging.requirements import Requirement
 
 REVISION = "ed96f2e04ec868b04f969733a242ce3b5bb7cb1e"
 MARKER = "quantizer_followups_ready.json"
+
+
+def editable_distribution(environment: Path, source: Path) -> tuple[metadata.Distribution, Path]:
+    """Find PEP 660 dist-info in this interpreter's venv, not its source tree."""
+    environment, source = environment.resolve(), source.resolve()
+    if Path(sys.prefix).resolve() != environment:
+        raise RuntimeError(f"Wrong active interpreter: {sys.prefix}")
+    site = Path(sysconfig.get_path("purelib")).resolve()
+    if not site.is_relative_to(environment):
+        raise RuntimeError(f"GPTQ site-packages escapes isolated environment: {site}")
+    matches = [dist for dist in metadata.distributions(path=[str(site)])
+               if dist.metadata.get("Name", "").lower().replace("_", "-") == "gptqmodel"]
+    if len(matches) != 1 or matches[0].version != "5.7.0":
+        raise RuntimeError("Pinned GPTQModel 5.7.0 dist-info is absent from isolated environment")
+    direct = json.loads(matches[0].read_text("direct_url.json") or "{}")
+    parsed = urlparse(direct.get("url", ""))
+    if parsed.scheme != "file" or parsed.netloc not in ("", "localhost") or direct.get("dir_info", {}).get("editable") is not True:
+        raise RuntimeError("GPTQModel is not a local PEP 660 editable install")
+    editable_source = Path(url2pathname(unquote(parsed.path))).resolve()
+    if editable_source != source:
+        raise RuntimeError(f"GPTQModel editable source differs from pinned checkout: {editable_source}")
+    return matches[0], site
 
 
 def missing_extras(source: Path, pins: Path) -> list[str]:
@@ -62,11 +88,27 @@ def verify(environment: Path, lp_environment: Path, source: Path, mode: str) -> 
         raise RuntimeError(f"Transformers did not come from LP environment: {transformers.__file__}")
     if not Path(gptqmodel.__file__).resolve().is_relative_to(source):
         raise RuntimeError(f"GPTQModel did not come from pinned source: {gptqmodel.__file__}")
-    installed_at = Path(metadata.distribution("gptqmodel").locate_file("")).resolve()
-    if not installed_at.is_relative_to(environment):
-        raise RuntimeError(f"GPTQModel distribution was not installed into the isolated environment: {installed_at}")
+    installed, installed_site = editable_distribution(environment, source)
+    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    if revision != REVISION:
+        raise RuntimeError(f"GPTQModel source revision differs: {revision}")
     if not torch.__version__.startswith("2.9.1+cu128") or transformers.__version__ != "4.57.1":
         raise RuntimeError("Inherited Torch/Transformers versions differ from pinned LP versions")
+    requirements = [Requirement(line) for line in
+                    tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]]
+    allowed_sites = (installed_site, Path(torch.__file__).resolve().parents[1])
+    allowed = {}
+    for site in allowed_sites:
+        for dist in metadata.distributions(path=[str(site)]):
+            name = dist.metadata.get("Name", "").lower().replace("_", "-")
+            allowed.setdefault(name, set()).add(dist.version)
+    dependency_versions = {}
+    for requirement in requirements:
+        name = requirement.name.lower().replace("_", "-")
+        version = metadata.version(requirement.name)
+        if version not in requirement.specifier or version not in allowed.get(name, set()):
+            raise RuntimeError(f"GPTQ dependency outside isolated/LP sites or incompatible: {name}=={version}")
+        dependency_versions[name] = version
     qcfg = QuantizeConfig(bits=2, group_size=128, sym=True, desc_act=False,
                           act_group_aware=True, damp_percent=0.05,
                           damp_auto_increment=0.01, static_groups=False,
@@ -83,13 +125,15 @@ def verify(environment: Path, lp_environment: Path, source: Path, mode: str) -> 
             "transformers": transformers.__version__,
             "transformers_file": str(Path(transformers.__file__).resolve()),
             "gptqmodel_file": str(Path(gptqmodel.__file__).resolve()),
-            "gptqmodel_distribution": str(installed_at),
-            "datasets": datasets.__version__, "backend": "TORCH", "bits": 2, "group_size": 128}
+            "gptqmodel_distribution_site": str(installed_site),
+            "gptqmodel_version": installed.version,
+            "datasets": datasets.__version__, "dependency_versions": dependency_versions,
+            "backend": "TORCH", "bits": 2, "group_size": 128}
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("missing", "initialize", "verify"))
+    parser.add_argument("action", choices=("missing", "installed", "initialize", "verify"))
     parser.add_argument("--env", type=Path, required=True)
     parser.add_argument("--lp-env", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)
@@ -98,6 +142,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.action == "missing":
         print("\n".join(missing_extras(args.source, args.pins)))
+        return
+    if args.action == "installed":
+        installed, site = editable_distribution(args.env, args.source)
+        print(json.dumps({"version": installed.version, "dist_info_site": str(site)}))
         return
     current = verify(args.env, args.lp_env, args.source, args.mode)
     if missing_extras(args.source, args.pins):
