@@ -39,7 +39,9 @@ PYTHONPATH=/shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel \
 sbatch --export=ALL,EXPERIMENT_ID=r03,FOLLOWUP_SMOKE=1 hpc/quantizer_followups/run_experiment.sbatch
 ```
 
-The pinned GPTQModel `pyproject.toml` requires `device-smi>=0.5.3` (its `requirements.txt` still says `>=0.5.2`); the supplemental pin follows package metadata. If lightweight setup stops before the marker, rerun the same `bash hpc/quantizer_followups/setup_gptq_env.sh`. It verifies the existing venv, installs only missing/incompatible supplemental packages, skips GPTQModel when its pinned distribution is already installed there, and finishes the checks without rebuilding the venv. A malformed venv is rejected. The interrupted full clone at `envs/gptq_followups_v570` is not touched by light setup. If it is incomplete, clone mode rejects it. To keep it for inspection and build a fresh clone elsewhere, set `GPTQ_ENV_MODE=clone GPTQ_ENV_OVERRIDE=/shared/makhtar/lp_llm/envs/gptq_followups_v570_fallback` for both setup and smoke.
+The pinned GPTQModel `pyproject.toml` requires `device-smi>=0.5.3` (its `requirements.txt` still says `>=0.5.2`); the supplemental pin is now `0.5.7`, matching the working AUS lightweight environment. Setup accepts that existing version without reinstalling it. If lightweight setup stops before the marker, rerun the same `bash hpc/quantizer_followups/setup_gptq_env.sh`. It verifies the existing venv, installs only missing/incompatible supplemental packages, skips GPTQModel when its pinned distribution is already installed there, and finishes the checks without rebuilding the venv. A malformed venv is rejected. The interrupted full clone at `envs/gptq_followups_v570` is not touched by light setup. If it is incomplete, clone mode rejects it. To keep it for inspection and build a fresh clone elsewhere, set `GPTQ_ENV_MODE=clone GPTQ_ENV_OVERRIDE=/shared/makhtar/lp_llm/envs/gptq_followups_v570_fallback` for both setup and smoke.
+
+Batch jobs stage the tracked repository code from `FOLLOWUP_CODE_SHA` into a private directory on the compute node before running preflight or importing `lp_llm`. A later `git pull` in the shared checkout cannot replace a script opened by that running job. The selected commit and stage path appear in the Slurm log. Pass the commit captured at submission; if omitted, the batch captures `HEAD` at job start. The staging change does not alter model exports or experiment identities.
 
 The pinned v5.7.0 HF exporter creates empty bias parameters for biasless Qwen3 projections. R03 uses its `TorchQuantLinear.dequantize_weight()` on the packed checkpoint, preserves the original bias inventory, and verifies all 252 FP16 projection tensors against the pre-save decode. This is a materialization workaround, recorded in the resolved configuration; quantization, codes, scales and grouping remain upstream. R03 has **not** passed an AUS GPU smoke test. Do not submit its full experiment until the smoke log is reviewed.
 
@@ -50,11 +52,12 @@ The existing successful `quantization_process.json` records let the runner valid
 ```bash
 cd /shared/makhtar/lp_llm/code
 git pull --ff-only origin experiment/rrq-w2-reproduction
-sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_STAGE=encode,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
-sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_STAGE=encode,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
+CODE_SHA=$(git rev-parse HEAD)
+sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_STAGE=encode,FOLLOWUP_REUSE_EXPORT_ONLY=1,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_STAGE=encode,FOLLOWUP_REUSE_EXPORT_ONLY=1,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/run_experiment.sbatch
 # After both encoding markers pass validation, run evaluation one job at a time:
-sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
-sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_REUSE_EXPORT_ONLY=1,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_REUSE_EXPORT_ONLY=1,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/run_experiment.sbatch
 ```
 
 For S01, first measure every excluded tensor against the source after casting to its export dtype:
@@ -72,9 +75,9 @@ S01 validation remains strict. The audit does not change the export or create a 
 If every changed excluded tensor has `fp16_roundtrip_mismatches: 0`, the separately identified `s01_fp16_load_repair` path can restore only those excluded source bytes. It copies the raw checkpoint, verifies all 252 quantized projection tensors are byte-identical to the raw export, validates the repaired full checkpoint, and then evaluates it with the same MatGPTQ protocol. The original S01 export and result files are never changed. Review the audit and ensure enough disk space for a second roughly 16 GB checkpoint before running:
 
 ```bash
-sbatch --export=ALL,S01_REPAIR_STAGE=encode hpc/quantizer_followups/repair_s01.sbatch
+sbatch --export=ALL,S01_REPAIR_STAGE=encode,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/repair_s01.sbatch
 # Inspect s01_fp16_load_repair/encoding_complete.json and the job log.
-sbatch --export=ALL,S01_REPAIR_STAGE=all hpc/quantizer_followups/repair_s01.sbatch
+sbatch --export=ALL,S01_REPAIR_STAGE=all,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/repair_s01.sbatch
 ```
 
 The repair refuses an unexplained excluded-tensor change or a conflicting partial/repaired checkpoint. The result is a separate materialization variant, not a replacement for the official S01 export.

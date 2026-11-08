@@ -15,7 +15,8 @@ for id in "${ids[@]}"; do
     echo "ERROR: $id has completed or failed output; inspect before submitting" >&2; exit 1
   fi
 done
+code_sha=$(git rev-parse HEAD)
 for id in "${ids[@]}"; do
   echo "Submitting $id"
-  sbatch --export=ALL,EXPERIMENT_ID="$id" hpc/quantizer_followups/run_experiment.sbatch
+  sbatch --export=ALL,EXPERIMENT_ID="$id",FOLLOWUP_CODE_SHA="$code_sha" hpc/quantizer_followups/run_experiment.sbatch
 done

@@ -30,7 +30,22 @@ conda activate "$LP_ROOT/envs/lp_llm"
 source "$LP_ROOT/env.sh"
 unset TRANSFORMERS_CACHE
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
-cd "$LP_CODE"
+FOLLOWUP_CODE_SHA="${FOLLOWUP_CODE_SHA:-$(git -C "$LP_CODE" rev-parse HEAD)}"
+[[ "$FOLLOWUP_CODE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: invalid FOLLOWUP_CODE_SHA" >&2; exit 1; }
+git -C "$LP_CODE" cat-file -e "$FOLLOWUP_CODE_SHA^{commit}" || {
+  echo "ERROR: pinned code commit unavailable: $FOLLOWUP_CODE_SHA" >&2; exit 1;
+}
+CODE_STAGE=$(mktemp -d "${SLURM_TMPDIR:-/tmp}/lp-followup-${SLURM_JOB_ID:-manual}.XXXXXXXX")
+trap 'rm -rf -- "$CODE_STAGE"' EXIT
+git -C "$LP_CODE" archive --format=tar --output="$CODE_STAGE/code.tar" "$FOLLOWUP_CODE_SHA"
+tar -xf "$CODE_STAGE/code.tar" -C "$CODE_STAGE"
+rm -- "$CODE_STAGE/code.tar"
+[[ -f "$CODE_STAGE/hpc/quantizer_followups/preflight.sh" && -f "$CODE_STAGE/lp_llm/quantizer_followups.py" ]] || {
+  echo "ERROR: staged code incomplete for $FOLLOWUP_CODE_SHA" >&2; exit 1;
+}
+export LP_CODE="$CODE_STAGE" PYTHONPATH="$CODE_STAGE${PYTHONPATH:+:$PYTHONPATH}"
+echo "[CODE] commit=$FOLLOWUP_CODE_SHA stage=$CODE_STAGE"
+cd "$CODE_STAGE"
 bash hpc/quantizer_followups/preflight.sh
 mkdir -p "$RESULT_ROOT/quantizer_followups/.locks"
 exec 9>"$RESULT_ROOT/quantizer_followups/.locks/$EXPERIMENT_ID.lock"

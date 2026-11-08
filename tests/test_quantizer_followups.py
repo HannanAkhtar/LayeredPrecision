@@ -58,13 +58,13 @@ def test_gptq_lightweight_dependency_selection_and_marker_gate(tmp_path, monkeyp
     source.mkdir()
     (source / "pyproject.toml").write_text('[project]\ndependencies = ["torch>=2.8.0", "transformers>=4.57.1", "logbar>=0.2.1", "numpy==2.2.6", "device-smi>=0.5.3"]\n')
     pins = tmp_path / "pins.txt"
-    pins.write_text("logbar==0.2.1\nnumpy==2.2.6\ndevice-smi==0.5.3\n")
+    pins.write_text("logbar==0.2.1\nnumpy==2.2.6\ndevice-smi==0.5.7\n")
     versions = {"logbar": "0.2.1", "numpy": "1.26.0", "device-smi": "0.5.2"}
     monkeypatch.setattr(module.metadata, "version", lambda name: versions[name])
-    assert module.missing_extras(source, pins) == ["numpy==2.2.6", "device-smi==0.5.3"]
+    assert module.missing_extras(source, pins) == ["numpy==2.2.6", "device-smi==0.5.7"]
     versions["numpy"] = "2.2.6"
-    assert module.missing_extras(source, pins) == ["device-smi==0.5.3"]
-    versions["device-smi"] = "0.5.3"
+    assert module.missing_extras(source, pins) == ["device-smi==0.5.7"]
+    versions["device-smi"] = "0.5.7"
     assert module.missing_extras(source, pins) == []
     pins.write_text("logbar==0.2.1\nnumpy==2.2.6\ndevice-smi==0.5.2\n")
     versions["device-smi"] = "0.5.2"
@@ -87,8 +87,18 @@ def test_device_smi_pin_matches_pinned_gptq_package_metadata():
     pins = (ROOT / "hpc/quantizer_followups/gptq_v570_extras.txt").read_text().splitlines()
     pin = next(Requirement(line) for line in pins if Requirement(line).name == "device-smi")
     assert "0.5.3" in requirement.specifier
-    assert "0.5.3" in pin.specifier
+    assert "0.5.7" in pin.specifier
     assert "0.5.2" not in requirement.specifier
+
+
+def test_followup_batches_stage_commit_before_preflight():
+    for script_name in ("run_experiment.sbatch", "repair_s01.sbatch"):
+        script = (ROOT / "hpc/quantizer_followups" / script_name).read_text()
+        assert 'git -C "$LP_CODE" archive --format=tar' in script
+        assert '"$FOLLOWUP_CODE_SHA"' in script
+        assert 'export LP_CODE="$CODE_STAGE" PYTHONPATH="$CODE_STAGE' in script
+        assert script.index("git -C \"$LP_CODE\" archive") < script.index("bash hpc/quantizer_followups/preflight.sh")
+        assert 'stage=$CODE_STAGE' in script
 
 
 def test_effective_upstream_dispatch_contract():
