@@ -21,7 +21,25 @@ git -C /shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel checkout 
 bash hpc/quantizer_followups/setup_gptq_env.sh
 ```
 
-The pinned GPTQModel v5.7.0 revision declares Torch >=2.8.0 and Transformers >=4.57.1, compatible with the validated LP versions (Torch 2.9.1+cu128, Transformers 4.57.1). The setup script clones the LP environment into a new `/shared/makhtar/lp_llm/envs/gptq_followups_v570` prefix, installs pinned supplemental requirements with `--no-deps`, then installs GPTQModel with `--no-deps`. It checks the exact Torch and Transformers versions and saves a `pip freeze` lock snapshot. Neither the original LP environment nor the earlier incompatible GPTQ environment is changed. The original LP environment runs MatGPTQ evaluation. The reference source must remain unmodified. The AutoRound `RRQ_PR_OVERLAY`, if needed, is validated and applied only to its subprocess. Never export the overlay as a global `PYTHONPATH` before activating Conda.
+The pinned GPTQModel v5.7.0 revision declares Torch >=2.8.0 and Transformers >=4.57.1, compatible with the validated LP versions (Torch 2.9.1+cu128, Transformers 4.57.1). Setup now defaults to a small `venv --system-site-packages` at `/shared/makhtar/lp_llm/envs/gptq_followups_v570_light`; Torch and Transformers must resolve inside the unchanged LP environment. Only missing supplemental requirements and GPTQModel are installed into the new venv with `--no-deps`. Import paths, dependency versions, the W2G128 API, and an environment completion marker are checked before smoke. An existing directory without a valid marker is rejected; inspect it rather than rerunning setup into it. The earlier full copy remains available with `GPTQ_ENV_MODE=clone bash hpc/quantizer_followups/setup_gptq_env.sh` and `GPTQ_ENV_MODE=clone` on the R03 smoke job. The original LP environment runs MatGPTQ evaluation. The AutoRound `RRQ_PR_OVERLAY`, if needed, is validated and applied only to its subprocess.
+
+On AUS, after pulling this patch, run:
+
+```bash
+cd /shared/makhtar/lp_llm/code
+git pull --ff-only origin experiment/rrq-w2-reproduction
+bash hpc/quantizer_followups/setup_gptq_env.sh
+PYTHONPATH=/shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel \
+  /shared/makhtar/lp_llm/envs/gptq_followups_v570_light/bin/python \
+  hpc/quantizer_followups/gptq_env_check.py verify \
+  --env /shared/makhtar/lp_llm/envs/gptq_followups_v570_light \
+  --lp-env /shared/makhtar/lp_llm/envs/lp_llm \
+  --source /shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel \
+  --pins hpc/quantizer_followups/gptq_v570_extras.txt --mode light
+sbatch --export=ALL,EXPERIMENT_ID=r03,FOLLOWUP_SMOKE=1 hpc/quantizer_followups/run_experiment.sbatch
+```
+
+The interrupted full clone at `envs/gptq_followups_v570` is not touched by light setup. If it is incomplete, clone mode rejects it. To keep it for inspection and build a fresh clone elsewhere, set `GPTQ_ENV_MODE=clone GPTQ_ENV_OVERRIDE=/shared/makhtar/lp_llm/envs/gptq_followups_v570_fallback` for both setup and smoke.
 
 The pinned v5.7.0 HF exporter creates empty bias parameters for biasless Qwen3 projections. R03 uses its `TorchQuantLinear.dequantize_weight()` on the packed checkpoint, preserves the original bias inventory, and verifies all 252 FP16 projection tensors against the pre-save decode. This is a materialization workaround, recorded in the resolved configuration; quantization, codes, scales and grouping remain upstream. R03 has **not** passed an AUS GPU smoke test. Do not submit its full experiment until the smoke log is reviewed.
 

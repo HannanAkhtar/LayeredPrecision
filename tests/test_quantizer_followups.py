@@ -41,10 +41,32 @@ def test_pinned_configs_and_shared_reference():
     setup = (ROOT / "hpc/quantizer_followups/setup_gptq_env.sh").read_text()
     runner = (ROOT / "hpc/quantizer_followups/run_experiment.sbatch").read_text()
     extras = (ROOT / "hpc/quantizer_followups/gptq_v570_extras.txt").read_text().splitlines()
-    assert "gptq_followups_v570" in setup and "gptq_followups_v570" in runner
-    assert "--copy --prefix \"$GPTQ_ENV\" --clone \"$LP_ROOT/envs/lp_llm\"" in setup
+    assert "gptq_followups_v570_light" in setup and "gptq_followups_v570_light" in runner
+    assert "-m venv --system-site-packages" in setup
+    assert "--copy --prefix \"$GPTQ_ENV\" --clone \"$LP_ENV\"" in setup
     assert setup.count("--no-deps") >= 2
     assert not any(entry.startswith(("torch=", "transformers=")) for entry in extras)
+
+
+def test_gptq_lightweight_dependency_selection_and_marker_gate(tmp_path, monkeypatch):
+    import importlib.util
+    path = ROOT / "hpc/quantizer_followups/gptq_env_check.py"
+    spec = importlib.util.spec_from_file_location("gptq_env_check_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "requirements.txt").write_text("torch>=2.8.0\ntransformers>=4.57.1\nlogbar>=0.2.1\nnumpy==2.2.6\n")
+    pins = tmp_path / "pins.txt"
+    pins.write_text("logbar==0.2.1\nnumpy==2.2.6\n")
+    versions = {"logbar": "0.2.1", "numpy": "1.26.0"}
+    monkeypatch.setattr(module.metadata, "version", lambda name: versions[name])
+    assert module.missing_extras(source, pins) == ["numpy==2.2.6"]
+    versions["numpy"] = "2.2.6"
+    assert module.missing_extras(source, pins) == []
+    setup = (ROOT / "hpc/quantizer_followups/setup_gptq_env.sh").read_text()
+    assert '[[ -f "$GPTQ_ENV/quantizer_followups_ready.json"' in setup
+    assert '"$CHECK" verify' in setup and '"$CHECK" initialize' in setup
 
 
 def test_effective_upstream_dispatch_contract():

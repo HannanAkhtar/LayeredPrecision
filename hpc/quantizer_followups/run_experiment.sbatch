@@ -17,7 +17,14 @@ RRQ_PR_SOURCE="${RRQ_PR_SOURCE:-$LP_ROOT/references/rrq_pr2308/auto-round}"
 GPTQ_SOURCE="${GPTQ_SOURCE:-$LP_ROOT/references/quantizer_followups/GPTQModel}"
 MATGPTQ_SOURCE="${MATGPTQ_SOURCE:-$LP_ROOT/references/rrq_w2/MatGPTQ}"
 LP_PYTHON="${LP_PYTHON:-$LP_ROOT/envs/lp_llm/bin/python}"
-GPTQ_PYTHON="${GPTQ_PYTHON:-$LP_ROOT/envs/gptq_followups_v570/bin/python}"
+GPTQ_ENV_MODE="${GPTQ_ENV_MODE:-light}"
+case "$GPTQ_ENV_MODE" in
+  light) GPTQ_ENV="$LP_ROOT/envs/gptq_followups_v570_light" ;;
+  clone) GPTQ_ENV="$LP_ROOT/envs/gptq_followups_v570" ;;
+  *) echo "ERROR: GPTQ_ENV_MODE must be light or clone" >&2; exit 1 ;;
+esac
+GPTQ_ENV="${GPTQ_ENV_OVERRIDE:-$GPTQ_ENV}"
+GPTQ_PYTHON="${GPTQ_PYTHON:-$GPTQ_ENV/bin/python}"
 source /opt/miniconda/etc/profile.d/conda.sh
 conda activate "$LP_ROOT/envs/lp_llm"
 source "$LP_ROOT/env.sh"
