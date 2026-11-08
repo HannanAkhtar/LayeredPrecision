@@ -13,6 +13,7 @@ LP_CODE="${LP_CODE:-$LP_ROOT/code}"
 LP_SOURCE="${LP_SOURCE:-$LP_ROOT/models/qwen3-8b-base}"
 RESULT_ROOT="${RESULT_ROOT:-$LP_ROOT/results/qwen3_8b_base}"
 LP_PYTHON="${LP_PYTHON:-$LP_ROOT/envs/lp_llm/bin/python}"
+R03_OFFLOAD_ROOT="${R03_OFFLOAD_ROOT:-$LP_ROOT/tmp/r03_offload}"
 FOLLOWUP_CODE_SHA="${FOLLOWUP_CODE_SHA:-$(git -C "$LP_CODE" rev-parse HEAD)}"
 [[ "$FOLLOWUP_CODE_SHA" =~ ^[0-9a-f]{40}$ && -x "$LP_PYTHON" ]] || {
   echo "ERROR: pinned code SHA or LP Python is invalid" >&2; exit 1;
@@ -30,5 +31,6 @@ rm -- "$CODE_STAGE/code.tar"
 }
 cd "$CODE_STAGE"
 PYTHONPATH="$CODE_STAGE" "$LP_PYTHON" -m lp_llm.r03_resources \
-  --source "$LP_SOURCE" --result-root "$RESULT_ROOT" --scratch "$CODE_STAGE" --strict
+  --source "$LP_SOURCE" --result-root "$RESULT_ROOT" --scratch "$CODE_STAGE" \
+  --offload-root "$R03_OFFLOAD_ROOT" --strict
 echo "[R03 CAPACITY CHECK COMPLETE] commit=$FOLLOWUP_CODE_SHA"

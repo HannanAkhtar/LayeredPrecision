@@ -44,9 +44,9 @@ def test_r03_capacity_counts_codes_scales_zeros_and_dense_exclusions(tmp_path, m
     monkeypatch.setattr("lp_llm.r03_resources.shutil.disk_usage",
                         lambda _: SimpleNamespace(free=100 * GIB))
     gpu = {"name": "A10G", "free_bytes": 22 * GIB, "total_bytes": 23 * GIB}
-    result = assess(source, tmp_path, tmp_path, gpu=gpu, memory_limit_bytes=24 * GIB)
+    result = assess(source, tmp_path, tmp_path, tmp_path, gpu=gpu,
+                    memory_limit_bytes=12 * GIB, quota_bytes=100 * GIB)
     assert result["status"] == "capacity_floor_passed"
-    assert result["same_filesystem"]
     assert all(result["checks"].values())
 
 
@@ -58,16 +58,33 @@ def test_r03_capacity_rejects_missing_projection_and_low_space(tmp_path, monkeyp
     monkeypatch.setattr("lp_llm.r03_resources.shutil.disk_usage",
                         lambda _: SimpleNamespace(free=16 * GIB))
     gpu = {"name": "A10G", "free_bytes": 19 * GIB, "total_bytes": 23 * GIB}
-    result = assess(source, tmp_path, tmp_path, gpu=gpu, memory_limit_bytes=12 * GIB)
+    result = assess(source, tmp_path, tmp_path, tmp_path, gpu=gpu,
+                    memory_limit_bytes=8 * GIB, quota_bytes=16 * GIB)
     assert result["status"] == "capacity_floor_failed"
-    assert not result["checks"]["scratch_and_output_capacity"]
+    assert not result["checks"]["filesystem_capacity"]
     assert not result["checks"]["gpu_free_at_least_20_gib"]
-    assert not result["checks"]["host_allocation_for_dense_qdq"]
+    assert not result["checks"]["host_allocation_for_streaming"]
+    assert not result["checks"]["declared_shared_quota"]
+
+
+def test_r03_read_only_preflight_reports_missing_quota(tmp_path, monkeypatch):
+    source = source_fixture(tmp_path / "source")
+    monkeypatch.delenv("R03_SHARED_QUOTA_FREE_GIB", raising=False)
+    monkeypatch.setattr("lp_llm.r03_resources.shutil.disk_usage",
+                        lambda _: SimpleNamespace(free=100 * GIB))
+    result = assess(source, tmp_path, tmp_path, tmp_path,
+                    gpu={"name": "A10G", "free_bytes": 22 * GIB},
+                    memory_limit_bytes=12 * GIB)
+    assert not result["checks"]["declared_shared_quota"]
+    assert result["declared_shared_quota_free_bytes"] is None
+    assert "R03_SHARED_QUOTA_FREE_GIB" in result["quota_note"]
 
 
 def test_r03_full_job_requires_explicit_feasibility_gate():
     script = (Path(__file__).resolve().parents[1] /
               "hpc/quantizer_followups/run_experiment.sbatch").read_text()
     assert 'R03_FULL_FEASIBILITY_OK:-0' in script
+    assert 'R03_PROBE_REPORT:?' in script
     assert 'lp_llm.r03_resources' in script
-    assert '--scratch "$CODE_STAGE" --strict' in script
+    assert '--scratch "$CODE_STAGE"' in script and '--strict' in script
+    assert '--offload-root "${R03_OFFLOAD_ROOT:-$LP_ROOT/tmp/r03_offload}"' in script

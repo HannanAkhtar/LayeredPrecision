@@ -70,8 +70,12 @@ if [[ "$EXPERIMENT_ID" == r03 ]]; then
     echo "ERROR: R03 full quantization requires representative-layer feasibility review and R03_FULL_FEASIBILITY_OK=1" >&2
     exit 1
   }
+  : "${R03_PROBE_REPORT:?Set reviewed representative-layer report path}"
+  "$LP_PYTHON" -m lp_llm.r03_probe_gate --report "$R03_PROBE_REPORT" \
+    --source "$LP_SOURCE" --code-sha "$FOLLOWUP_CODE_SHA"
   "$LP_PYTHON" -m lp_llm.r03_resources \
-    --source "$LP_SOURCE" --result-root "$RESULT_ROOT" --scratch "$CODE_STAGE" --strict
+    --source "$LP_SOURCE" --result-root "$RESULT_ROOT" --scratch "$CODE_STAGE" \
+    --offload-root "${R03_OFFLOAD_ROOT:-$LP_ROOT/tmp/r03_offload}" --strict
 fi
 args=(--experiment-id "$EXPERIMENT_ID" --stage "${FOLLOWUP_STAGE:-all}"
       --source "$LP_SOURCE" --result-root "$RESULT_ROOT"

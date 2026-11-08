@@ -141,11 +141,15 @@ def validate_resolved(config: dict, path: Path, checkout: Path) -> dict:
         if (any(observed.get(key) != value for key, value in expected_gptq.items()) or
                 record.get("backend") != "TORCH" or record.get("model_dtype") != "float16" or
                 record.get("packed_decoder") != "CPU INT2 and official Torch non-Triton" or
+                record.get("offload_mode") != "shared_job_owned" or
                 record.get("calibration_sample_count") != 128 or
                 record.get("materializer") !=
-                "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory" or
+                "streamed source inventory, independent INT2 parity, official Torch FP16 QDQ" or
                 record.get("packed_to_qdq_exact_projection_parity") is not True or
-                record.get("packed_to_qdq_projection_count") != 252):
+                record.get("packed_to_qdq_projection_count") != 252 or
+                record.get("qdq_stream", {}).get("format") != "dense_fp16_qdq_streamed" or
+                record.get("qdq_stream", {}).get("quantized_projection_count") != 252 or
+                len(record.get("packed_to_qdq_hashes", {})) != 252):
             raise ValueError("GPTQ settings or packed-to-QDQ parity not verified")
     else:
         expected_class = "SignRoundV2Quantizer" if config["id"] == "s01" else "OptimizedRTNQuantizer"

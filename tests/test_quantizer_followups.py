@@ -292,7 +292,7 @@ def test_gptq_packed_decode_rejects_meta_or_missing_weights():
     assert smoke.index('model.save(str(tmp / "packed"))') < smoke.index('reloaded = GPTQModel.load(str(')
     assert smoke.index('reloaded = GPTQModel.load(str(') < smoke.index('expected_qdq = {')
     assert worker.index('model.save(str(packed))') < worker.index('reloaded = GPTQModel.load(str(')
-    assert worker.index('reloaded = GPTQModel.load(str(') < worker.index('decoded = decode_gptq_w2_packed(')
+    assert worker.index('reloaded = GPTQModel.load(str(') < worker.index('stream_gptq_qdq(reloaded,')
 
 
 def test_actual_pinned_dispatch_function(monkeypatch):
@@ -500,9 +500,12 @@ def test_r03_resolved_identity_requires_pinned_backend_and_materializer(tmp_path
                          "format": "gptq"},
               "backend": "TORCH", "model_dtype": "float16", "calibration_sample_count": 128,
               "packed_decoder": "CPU INT2 and official Torch non-Triton",
-              "materializer": "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory",
+              "offload_mode": "shared_job_owned",
+              "materializer": "streamed source inventory, independent INT2 parity, official Torch FP16 QDQ",
               "packed_to_qdq_exact_projection_parity": True,
-              "packed_to_qdq_projection_count": 252}
+              "packed_to_qdq_projection_count": 252,
+              "packed_to_qdq_hashes": {str(i): "hash" for i in range(252)},
+              "qdq_stream": {"format": "dense_fp16_qdq_streamed", "quantized_projection_count": 252}}
     atomic_json(path, record)
     assert validate_resolved(load_config("r03"), path, checkout) == record
     for key, bad in (("backend", "AUTO"), ("calibration_sample_count", 0),

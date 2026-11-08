@@ -1,117 +1,124 @@
-# R03 full-model feasibility gate
+# R03 A10G feasibility and guarded layer probe
 
-The AUS tiny Qwen3 GPTQ smoke passed (job 53793). It verified the seven packed
-projections against an independent INT2 decoder after checkpoint reload.
-Its reported GPU allocation peak was 46.9165 MiB and process RSS peak was
-2,267,360 KiB (about 2.16 GiB). These are tiny-model observations, not a
-measurement or scaling basis for Qwen3-8B peak memory or disk use.
+The tiny R03 smoke passed on AUS in job 53793 (46.9165 MiB PyTorch GPU peak,
+2,267,360 KiB process RSS). Those are tiny-model observations only. Read-only
+capacity job 53833 found 21.97 GiB free on its A10G and confirmed the old
+workflow could not fit: 12 GiB host RAM was below its 20 GiB floor and local
+`/tmp` had only 21.60 GiB free versus 40 GiB required. GPU nodes have only
+15,564 MiB Slurm RealMemory.
 
-## Pinned workflow
+## Revised workflow
 
-R03 uses GPTQModel 5.7.0 at `ed96f2e04ec868b04f969733a242ce3b5bb7cb1e`.
-The source Qwen3-8B-Base revision is
-`49e3418fbbbca6ecbdf9608b4d22e5a407081db4`. `QuantizeConfig` fixes
-W2G128, `sym=True`, `desc_act=False`, `act_group_aware=True`, `static_groups=False`,
-`true_sequential=True`, FP32 Hessian staging, 0.05 dampening and 0.01 automatic
-dampening increment. The worker shuffles `NeelNanda/pile-10k` with seed 42,
-uses the source slow tokenizer, selects 128 sequences of 2048 tokens (joining
-short samples as needed), hashes the exact token IDs, and runs batch-one GPTQ
-on the Torch backend. The Qwen3 module tree selects seven projections in each
-of 36 layers. RMS norms, embeddings and the untied output head are excluded.
+R03 retains GPTQModel 5.7.0 revision
+`ed96f2e04ec868b04f969733a242ce3b5bb7cb1e`, symmetric W2G128, Torch
+backend, FP16 load, FP32 Hessian staging, `desc_act=False`,
+`act_group_aware=True`, `static_groups=False`, `true_sequential=True`, and the
+existing dampening settings. Full and probe paths share the exact calibration
+builder: source slow tokenizer, `NeelNanda/pile-10k` shuffled with seed 42,
+128 sequences of 2048 tokens with the established short-sample fallback, and
+a token-ID SHA256 fingerprint. GPTQModel's Qwen3 tree selects seven
+projections per layer, 252 total. Embeddings, untied head and norms are
+excluded.
 
-The worker requires 252 packed Torch projections before save, saves the packed
-checkpoint, reloads it, and requires identical projection coverage. It
-independently decodes every reloaded INT2 `qweight`/`qzeros`/`scales`/`g_idx`
-tensor and SHA-compares all 252 decoded FP16 weights with the official Torch
-decoder's dense QDQ export. The checkpoint validator then checks source/QDQ
-inventory, architecture, all 252 changed projections, W2 group structure,
-excluded source-cast weights, finite values, packed code/scale/zero coverage,
-and file hashes. Resume compares those hashes with its completion marker.
-MatGPTQ evaluation retains the recorded WikiText-2 token hash, 2048-token
-nonoverlapping protocol and FP16 inference dtype.
+GPTQModel saves a **packed** checkpoint first. The worker reloads it and
+streams the dense **QDQ** checkpoint one source-named tensor per Safetensors
+shard, with the `format=pt` header needed by Hugging Face. It does not
+accumulate all CPU FP16 projection weights. For each projection it compares
+the independent INT2 decoder with the official Torch decoder exactly. The
+checkpoint validator repeats all 252 comparisons, including `g_idx`, and
+checks source inventory, exclusions, finiteness and hashes. An interrupted
+QDQ export remains in `.partial` and is never automatically overwritten.
+Packed and QDQ storage are measured and reported separately. MatGPTQ's
+recorded WikiText-2 token hash, 2048-token protocol and FP16 inference are
+unchanged.
 
-## Capacity estimate and limits
+GPTQModel's temporary offload path now points into a unique, job-owned
+directory under `/shared/makhtar/lp_llm/tmp/r03_offload` (or another reviewed
+`R03_OFFLOAD_ROOT` under `/shared/makhtar/lp_llm`). Normal exit or a Python
+exception removes only the directory bearing that job's ownership marker.
+A hard kill can leave an orphan; later jobs never delete it automatically.
+Inspect an orphan before manual cleanup.
 
-The read-only preflight scans the source Safetensors headers. For the expected
-Qwen3-8B shapes, approximately 6.946 billion projection weights contribute
-1.617 GiB of 2-bit codes, 0.101 GiB of FP16 scales, 0.013 GiB of packed zero
-points and 0.005 GiB of group indices. Excluded dense weights, mainly the
-separate embedding and head, contribute about 2.32 GiB. The **estimated packed
-tensor payload** is therefore about 4.05 GiB, before file headers, config,
-tokenizer and any other sidecars. The actual packed checkpoint bytes will be
-measured after export. The **dense FP16 QDQ representation** remains about
-15.26 GiB of tensor payload; it is not a 2-bit deployment size.
+## Revised admission floors
 
-One FP16 128×2048×4096 activation cache is 2 GiB. One FP32 12288² Hessian is
-0.5625 GiB; decomposition, workspaces and other projection Hessians can
-coexist. GPTQModel defaults to disk offloading and loads a CPU turtle model
-alongside a meta shell. It captures initial inputs on CPU and processes layers
-sequentially, but asynchronous submodule finalizers, cache replay, packing,
-save/reload and the large excluded tensors prevent a reliable 8B peak estimate
-from the tiny smoke. More decisively, the current QDQ materializer creates all
-252 CPU FP16 projection `Linear` weights before `save_pretrained`; these alone
-occupy about 12.94 GiB. The 12 GiB host allocation **cannot complete the
-current full workflow**, irrespective of quantization offloading. A streaming
-QDQ writer or a larger validated node allocation is required. The 23 GiB A10G
-GPU peak remains unmeasured for the 8B path.
+These are capacity gates, **not predicted 8B peaks**. Source Safetensors
+headers set the exact byte counts. For Qwen3-8B, the estimated packed tensor
+payload is 4,353,779,712 bytes (about 4.05 GiB), including dense excluded
+tensors. Dense FP16 QDQ tensor payload is about 15.26 GiB. Physical packed
+files include headers and sidecars and are measured after export. The
+streamed writer's largest single dense tensor is about 1.16 GiB. One FP16
+128×2048×4096 activation cache is 2 GiB, and one FP32 12288² Hessian is
+0.5625 GiB; overlapping GPTQ workspaces remain unmeasured.
 
-The preflight uses conservative **capacity floors**, not predicted peaks: at
-least 20 GiB currently free on the allocated GPU, a 20 GiB host allocation for
-the current nonstreaming QDQ phase,
-40 GiB scratch free for offloaded state, and the estimated packed plus dense
-QDQ payload plus 4 GiB (about 23.3 GiB) free for output. If scratch and output
-share a filesystem, it requires their combined free space (about 63.3 GiB).
-The disk floors allow for duplicate offload serialization but are not an
-upper bound. The reported node available RAM and cgroup headroom are read-only
-observations. Full quantization remains blocked pending a representative-layer
-measurement of GPU peak, process-tree RSS and scratch growth.
+| Resource | New floor |
+| --- | ---: |
+| Allocated A10G free memory | 20 GiB |
+| Slurm host allocation | 10 GiB (current 12 GiB request passes this static check) |
+| Local scratch for staged code/runtime | 2 GiB |
+| Dedicated shared offload directory | 40 GiB free |
+| Shared packed plus QDQ output | payload estimates plus 4 GiB, about 23.3 GiB |
+| Declared available shared quota | offload plus output floors, about 63.3 GiB |
 
-An interactive reading on `ip-10-240-16-194` found 15 GiB total host RAM,
-about 8.3 GiB available and only 20 GiB free on `/tmp`; `/shared` had ample
-reported capacity. That is **not** a measurement from the GPU compute-node
-allocation. If its local scratch has the same 20 GiB free, the preflight will
-fail before quantization. Do not redirect offloading to `/shared` without a
-separately reviewed path, capacity check and restart policy.
+For paths on one filesystem, the preflight sums the relevant floors. It also
+checks declared available shared quota. AUS has no `quota` command; `/shared`
+is NFSv4 and reports 8.0E free via `df`, while current project usage is 666
+GiB. None of those figures proves remaining user/project quota. With no
+declared quota, the read-only preflight prints other measurements but fails
+the quota gate; the layer probe and full worker fail closed. Obtain an
+administrator or portal value for **available** quota before setting
+`R03_SHARED_QUOTA_FREE_GIB`.
 
-## Run only the read-only assessment
+## AUS commands
+
+The next capacity job reads headers and node metrics; it does not load weights
+or write an experiment result. Create the dedicated empty parent once, then
+submit it even if quota is still unknown. Expect a nonzero exit when the quota
+gate remains unresolved; inspect its JSON in the Slurm log.
 
 ```bash
 cd /shared/makhtar/lp_llm/code
 git pull --ff-only origin experiment/rrq-w2-reproduction
 CODE_SHA=$(git rev-parse HEAD)
-mkdir -p /shared/makhtar/lp_llm/logs
+LP_ROOT=/shared/makhtar/lp_llm
+export R03_OFFLOAD_ROOT="$LP_ROOT/tmp/r03_offload"
+mkdir -p "$R03_OFFLOAD_ROOT" "$LP_ROOT/logs"
 sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
   hpc/quantizer_followups/r03_feasibility.sbatch
 ```
 
-The job requests one A10G, one CPU, 12 GiB host RAM and ten minutes. It reads
-source headers, `nvidia-smi`, filesystem capacity and Linux memory counters.
-It does not load the model, download data, write an experiment result or run
-GPTQ. It prints a JSON report and exits nonzero if a capacity floor fails.
-With the current 12 GiB request, failure of the host-QDQ floor is expected;
-that is an actionable result, not a preflight malfunction. The GPU-node disk
-and GPU measurements in the same report still determine whether those
-resources also need work.
+Once an administrator or portal confirms the free quota, set it and rerun the
+same capacity job. **Only after it passes**, submit the separate first-layer
+probe:
 
-Before full R03, run a **separately identified representative-layer job** using
-the pinned 8B source and 128×2048 calibration inputs. It should exercise the
-largest `down_proj` (12288 input channels), Hessian staging, packing and disk
-offloading while sampling GPU memory, process-tree RSS, cgroup memory and
-scratch usage at short intervals. Preserve its outputs outside `r03/`; do not
-use the full R03 result identity or launch the 252-projection runner. Abort if
-the allocation approaches 90% of GPU or host memory, scratch/output free space
-falls below the capacity floor, any tensor becomes nonfinite, or a packed
-projection cannot be independently decoded. The representative job still
-cannot prove every phase's peak; review its measurements with additional room
-for final save/reload and QDQ export before approving a full allocation.
+```bash
+read -r -p 'Site-confirmed available shared quota (GiB): ' R03_SHARED_QUOTA_FREE_GIB
+export R03_SHARED_QUOTA_FREE_GIB
+sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
+  hpc/quantizer_followups/r03_feasibility.sbatch
+sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
+  hpc/quantizer_followups/r03_layer_probe.sbatch
+```
 
-The full R03 batch path now requires `R03_FULL_FEASIBILITY_OK=1` **and** reruns
-the capacity preflight. There is no safe full submission on the known 12 GiB
-allocation. Do not set that flag until the host-QDQ blocker is resolved, the
-representative-layer results have been reviewed, and a suitable allocation is
-available. A later full submission must override the memory request with a
-reviewed value of at least 20 GiB and the wall time with the QoS-approved
-limit; start with `FOLLOWUP_STAGE=encode`. The existing 12 GiB/12-hour defaults
-are not a feasibility claim. A failed or partial R03 export must be inspected,
-not automatically overwritten. Evaluate only after the 252-projection
-encoding marker passes validation.
+The probe requests one A10G, four CPUs, 12 GiB and four hours. It loads the
+pinned 8B source but keeps only its first real decoder layer in the in-memory
+shell and turtle. The seven projections include the largest-shape
+`down_proj` (12288 input channels). It runs the same 128×2048 calibration and
+W2G128 Torch algorithm, packs, saves/reloads a temporary one-layer checkpoint
+and checks all seven packed decodes exactly. It writes a separate report under
+`quantizer_followups/r03_feasibility/layer_probe-<jobid>.json`, never under
+`r03/`. Job-owned offload and temporary packed files are removed on normal
+exit. No full 252-projection quantization is invoked.
+
+Abort or decline full R03 if the probe reaches 90% of GPU or cgroup host
+memory, runs out of shared quota, approaches storage floors, produces
+nonfinite weights, fails packed parity, or leaves an unexplained partial
+export. This first layer exercises the largest tensor dimensions but cannot
+prove late-layer activation, total runtime or final QDQ export peaks.
+
+Full R03 remains guarded by `R03_FULL_FEASIBILITY_OK=1`, a same-code and
+same-source successful `R03_PROBE_REPORT` (including source-shard hashes and
+the exact W2G128 Torch settings), and a fresh capacity preflight.
+**Do not submit full R03 yet.** Review the probe measurements, quota and
+remaining storage first. A later authorized first full run should use
+`FOLLOWUP_STAGE=encode` and a QoS-approved wall time; evaluate only after
+the 252-projection completion marker passes validation.

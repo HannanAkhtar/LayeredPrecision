@@ -76,6 +76,7 @@ def estimate(source: Path) -> dict:
     if not expected <= set(tensors):
         raise ValueError(f"Missing {len(expected - set(tensors))} expected R03 projections")
     code_bytes = scale_bytes = zero_bytes = group_index_bytes = projected_elements = 0
+    max_projection_tensor_bytes = max_dense_tensor_bytes = 0
     dense_bytes = excluded_bytes = 0
     for name, entry in tensors.items():
         shape, dtype = entry["shape"], entry["dtype"]
@@ -83,6 +84,7 @@ def estimate(source: Path) -> dict:
             raise ValueError(f"Unsupported source dtype: {name}: {dtype}")
         elements = math.prod(shape)
         dense_bytes += elements * 2
+        max_dense_tensor_bytes = max(max_dense_tensor_bytes, elements * 2)
         if name not in expected:
             excluded_bytes += elements * 2
             continue
@@ -92,6 +94,7 @@ def estimate(source: Path) -> dict:
         if in_features % 128 or in_features % 16 or out_features % 16:
             raise ValueError(f"Unsupported packed projection dimensions: {name}: {shape}")
         projected_elements += elements
+        max_projection_tensor_bytes = max(max_projection_tensor_bytes, elements * 2)
         groups = in_features // 128
         code_bytes += in_features // 16 * out_features * 4
         scale_bytes += groups * out_features * 2
@@ -106,6 +109,8 @@ def estimate(source: Path) -> dict:
             "packed_scale_bytes": scale_bytes, "packed_zero_bytes": zero_bytes,
             "packed_group_index_bytes": group_index_bytes,
             "packed_tensor_estimate_bytes": packed_estimate,
+            "max_projection_tensor_bytes": max_projection_tensor_bytes,
+            "max_dense_tensor_bytes": max_dense_tensor_bytes,
             "calibration_activation_single_copy_bytes": 128 * 2048 * 4096 * 2,
             "largest_fp32_hessian_single_copy_bytes": 12288 ** 2 * 4}
 
@@ -148,29 +153,51 @@ def _host_memory() -> dict:
     return result
 
 
-def assess(source: Path, result_root: Path, scratch: Path, *, gpu: dict | None = None,
-           memory_limit_bytes: int | None = None) -> dict:
+def assess(source: Path, result_root: Path, scratch: Path, offload: Path, *, gpu: dict | None = None,
+           memory_limit_bytes: int | None = None, quota_bytes: int | None = None) -> dict:
+    from .r03_offload import quota_free_bytes
+
     sizes = estimate(source)
-    scratch_base, result_base = _existing(scratch), _existing(result_root)
+    if not offload.is_dir() or offload.is_symlink():
+        raise ValueError("R03 offload directory must exist and cannot be a symlink")
+    scratch_base, result_base, offload_base = _existing(scratch), _existing(result_root), offload.resolve()
     scratch_free = shutil.disk_usage(scratch_base).free
     result_free = shutil.disk_usage(result_base).free
-    same_filesystem = scratch_base.stat().st_dev == result_base.stat().st_dev
-    # Capacity floors include a duplicate offload copy and room for checkpoint
-    # serialization. They are conservative gates, not predicted peak usage.
-    scratch_floor = max(40 * GIB, 2 * sizes["dense_tensor_bytes"] +
+    offload_free = shutil.disk_usage(offload_base).free
+    scratch_floor = 2 * GIB  # staged code, Python caches and short-lived local files
+    offload_floor = max(40 * GIB, 2 * sizes["dense_tensor_bytes"] +
                         sizes["packed_tensor_estimate_bytes"] + 4 * GIB)
     result_floor = sizes["packed_tensor_estimate_bytes"] + sizes["dense_tensor_bytes"] + 4 * GIB
-    # The current QDQ materializer allocates all 252 FP16 projection Linear
-    # weights on CPU before save_pretrained. This alone exceeds 12 GiB.
-    host_floor = max(20 * GIB, 2 * sizes["projected_elements"] + 4 * GIB)
+    # Streaming QDQ retains one dense tensor at a time; this is a floor, not
+    # a prediction of GPTQModel's peak during the 128-sample calibration.
+    host_floor = max(10 * GIB, sizes["excluded_dense_bytes"] +
+                     sizes["calibration_activation_single_copy_bytes"] +
+                     2 * sizes["max_projection_tensor_bytes"] + 2 * GIB)
     gpu = _gpu() if gpu is None else gpu
     memory_limit_bytes = memory_limit_bytes if memory_limit_bytes is not None else int(
         os.environ.get("SLURM_MEM_PER_NODE", "0")) * 1024**2
+    quota_note = None
+    if quota_bytes is None:
+        try:
+            quota_bytes = quota_free_bytes()
+        except ValueError as exc:
+            quota_note = str(exc)
+    locations = {"scratch": (scratch_base, scratch_floor),
+                 "offload": (offload_base, offload_floor),
+                 "output": (result_base, result_floor)}
+    required_by_device = {}
+    free_by_device = {}
+    for path, floor in locations.values():
+        device = path.stat().st_dev
+        required_by_device[device] = required_by_device.get(device, 0) + floor
+        free_by_device[device] = min(free_by_device.get(device, shutil.disk_usage(path).free),
+                                     shutil.disk_usage(path).free)
     checks = {"gpu_is_a10g": "A10G" in gpu["name"],
               "gpu_free_at_least_20_gib": gpu["free_bytes"] >= 20 * GIB,
-              "host_allocation_for_dense_qdq": memory_limit_bytes >= host_floor,
-              "scratch_and_output_capacity": (scratch_free >= scratch_floor + result_floor
-                    if same_filesystem else scratch_free >= scratch_floor and result_free >= result_floor)}
+              "host_allocation_for_streaming": memory_limit_bytes >= host_floor,
+              "filesystem_capacity": all(free_by_device[device] >= floor
+                    for device, floor in required_by_device.items()),
+              "declared_shared_quota": quota_bytes is not None and quota_bytes >= offload_floor + result_floor}
     return {"status": "capacity_floor_passed" if all(checks.values()) else "capacity_floor_failed",
             "scope": "read-only capacity floors; not a peak-memory prediction or full-run approval",
             "source": str(source.resolve()), "sizes": sizes, "gpu": gpu,
@@ -178,9 +205,14 @@ def assess(source: Path, result_root: Path, scratch: Path, *, gpu: dict | None =
             "host_observed": _host_memory(),
             "scratch": {"path": str(scratch_base), "free_bytes": scratch_free,
                         "floor_bytes": scratch_floor},
+            "offload": {"path": str(offload_base), "free_bytes": offload_free,
+                        "floor_bytes": offload_floor},
             "output": {"path": str(result_base), "free_bytes": result_free,
                        "floor_bytes": result_floor},
-            "same_filesystem": same_filesystem, "checks": checks}
+            "declared_shared_quota_free_bytes": quota_bytes,
+            "quota_note": quota_note,
+            "required_free_bytes_by_device": {str(k): v for k, v in required_by_device.items()},
+            "checks": checks}
 
 
 def main() -> None:
@@ -188,9 +220,11 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--scratch", type=Path, required=True)
+    parser.add_argument("--offload-root", type=Path)
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
-    report = assess(args.source, args.result_root, args.scratch)
+    from .r03_offload import offload_root
+    report = assess(args.source, args.result_root, args.scratch, offload_root(args.offload_root))
     print(json.dumps(report, indent=2))
     if args.strict and report["status"] != "capacity_floor_passed":
         raise SystemExit("R03 resource capacity floor failed; no quantization started")

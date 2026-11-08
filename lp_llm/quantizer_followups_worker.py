@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -150,31 +151,14 @@ def decode_gptq_w2_packed(module):
     return (scales[groups] * (codes - zeros[groups])).T.contiguous().to(torch.float16)
 
 
-def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
+def prepare_r03_calibration(source: Path):
+    """The pinned 128×2048 pile-10k token construction shared with the probe."""
     import torch
-    os.environ["GPTQ_TORCH_TRITON_DEQUANT"] = "0"
-    import gptqmodel
     from datasets import load_dataset
-    from gptqmodel import BACKEND, GPTQModel
-    from gptqmodel.quantization import QuantizeConfig
     from transformers import AutoTokenizer
 
-    qcfg = QuantizeConfig(bits=2, group_size=128, sym=True, desc_act=False,
-                     act_group_aware=True, damp_percent=0.05,
-                     damp_auto_increment=0.01, static_groups=False,
-                     true_sequential=True)
-    actual = {key: getattr(qcfg, key) for key in ("bits", "group_size", "sym", "desc_act",
-        "act_group_aware", "damp_percent", "damp_auto_increment", "static_groups",
-        "true_sequential", "format")}
-    actual["format"] = getattr(actual["format"], "value", actual["format"])
-    if actual["bits"] != 2 or actual["group_size"] != 128 or actual["sym"] is not True:
-        raise RuntimeError(f"Wrong GPTQ configuration: {actual}")
-    # Save the packed checkpoint first. The pinned upstream HF exporter adds an
-    # empty bias Parameter to biasless Qwen3 projections, so materialize from
-    # its decoder while preserving the original bias inventory.
     tokenizer = AutoTokenizer.from_pretrained(source, use_fast=False)
-    dataset = load_dataset("NeelNanda/pile-10k", split="train")
-    dataset = dataset.shuffle(seed=42)
+    dataset = load_dataset("NeelNanda/pile-10k", split="train").shuffle(seed=42)
     natural, short = [], []
     for row in dataset:
         value = row.get("text")
@@ -198,19 +182,59 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
                    for ids in (natural + packed)[:128]]
     if len(calibration) != 128:
         raise RuntimeError(f"Only {len(calibration)} calibration samples reached 2048 tokens")
-    import hashlib
     fingerprint = hashlib.sha256()
     for item in calibration:
         fingerprint.update(torch.tensor(item["input_ids"], dtype=torch.int32).numpy().tobytes())
+    return tokenizer, calibration, fingerprint.hexdigest()
+
+
+def make_r03_quantize_config():
+    from gptqmodel.quantization import QuantizeConfig
+
+    return QuantizeConfig(bits=2, group_size=128, sym=True, desc_act=False,
+                          act_group_aware=True, damp_percent=0.05,
+                          damp_auto_increment=0.01, static_groups=False,
+                          true_sequential=True)
+
+
+def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
+    from .r03_offload import OffloadLease, offload_root
+
+    with OffloadLease.create(offload_root()) as lease:
+        _gptq_with_lease(config, source, export, resolved, lease)
+
+
+def _gptq_with_lease(config: dict, source: Path, export: Path, resolved: Path, lease) -> None:
+    import torch
+    os.environ["GPTQ_TORCH_TRITON_DEQUANT"] = "0"
+    import gptqmodel
+    from gptqmodel import BACKEND, GPTQModel
+    qcfg = make_r03_quantize_config()
+    if qcfg.offload_to_disk is not True:
+        raise RuntimeError("Pinned GPTQModel disk offloading is unavailable")
+    qcfg.offload_to_disk_path = str(lease.directory / "weights")
+    actual = {key: getattr(qcfg, key) for key in ("bits", "group_size", "sym", "desc_act",
+        "act_group_aware", "damp_percent", "damp_auto_increment", "static_groups",
+        "true_sequential", "format")}
+    actual["format"] = getattr(actual["format"], "value", actual["format"])
+    if actual["bits"] != 2 or actual["group_size"] != 128 or actual["sym"] is not True:
+        raise RuntimeError(f"Wrong GPTQ configuration: {actual}")
+    # Save the packed checkpoint first. The pinned upstream HF exporter adds an
+    # empty bias Parameter to biasless Qwen3 projections, so materialize from
+    # its decoder while preserving the original bias inventory.
+    tokenizer, calibration, fingerprint = prepare_r03_calibration(source)
     resolved.write_text(json.dumps({"reference_module": str(Path(gptqmodel.__file__).resolve()),
         "config": {key: str(value) for key, value in actual.items()},
         "hessian": str(qcfg.hessian), "block_size": 128,
-        "calibration_sample_count": len(calibration), "calibration_token_sha256": fingerprint.hexdigest(),
+        "calibration_sample_count": len(calibration), "calibration_token_sha256": fingerprint,
         "calibration_construction": "HF shuffle(seed=42), tokenize/truncate to 2048, natural full sequences first, concatenate short samples as fallback; first 128",
         "backend": "TORCH", "model_dtype": "float16", "packed_decoder": "CPU INT2 and official Torch non-Triton",
-        "materializer": "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory"}, indent=2), encoding="utf-8")
+        "offload_mode": "shared_job_owned", "offload_root": str(lease.root),
+        "materializer": "streamed source inventory, independent INT2 parity, official Torch FP16 QDQ"}, indent=2), encoding="utf-8")
     model = GPTQModel.load(str(source), qcfg, device="cuda:0", dtype=torch.float16)
     require_loaded_gptq_quantizer(model, qcfg)
+    if not qcfg.offload_to_disk or qcfg.offload_to_disk_path != str(lease.directory / "weights"):
+        raise RuntimeError("GPTQModel changed the pinned shared offload configuration")
     loaded_first = next(model.model.parameters(), None)
     details = json.loads(resolved.read_text())
     details["observed_first_loaded_weight_dtype"] = str(loaded_first.dtype) if loaded_first is not None else None
@@ -233,14 +257,10 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
                         if isinstance(module, TorchQuantLinear)}
     if set(reloaded_modules) != quantized_names:
         raise RuntimeError("Reloaded GPTQ projection coverage differs from quantized model")
-    expected_qdq_hashes = {}
-    for name, module in reloaded_modules.items():
-        decoded = decode_gptq_w2_packed(module)
-        expected_qdq_hashes[name + ".weight"] = hashlib.sha256(decoded.numpy().tobytes()).hexdigest()
-        del decoded
-    del reloaded_modules, module
-    if materialize_gptq_qdq(reloaded, export / "qdq") != 252:
-        raise RuntimeError("GPTQ QDQ materialization did not cover 252 projections")
+    del reloaded_modules
+    from .r03_stream import stream_gptq_qdq
+    streamed = stream_gptq_qdq(reloaded, source, export / "qdq")
+    expected_qdq_hashes = streamed["projection_sha256"]
     del reloaded
     torch.cuda.empty_cache()
     from safetensors import safe_open
@@ -260,6 +280,9 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
     details["packed_to_qdq_exact_projection_parity"] = True
     details["packed_to_qdq_projection_count"] = len(expected_qdq_hashes)
     details["packed_to_qdq_hashes"] = expected_qdq_hashes
+    details["qdq_stream"] = {key: streamed[key] for key in (
+        "format", "tensor_count", "quantized_projection_count", "max_single_tensor_bytes",
+        "total_tensor_bytes")}
     resolved.write_text(json.dumps(details, indent=2), encoding="utf-8")
 
 

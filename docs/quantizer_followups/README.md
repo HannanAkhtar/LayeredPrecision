@@ -2,7 +2,7 @@
 
 This adds S01 SignRoundV2, R01 symmetric NeUQI optimized RTN, R02 asymmetric NeUQI optimized RTN, and R03 GPTQModel GPTQ. No new 8B measurements are claimed. Existing J01–J14 and PR03/PR04 checkpoints and result directories are untouched.
 
-The tiny R03 GPU smoke passed on AUS (job 53793). Full-model R03 remains gated: the current dense QDQ materializer alone needs more than the 12 GiB host allocation. Run the read-only capacity job and review [R03 feasibility](r03_feasibility.md) before considering a separate representative-layer test or full submission.
+The tiny R03 GPU smoke passed on AUS (job 53793). Capacity job 53833 rejected the old nonstreaming workflow. The full R03 path now streams dense QDQ tensors and uses job-owned shared offloading, but remains gated by a fresh read-only preflight and separate largest-layer GPU probe. See [R03 feasibility](r03_feasibility.md) before any full submission.
 
 R01/R02 use the same pinned AutoRound PR source as PR04. In this source, asymmetric zero-iteration optimized RTN requires `enable_neuqi=True`; otherwise the dispatcher runs plain asymmetric min/max RTN. Thus R01 versus PR04 tests NeUQI on the same revision; R02 versus R01 tests symmetry at fixed NeUQI settings. The [numerical audit](numerical_audit.md) records the older J05 revision and remaining confounders.
 
