@@ -6,6 +6,10 @@ import importlib.metadata as metadata
 import inspect
 import json
 import sys
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 LP environments
+    import tomli as tomllib
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -15,8 +19,8 @@ MARKER = "quantizer_followups_ready.json"
 
 
 def missing_extras(source: Path, pins: Path) -> list[str]:
-    requirements = [Requirement(line) for line in (source / "requirements.txt").read_text().splitlines()
-                    if line.strip() and not line.lstrip().startswith("#")]
+    project = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    requirements = [Requirement(line) for line in project["dependencies"]]
     pinned = {Requirement(line).name.lower().replace("_", "-"): line for line in pins.read_text().splitlines()
               if line.strip() and not line.lstrip().startswith("#")}
     missing = []
@@ -31,6 +35,9 @@ def missing_extras(source: Path, pins: Path) -> list[str]:
         if version is None or version not in requirement.specifier:
             if name not in pinned:
                 raise RuntimeError(f"No supplemental pin for {requirement}")
+            pin_version = pinned[name].split("==", 1)[-1]
+            if pin_version not in requirement.specifier:
+                raise RuntimeError(f"Supplemental pin {pinned[name]} violates {requirement}")
             missing.append(pinned[name])
     return missing
 

@@ -3,7 +3,7 @@ numpy==2.2.6
 safetensors==0.6.2
 threadpoolctl==3.6.0
 packaging==24.2
-device-smi==0.5.2
+device-smi==0.5.3
 protobuf==6.32.0
 pillow==11.3.0
 pypcre==0.2.9

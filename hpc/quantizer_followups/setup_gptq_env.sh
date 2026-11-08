@@ -22,19 +22,26 @@ PINS="$LP_CODE/hpc/quantizer_followups/gptq_v570_extras.txt"
 }
 git -C "$GPTQ_SOURCE" diff --quiet HEAD || { echo "ERROR: GPTQModel checkout has local changes" >&2; exit 1; }
 if [[ -e "$GPTQ_ENV" ]]; then
-  [[ -f "$GPTQ_ENV/quantizer_followups_ready.json" && -x "$GPTQ_ENV/bin/python" ]] || {
-    echo "ERROR: incomplete GPTQ environment at $GPTQ_ENV; inspect it before retrying" >&2; exit 1;
-  }
-  PYTHONPATH="$GPTQ_SOURCE" "$GPTQ_ENV/bin/python" "$CHECK" verify \
-    --env "$GPTQ_ENV" --lp-env "$LP_ENV" --source "$GPTQ_SOURCE" --pins "$PINS" --mode "$GPTQ_ENV_MODE"
-  echo "[GPTQ ENV READY] $GPTQ_ENV"
-  exit 0
-fi
-if [[ "$GPTQ_ENV_MODE" == light ]]; then
-  "$LP_PYTHON" -m venv --system-site-packages "$GPTQ_ENV"
+  if [[ -f "$GPTQ_ENV/quantizer_followups_ready.json" ]]; then
+    [[ -x "$GPTQ_ENV/bin/python" ]] || { echo "ERROR: marked GPTQ environment lacks Python" >&2; exit 1; }
+    PYTHONPATH="$GPTQ_SOURCE" "$GPTQ_ENV/bin/python" "$CHECK" verify \
+      --env "$GPTQ_ENV" --lp-env "$LP_ENV" --source "$GPTQ_SOURCE" --pins "$PINS" --mode "$GPTQ_ENV_MODE"
+    echo "[GPTQ ENV READY] $GPTQ_ENV"
+    exit 0
+  fi
+  if [[ "$GPTQ_ENV_MODE" != light || ! -x "$GPTQ_ENV/bin/python" || ! -f "$GPTQ_ENV/pyvenv.cfg" ]] || \
+     ! grep -qi '^include-system-site-packages = true$' "$GPTQ_ENV/pyvenv.cfg"; then
+    echo "ERROR: incomplete GPTQ environment at $GPTQ_ENV is not a recoverable lightweight venv" >&2; exit 1
+  fi
+  "$GPTQ_ENV/bin/python" -c 'import sys; from pathlib import Path; assert Path(sys.prefix).resolve() == Path(sys.argv[1]).resolve()' "$GPTQ_ENV"
+  echo "[GPTQ ENV RESUME] using existing lightweight venv $GPTQ_ENV"
 else
-  source /opt/miniconda/etc/profile.d/conda.sh
-  conda create --yes --copy --prefix "$GPTQ_ENV" --clone "$LP_ENV"
+  if [[ "$GPTQ_ENV_MODE" == light ]]; then
+    "$LP_PYTHON" -m venv --system-site-packages "$GPTQ_ENV"
+  else
+    source /opt/miniconda/etc/profile.d/conda.sh
+    conda create --yes --copy --prefix "$GPTQ_ENV" --clone "$LP_ENV"
+  fi
 fi
 PYTHON="$GPTQ_ENV/bin/python"
 missing_output=$("$PYTHON" "$CHECK" missing --env "$GPTQ_ENV" --lp-env "$LP_ENV" \
@@ -43,7 +50,20 @@ if [[ -n "$missing_output" ]]; then
   mapfile -t extras <<< "$missing_output"
   "$PYTHON" -m pip install --no-deps "${extras[@]}"
 fi
-"$PYTHON" -m pip install --no-deps --no-build-isolation --editable "$GPTQ_SOURCE"
+if ! "$PYTHON" - "$GPTQ_ENV" <<'PY'
+import importlib.metadata as m
+import sys
+from pathlib import Path
+try:
+    dist = m.distribution("gptqmodel")
+    assert dist.version == "5.7.0"
+    assert Path(dist.locate_file("")).resolve().is_relative_to(Path(sys.argv[1]).resolve())
+except (m.PackageNotFoundError, AssertionError):
+    raise SystemExit(1)
+PY
+then
+  "$PYTHON" -m pip install --no-deps --no-build-isolation --editable "$GPTQ_SOURCE"
+fi
 "$PYTHON" -m pip check || { echo "ERROR: isolated GPTQ environment has dependency conflicts" >&2; exit 1; }
 "$PYTHON" -m pip freeze > "$GPTQ_ENV/quantizer_followups_requirements_lock.txt"
 PYTHONPATH="$GPTQ_SOURCE" "$PYTHON" "$CHECK" initialize \

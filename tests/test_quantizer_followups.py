@@ -56,17 +56,39 @@ def test_gptq_lightweight_dependency_selection_and_marker_gate(tmp_path, monkeyp
     spec.loader.exec_module(module)
     source = tmp_path / "source"
     source.mkdir()
-    (source / "requirements.txt").write_text("torch>=2.8.0\ntransformers>=4.57.1\nlogbar>=0.2.1\nnumpy==2.2.6\n")
+    (source / "pyproject.toml").write_text('[project]\ndependencies = ["torch>=2.8.0", "transformers>=4.57.1", "logbar>=0.2.1", "numpy==2.2.6", "device-smi>=0.5.3"]\n')
     pins = tmp_path / "pins.txt"
-    pins.write_text("logbar==0.2.1\nnumpy==2.2.6\n")
-    versions = {"logbar": "0.2.1", "numpy": "1.26.0"}
+    pins.write_text("logbar==0.2.1\nnumpy==2.2.6\ndevice-smi==0.5.3\n")
+    versions = {"logbar": "0.2.1", "numpy": "1.26.0", "device-smi": "0.5.2"}
     monkeypatch.setattr(module.metadata, "version", lambda name: versions[name])
-    assert module.missing_extras(source, pins) == ["numpy==2.2.6"]
+    assert module.missing_extras(source, pins) == ["numpy==2.2.6", "device-smi==0.5.3"]
     versions["numpy"] = "2.2.6"
+    assert module.missing_extras(source, pins) == ["device-smi==0.5.3"]
+    versions["device-smi"] = "0.5.3"
     assert module.missing_extras(source, pins) == []
+    pins.write_text("logbar==0.2.1\nnumpy==2.2.6\ndevice-smi==0.5.2\n")
+    versions["device-smi"] = "0.5.2"
+    with pytest.raises(RuntimeError, match="violates"):
+        module.missing_extras(source, pins)
     setup = (ROOT / "hpc/quantizer_followups/setup_gptq_env.sh").read_text()
     assert '[[ -f "$GPTQ_ENV/quantizer_followups_ready.json"' in setup
+    assert "[GPTQ ENV RESUME]" in setup and "dist.version == \"5.7.0\"" in setup
     assert '"$CHECK" verify' in setup and '"$CHECK" initialize' in setup
+
+
+def test_device_smi_pin_matches_pinned_gptq_package_metadata():
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+    from packaging.requirements import Requirement
+    dependencies = tomllib.loads((GPTQ.parent / "pyproject.toml").read_text(encoding="utf-8"))["project"]["dependencies"]
+    requirement = next(Requirement(line) for line in dependencies if Requirement(line).name == "device-smi")
+    pins = (ROOT / "hpc/quantizer_followups/gptq_v570_extras.txt").read_text().splitlines()
+    pin = next(Requirement(line) for line in pins if Requirement(line).name == "device-smi")
+    assert "0.5.3" in requirement.specifier
+    assert "0.5.3" in pin.specifier
+    assert "0.5.2" not in requirement.specifier
 
 
 def test_effective_upstream_dispatch_contract():
