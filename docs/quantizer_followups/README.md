@@ -117,7 +117,7 @@ sbatch --export=ALL,REPAIR_EXPERIMENT_ID=r01,S01_REPAIR_STAGE=all,FOLLOWUP_CODE_
 sbatch --export=ALL,REPAIR_EXPERIMENT_ID=r02,S01_REPAIR_STAGE=all,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/repair_s01.sbatch
 ```
 
-The pinned GPTQModel 5.7.0 packed module creates `wf_unsqueeze_zero` and `wf_unsqueeze_neg_one` in `post_init()`. The in-memory quantization result is packed but has not run that loader initialization, so calling `TorchQuantLinear.dequantize_weight()` there fails. The R03 smoke now decodes W2 packed codes/scales/zero points independently before saving, then reloads through GPTQModel's official post-init path and compares all seven dense FP16 projection weights exactly with the independent decode. The same comparison is required for all 252 full-model projections if R03 later runs.
+The pinned GPTQModel 5.7.0 packed module creates `wf_unsqueeze_zero` and `wf_unsqueeze_neg_one` in `post_init()`. Immediately after quantization, the shell model may also contain meta placeholders while packed weights live in its turtle/offload state; the AUS tiny smoke observed a meta `qweight`. GPTQModel's save path synchronizes those states, and its loader initializes packed Torch modules. The R03 smoke therefore saves and reloads first, requires all packed fields to be materialized, independently decodes W2 codes/scales/zero points, and compares all seven dense FP16 projections exactly against the official Torch decoder's QDQ checkpoint. The full R03 runner applies the same check to all 252 projections. A missing packed field, meta tensor, or mismatch fails before a success marker.
 
 ## CPU checks and GPU smoke
 

@@ -126,12 +126,16 @@ def require_loaded_gptq_quantizer(model, qcfg) -> None:
 
 
 def decode_gptq_w2_packed(module):
-    """Independently decode the pinned INT2 qweight/qzeros layout before post_init."""
+    """Independently decode materialized pinned INT2 qweight/qzeros fields."""
     import torch
 
     if (module.bits != 2 or module.group_size != 128 or module.sym is not True or
             module.pack_dtype_bits != 32):
         raise ValueError("Expected symmetric W2G128 INT32 packed module")
+    for name in ("qweight", "qzeros", "scales", "g_idx"):
+        value = getattr(module, name, None)
+        if not isinstance(value, torch.Tensor) or value.device.type == "meta" or value.numel() == 0:
+            raise RuntimeError(f"GPTQ packed {name} is not materialized")
     shifts = (2 * torch.arange(16, dtype=torch.int64)).view(1, 16, 1)
     qweight = module.qweight.detach().cpu().to(torch.int64)
     qzeros = module.qzeros.detach().cpu().to(torch.int64)
@@ -218,16 +222,23 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
                          if isinstance(module, TorchQuantLinear)}
     if len(quantized_modules) != 252:
         raise RuntimeError(f"GPTQ quantized {len(quantized_modules)} modules instead of 252")
-    expected_qdq_hashes = {}
-    for name, module in quantized_modules.items():
-        decoded = decode_gptq_w2_packed(module)
-        expected_qdq_hashes[name + ".weight"] = hashlib.sha256(decoded.numpy().tobytes()).hexdigest()
-        del decoded
+    quantized_names = set(quantized_modules)
+    del quantized_modules
     packed = export / "packed"
     model.save(str(packed))
     del model
     torch.cuda.empty_cache()
     reloaded = GPTQModel.load(str(packed), backend=BACKEND.TORCH)
+    reloaded_modules = {name: module for name, module in reloaded.model.named_modules()
+                        if isinstance(module, TorchQuantLinear)}
+    if set(reloaded_modules) != quantized_names:
+        raise RuntimeError("Reloaded GPTQ projection coverage differs from quantized model")
+    expected_qdq_hashes = {}
+    for name, module in reloaded_modules.items():
+        decoded = decode_gptq_w2_packed(module)
+        expected_qdq_hashes[name + ".weight"] = hashlib.sha256(decoded.numpy().tobytes()).hexdigest()
+        del decoded
+    del reloaded_modules, module
     if materialize_gptq_qdq(reloaded, export / "qdq") != 252:
         raise RuntimeError("GPTQ QDQ materialization did not cover 252 projections")
     del reloaded

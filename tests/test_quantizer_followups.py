@@ -236,7 +236,7 @@ def test_pinned_gptq_instance_quantization_api_and_torch_w2g128(monkeypatch):
         assert "model.quantize(" in code and "backend=BACKEND.TORCH" in code
 
 
-def test_independent_gptq_w2_packed_decode_before_post_init():
+def test_independent_gptq_w2_packed_decode_matches_official():
     from lp_llm.quantizer_followups_worker import decode_gptq_w2_packed
     torch.manual_seed(17)
     codes = torch.randint(0, 4, (128, 32), dtype=torch.int64)
@@ -269,6 +269,30 @@ def test_independent_gptq_w2_packed_decode_before_post_init():
     pinned_loader = (GPTQ / "models/loader.py").read_text(encoding="utf-8")
     assert 'self.register_buffer("wf_unsqueeze_zero"' in pinned_base
     assert "model = gptqmodel_post_init(model" in pinned_loader
+
+
+def test_gptq_packed_decode_rejects_meta_or_missing_weights():
+    from lp_llm.quantizer_followups_worker import decode_gptq_w2_packed
+    module = types.SimpleNamespace(bits=2, group_size=128, sym=True, pack_dtype_bits=32,
+        qweight=torch.zeros(8, 32, dtype=torch.int32),
+        qzeros=torch.zeros(1, 2, dtype=torch.int32),
+        scales=torch.ones(1, 32, dtype=torch.float16),
+        g_idx=torch.zeros(128, dtype=torch.int32), in_features=128, out_features=32)
+    for name in ("qweight", "qzeros", "scales", "g_idx"):
+        incomplete = types.SimpleNamespace(**vars(module))
+        setattr(incomplete, name, torch.empty_like(getattr(module, name), device="meta"))
+        with pytest.raises(RuntimeError, match=f"packed {name} is not materialized"):
+            decode_gptq_w2_packed(incomplete)
+    incomplete = types.SimpleNamespace(**vars(module))
+    incomplete.qweight = None
+    with pytest.raises(RuntimeError, match="packed qweight is not materialized"):
+        decode_gptq_w2_packed(incomplete)
+    smoke = (ROOT / "hpc/quantizer_followups/smoke.py").read_text()
+    worker = (ROOT / "lp_llm/quantizer_followups_worker.py").read_text()
+    assert smoke.index('model.save(str(tmp / "packed"))') < smoke.index('reloaded = GPTQModel.load(str(')
+    assert smoke.index('reloaded = GPTQModel.load(str(') < smoke.index('expected_qdq = {')
+    assert worker.index('model.save(str(packed))') < worker.index('reloaded = GPTQModel.load(str(')
+    assert worker.index('reloaded = GPTQModel.load(str(') < worker.index('decoded = decode_gptq_w2_packed(')
 
 
 def test_actual_pinned_dispatch_function(monkeypatch):

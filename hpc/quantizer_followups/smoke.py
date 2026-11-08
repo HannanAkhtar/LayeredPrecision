@@ -47,22 +47,33 @@ def main() -> None:
             from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
             quantized_modules = {name: module for name, module in model.model.named_modules()
                                  if isinstance(module, TorchQuantLinear)}
-            assert len(quantized_modules) == 7, f"Expected seven quantized projections, got {len(quantized_modules)}"
-            expected_qdq = {name + ".weight": decode_gptq_w2_packed(module)
-                            for name, module in quantized_modules.items()}
+            if len(quantized_modules) != 7:
+                raise RuntimeError(f"Expected seven quantized projections, got {len(quantized_modules)}")
+            quantized_names = set(quantized_modules)
+            del quantized_modules
             model.save(str(tmp / "packed"))
-            assert (tmp / "packed/config.json").is_file()
+            if not (tmp / "packed/config.json").is_file():
+                raise RuntimeError("GPTQ packed checkpoint config is missing")
             del model
             torch.cuda.empty_cache()
             reloaded = GPTQModel.load(str(tmp / "packed"), backend=BACKEND.TORCH)
-            assert materialize_gptq_qdq(reloaded, tmp / "qdq") == 7
+            reloaded_modules = {name: module for name, module in reloaded.model.named_modules()
+                                if isinstance(module, TorchQuantLinear)}
+            if set(reloaded_modules) != quantized_names:
+                raise RuntimeError("Reloaded GPTQ projection coverage differs")
+            expected_qdq = {name + ".weight": decode_gptq_w2_packed(module)
+                            for name, module in reloaded_modules.items()}
+            del reloaded_modules
+            if materialize_gptq_qdq(reloaded, tmp / "qdq") != 7:
+                raise RuntimeError("GPTQ QDQ checkpoint has wrong projection coverage")
             from safetensors import safe_open
             from lp_llm.rrq_pr2308_compare import _weight_map
             mapping = _weight_map(tmp / "qdq")
             for weight_name, expected in expected_qdq.items():
                 with safe_open(tmp / "qdq" / mapping[weight_name], framework="pt", device="cpu") as handle:
                     actual_qdq = handle.get_tensor(weight_name)
-                assert torch.equal(actual_qdq, expected), f"GPTQ packed and exported QDQ differ: {weight_name}"
+                if not torch.equal(actual_qdq, expected):
+                    raise RuntimeError(f"GPTQ packed and exported QDQ differ: {weight_name}")
         else:
             import os
             if args.experiment_id in ("r01", "r02"):
