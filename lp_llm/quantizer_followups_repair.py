@@ -1,4 +1,4 @@
-"""Separately identify and materialize an S01 checkpoint after FP16 load loss.
+"""Separately identify and materialize S01/R01/R02 after FP16 load loss.
 
 The original AutoRound export is read only. This path is enabled only when all
 excluded-weight changes exactly match a BF16 -> FP16 -> export-dtype round trip.
@@ -24,7 +24,7 @@ from .rrq_w2 import MATGPTQ_COMMIT
 from .storage import atomic_json, sha256
 
 
-REPAIR_ID = "s01_fp16_load_repair"
+REPAIR_IDS = {name: f"{name}_fp16_load_repair" for name in ("s01", "r01", "r02")}
 
 
 def _tensor_region(path: Path, name: str) -> tuple[int, int, str, tuple[int, ...]]:
@@ -90,31 +90,33 @@ def verify_projection_bytes(raw: Path, repaired: Path, names: list[str]) -> dict
 
 
 def repair(source: Path, raw_result: Path, target_result: Path, upstream: Path,
-           matgptq: Path, stage: str = "all") -> dict:
-    config = load_config("s01")
+           matgptq: Path, stage: str = "all", experiment_id: str = "s01") -> dict:
+    if experiment_id not in REPAIR_IDS:
+        raise ValueError(f"Unsupported repair experiment: {experiment_id}")
+    config = load_config(experiment_id)
     check_revision(upstream, PR_COMMIT)
     check_revision(matgptq, MATGPTQ_COMMIT)
     original_identity = identity(config, source, upstream)
     verify_original_checkpoint(original_identity["source"], raw_result)
     if json.loads((raw_result / "run.json").read_text()).get("identity") != original_identity:
-        raise ValueError("Original S01 run identity differs")
+        raise ValueError(f"Original {experiment_id} run identity differs")
     if json.loads((raw_result / "quantization_process.json").read_text()).get("returncode") != 0:
-        raise ValueError("Original S01 quantization did not exit successfully")
+        raise ValueError(f"Original {experiment_id} quantization did not exit successfully")
     if not (raw_result / "quantization.log").is_file():
-        raise ValueError("Original S01 quantization log is missing")
-    audit_source(upstream, "s01")
+        raise ValueError(f"Original {experiment_id} quantization log is missing")
+    audit_source(upstream, experiment_id)
     validate_resolved(config, raw_result / "resolved_config.json", upstream)
     raw_info = validate_output(raw_result / "export", source)
     raw = Path(raw_info["resolved_checkpoint_path"])
     evidence = audit(source, raw_result / "export")
     if len(evidence["quantized_projection_names"]) != 252:
-        raise ValueError("S01 export does not contain 252 eligible projections")
+        raise ValueError(f"{experiment_id} export does not contain 252 eligible projections")
     changed = [entry for entry in evidence["excluded_tensors"] if entry["changed"]]
     if not changed or any(entry["fp16_roundtrip_mismatches"] for entry in evidence["excluded_tensors"]):
         raise ValueError("Excluded changes are not fully explained by FP16 load round-trip")
     if any(entry["source_dtype"] != entry["export_dtype"] for entry in changed):
         raise ValueError("Repair requires identical source and export dtypes")
-    repair_identity = {"id": REPAIR_ID, "original_run_identity": original_identity,
+    repair_identity = {"id": REPAIR_IDS[experiment_id], "original_run_identity": original_identity,
                        "raw_checkpoint": {key: raw_info[key] for key in
                                           ("config_sha256", "index_sha256", "shard_sha256")},
                        "original_quantization_process_sha256": sha256(raw_result / "quantization_process.json"),
@@ -160,6 +162,21 @@ def repair(source: Path, raw_result: Path, target_result: Path, upstream: Path,
             raise ValueError("Repaired checkpoint differs from completion marker")
     else:
         atomic_json(marker_path, current)
+    integrity = {"status": "completed_validated", "identity": repair_identity,
+                 "excluded_source_exact": checkpoint["unchanged_tensor_count"] ==
+                 checkpoint["tensor_count"] - 252,
+                 "projection_byte_identical": len(projection_hashes) == 252,
+                 "projection_tensor_sha256": projection_hashes,
+                 "checkpoint_validation": checkpoint,
+                 "restored_excluded_tensors": current["restored_excluded_tensors"]}
+    if not integrity["excluded_source_exact"] or not integrity["projection_byte_identical"]:
+        raise ValueError("Repaired integrity report is incomplete")
+    report_path = target_result / "integrity_report.json"
+    if report_path.is_file():
+        if json.loads(report_path.read_text()) != integrity:
+            raise ValueError("Existing repair integrity report differs")
+    else:
+        atomic_json(report_path, integrity)
     if stage == "encode":
         return current
     corpus = corpus_identity(repaired)
@@ -189,9 +206,10 @@ def main() -> None:
     parser.add_argument("--upstream-source", type=Path, required=True)
     parser.add_argument("--matgptq-source", type=Path, required=True)
     parser.add_argument("--stage", choices=("encode", "all"), default="all")
+    parser.add_argument("--experiment-id", choices=tuple(REPAIR_IDS), default="s01")
     args = parser.parse_args()
     value = repair(args.source, args.raw_result, args.repaired_result,
-                   args.upstream_source, args.matgptq_source, args.stage)
+                   args.upstream_source, args.matgptq_source, args.stage, args.experiment_id)
     print(json.dumps({"status": value["status"], "result": str(args.repaired_result),
                       "stage": args.stage}, indent=2))
 

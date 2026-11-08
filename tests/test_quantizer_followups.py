@@ -236,6 +236,41 @@ def test_pinned_gptq_instance_quantization_api_and_torch_w2g128(monkeypatch):
         assert "model.quantize(" in code and "backend=BACKEND.TORCH" in code
 
 
+def test_independent_gptq_w2_packed_decode_before_post_init():
+    from lp_llm.quantizer_followups_worker import decode_gptq_w2_packed
+    torch.manual_seed(17)
+    codes = torch.randint(0, 4, (128, 32), dtype=torch.int64)
+    zero = torch.randint(0, 4, (1, 32), dtype=torch.int64)
+    scale = (torch.rand(1, 32) + 0.25).half()
+    shifts = (2 * torch.arange(16)).view(1, 16, 1)
+    qweight = (codes.reshape(8, 16, 32) << shifts).sum(1).to(torch.int32)
+    qzeros = (zero.reshape(1, 2, 16) << shifts.view(1, 1, 16)).sum(2).to(torch.int32)
+    module = types.SimpleNamespace(bits=2, group_size=128, sym=True, pack_dtype_bits=32,
+        qweight=qweight, qzeros=qzeros, scales=scale, g_idx=torch.zeros(128, dtype=torch.int32),
+        in_features=128, out_features=32)
+    actual = decode_gptq_w2_packed(module)
+    expected = (scale[0] * (codes - zero[0])).T.contiguous().half()
+    assert torch.equal(actual, expected)
+    source = (GPTQ / "nn_modules/qlinear/__init__.py").read_text(encoding="utf-8")
+    packable = next(node for node in ast.parse(source).body
+                    if isinstance(node, ast.ClassDef) and node.name == "PackableQuantLinear")
+    method = next(node for node in packable.body
+                  if isinstance(node, ast.FunctionDef) and node.name == "dequantize_weight")
+    namespace = {"t": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "pinned_packed_decoder.py", "exec"), namespace)
+    module.pack_factor, module.maxq, module.dequant_dtype = 16, 3, torch.int8
+    module.wf_unsqueeze_zero = shifts.view(1, 1, 16)
+    module.wf_unsqueeze_neg_one = shifts
+    official = namespace["dequantize_weight"](module).T.contiguous().half()
+    assert torch.equal(actual, official)
+    module.qzeros[0, 0] ^= 1
+    assert not torch.equal(decode_gptq_w2_packed(module), expected)
+    pinned_base = source
+    pinned_loader = (GPTQ / "models/loader.py").read_text(encoding="utf-8")
+    assert 'self.register_buffer("wf_unsqueeze_zero"' in pinned_base
+    assert "model = gptqmodel_post_init(model" in pinned_loader
+
+
 def test_actual_pinned_dispatch_function(monkeypatch):
     source = (AUTO / "data_type/utils.py").read_text()
     function = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)
@@ -396,6 +431,7 @@ def test_r03_resolved_identity_requires_pinned_backend_and_materializer(tmp_path
                          "static_groups": "False", "true_sequential": "True",
                          "format": "gptq"},
               "backend": "TORCH", "model_dtype": "float16", "calibration_sample_count": 128,
+              "packed_decoder": "CPU INT2 and official Torch non-Triton",
               "materializer": "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory",
               "packed_to_qdq_exact_projection_parity": True,
               "packed_to_qdq_projection_count": 252}
@@ -476,12 +512,15 @@ def test_s01_audit_detects_bf16_fp16_underflow_without_changing_export(tmp_path)
     assert report["lm_head"]["first_mismatches"][0]["export"] == 0.0
 
 
-def test_s01_repair_copies_only_excluded_bytes_and_resumes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("experiment_id", ("s01", "r01", "r02"))
+def test_s01_repair_copies_only_excluded_bytes_and_resumes(tmp_path, monkeypatch, experiment_id):
     import lp_llm.quantizer_followups_repair as module
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("quantizer relaunched"))
     source = tmp_path / "source"
-    raw_result = tmp_path / "quantizer_followups/s01"
+    raw_result = tmp_path / "quantizer_followups" / experiment_id
     raw = raw_result / "export"
-    repaired_result = tmp_path / "quantizer_followups/s01_fp16_load_repair"
+    repaired_result = tmp_path / "quantizer_followups" / f"{experiment_id}_fp16_load_repair"
     names = [f"model.layers.{i}.self_attn.q_proj.weight" for i in range(252)]
     original = {name: torch.tensor([[float(i + 1)]], dtype=torch.bfloat16)
                 for i, name in enumerate(names)}
@@ -490,7 +529,7 @@ def test_s01_repair_copies_only_excluded_bytes_and_resumes(tmp_path, monkeypatch
     exported["lm_head.weight"] = torch.zeros(1, 1, dtype=torch.bfloat16)
     _checkpoint(source, original)
     _checkpoint(raw, exported)
-    pinned = {"id": "s01", "source": {}}
+    pinned = {"id": experiment_id, "source": {}}
     atomic_json(raw_result / "run.json", {"identity": pinned})
     atomic_json(raw_result / "quantization_process.json", {"returncode": 0})
     (raw_result / "quantization.log").write_text("success")
@@ -510,18 +549,35 @@ def test_s01_repair_copies_only_excluded_bytes_and_resumes(tmp_path, monkeypatch
         mapping = json.loads((output_dir / "model.safetensors.index.json").read_text())["weight_map"]
         with __import__("safetensors").safe_open(output_dir / mapping["lm_head.weight"], framework="pt") as handle:
             assert torch.equal(handle.get_tensor("lm_head.weight"), original["lm_head.weight"])
-        return {"resolved_checkpoint_path": str(output_dir.resolve()), "quantized_projection_count": 252}
+        return {"resolved_checkpoint_path": str(output_dir.resolve()), "quantized_projection_count": 252,
+                "tensor_count": 253, "unchanged_tensor_count": 1}
 
     monkeypatch.setattr(module, "validate_checkpoint", validate)
     first = module.repair(source, raw_result, repaired_result, tmp_path / "upstream",
-                          tmp_path / "matgptq", "encode")
+                          tmp_path / "matgptq", "encode", experiment_id)
     second = module.repair(source, raw_result, repaired_result, tmp_path / "upstream",
-                           tmp_path / "matgptq", "encode")
+                           tmp_path / "matgptq", "encode", experiment_id)
     assert first == second
     with __import__("safetensors").safe_open(raw / "model.safetensors", framework="pt") as handle:
         assert torch.equal(handle.get_tensor("lm_head.weight"), exported["lm_head.weight"])
     assert len(first["projection_tensor_sha256"]) == 252
     assert first["restored_excluded_tensors"] == ["lm_head.weight"]
+    report = json.loads((repaired_result / "integrity_report.json").read_text())
+    assert report["excluded_source_exact"] and report["projection_byte_identical"]
+    assert len(report["projection_tensor_sha256"]) == 252
+    assert report["projection_tensor_sha256"] == first["projection_tensor_sha256"]
+    repaired = repaired_result / "export"
+    mapping = json.loads((repaired / "model.safetensors.index.json").read_text())["weight_map"]
+    shard = repaired / mapping[names[0]]
+    offset, _, _, _ = module._tensor_region(shard, names[0])
+    with shard.open("r+b") as stream:
+        stream.seek(offset)
+        byte = stream.read(1)
+        stream.seek(offset)
+        stream.write(bytes([byte[0] ^ 1]))
+    with pytest.raises(ValueError, match="Quantized projection bytes changed"):
+        module.repair(source, raw_result, repaired_result, tmp_path / "upstream",
+                      tmp_path / "matgptq", "encode", experiment_id)
 
 
 def test_s01_repair_rejects_unexplained_excluded_change(tmp_path, monkeypatch):

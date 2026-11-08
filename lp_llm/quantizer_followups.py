@@ -140,6 +140,7 @@ def validate_resolved(config: dict, path: Path, checkout: Path) -> dict:
                          "format": "gptq"}
         if (any(observed.get(key) != value for key, value in expected_gptq.items()) or
                 record.get("backend") != "TORCH" or record.get("model_dtype") != "float16" or
+                record.get("packed_decoder") != "CPU INT2 and official Torch non-Triton" or
                 record.get("calibration_sample_count") != 128 or
                 record.get("materializer") !=
                 "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory" or

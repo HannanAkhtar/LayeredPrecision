@@ -125,8 +125,30 @@ def require_loaded_gptq_quantizer(model, qcfg) -> None:
         raise RuntimeError("GPTQModel.load did not return the pinned Qwen3 quantization API")
 
 
+def decode_gptq_w2_packed(module):
+    """Independently decode the pinned INT2 qweight/qzeros layout before post_init."""
+    import torch
+
+    if (module.bits != 2 or module.group_size != 128 or module.sym is not True or
+            module.pack_dtype_bits != 32):
+        raise ValueError("Expected symmetric W2G128 INT32 packed module")
+    shifts = (2 * torch.arange(16, dtype=torch.int64)).view(1, 16, 1)
+    qweight = module.qweight.detach().cpu().to(torch.int64)
+    qzeros = module.qzeros.detach().cpu().to(torch.int64)
+    scales = module.scales.detach().cpu()
+    groups = module.g_idx.detach().cpu().long()
+    codes = ((qweight[:, None, :] >> shifts) & 3).reshape(-1, qweight.shape[1])
+    zeros = ((qzeros[:, :, None] >> shifts.view(1, 1, 16)) & 3).reshape(qzeros.shape[0], -1)
+    if (codes.shape != (module.in_features, module.out_features) or
+            zeros.shape != scales.shape or groups.numel() != module.in_features or
+            bool((groups < 0).any()) or bool((groups >= scales.shape[0]).any())):
+        raise ValueError("Packed GPTQ tensor shapes or group indices differ")
+    return (scales[groups] * (codes - zeros[groups])).T.contiguous().to(torch.float16)
+
+
 def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
     import torch
+    os.environ["GPTQ_TORCH_TRITON_DEQUANT"] = "0"
     import gptqmodel
     from datasets import load_dataset
     from gptqmodel import BACKEND, GPTQModel
@@ -181,7 +203,7 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
         "hessian": str(qcfg.hessian), "block_size": 128,
         "calibration_sample_count": len(calibration), "calibration_token_sha256": fingerprint.hexdigest(),
         "calibration_construction": "HF shuffle(seed=42), tokenize/truncate to 2048, natural full sequences first, concatenate short samples as fallback; first 128",
-        "backend": "TORCH", "model_dtype": "float16",
+        "backend": "TORCH", "model_dtype": "float16", "packed_decoder": "CPU INT2 and official Torch non-Triton",
         "materializer": "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory"}, indent=2), encoding="utf-8")
     model = GPTQModel.load(str(source), qcfg, device="cuda:0", dtype=torch.float16)
     require_loaded_gptq_quantizer(model, qcfg)
@@ -198,7 +220,7 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
         raise RuntimeError(f"GPTQ quantized {len(quantized_modules)} modules instead of 252")
     expected_qdq_hashes = {}
     for name, module in quantized_modules.items():
-        decoded = module.dequantize_weight().T.detach().to(device="cpu", dtype=torch.float16).contiguous()
+        decoded = decode_gptq_w2_packed(module)
         expected_qdq_hashes[name + ".weight"] = hashlib.sha256(decoded.numpy().tobytes()).hexdigest()
         del decoded
     packed = export / "packed"

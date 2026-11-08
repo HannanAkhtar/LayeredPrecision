@@ -84,6 +84,41 @@ sbatch --export=ALL,S01_REPAIR_STAGE=all,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quant
 
 The repair refuses an unexplained excluded-tensor change or a conflicting partial/repaired checkpoint. The result is a separate materialization variant, not a replacement for the official S01 export.
 
+R01 and R02 use the same guarded path with `REPAIR_EXPERIMENT_ID=r01` or `r02`. Their existing exports showed the same 12 excluded-tensor BF16→FP16→BF16 changes as S01. Each repaired variant has its own `run.json`, `encoding_complete.json`, `integrity_report.json`, checkpoint and evaluation result under `${id}_fp16_load_repair`. The report records exact excluded-source agreement and SHA-256 for all 252 quantized projections, compared byte-for-byte with the untouched raw export. Rerunning `S01_REPAIR_STAGE=encode` on the existing S01 repaired result verifies its marker and creates this explicit report without requantization.
+
+After pulling the recovery commit, rerun S01's encode stage to verify its existing completion marker and write the explicit report. Run R01 and R02 through the same encode-only repair, then inspect the three reports before evaluation. These commands read the successful quantization records and exports; the repair script has no quantization entry point:
+
+```bash
+CODE_SHA=$(git rev-parse HEAD)
+for id in s01 r01 r02; do
+  sbatch --export=ALL,REPAIR_EXPERIMENT_ID="$id",S01_REPAIR_STAGE=encode,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/repair_s01.sbatch
+done
+# Wait for each job, then verify each result before its evaluation stage:
+for id in s01 r01 r02; do
+  ID="$id" python - <<'PY'
+import json, os
+from pathlib import Path
+root = Path('/shared/makhtar/lp_llm/results/qwen3_8b_base/quantizer_followups')
+result = root / (os.environ['ID'] + '_fp16_load_repair')
+marker = json.loads((result / 'encoding_complete.json').read_text())
+report = json.loads((result / 'integrity_report.json').read_text())
+assert marker['status'] == report['status'] == 'completed_validated'
+assert marker['identity'] == report['identity']
+assert report['excluded_source_exact'] and report['projection_byte_identical']
+assert report['checkpoint_validation']['unchanged_tensor_count'] == report['checkpoint_validation']['tensor_count'] - 252
+assert len(report['projection_tensor_sha256']) == 252
+assert marker['projection_tensor_sha256'] == report['projection_tensor_sha256']
+print(result.name, 'excluded source exact; 252 quantized projections byte-identical')
+PY
+done
+# Submit only after the corresponding report passes:
+sbatch --export=ALL,REPAIR_EXPERIMENT_ID=s01,S01_REPAIR_STAGE=all,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/repair_s01.sbatch
+sbatch --export=ALL,REPAIR_EXPERIMENT_ID=r01,S01_REPAIR_STAGE=all,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/repair_s01.sbatch
+sbatch --export=ALL,REPAIR_EXPERIMENT_ID=r02,S01_REPAIR_STAGE=all,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/quantizer_followups/repair_s01.sbatch
+```
+
+The pinned GPTQModel 5.7.0 packed module creates `wf_unsqueeze_zero` and `wf_unsqueeze_neg_one` in `post_init()`. The in-memory quantization result is packed but has not run that loader initialization, so calling `TorchQuantLinear.dequantize_weight()` there fails. The R03 smoke now decodes W2 packed codes/scales/zero points independently before saving, then reloads through GPTQModel's official post-init path and compares all seven dense FP16 projection weights exactly with the independent decode. The same comparison is required for all 252 full-model projections if R03 later runs.
+
 ## CPU checks and GPU smoke
 
 ```bash
