@@ -2,7 +2,7 @@ id: r03
 method: gptqmodel_gptq
 model_id: Qwen/Qwen3-8B-Base
 model_revision: 49e3418fbbbca6ecbdf9608b4d22e5a407081db4
-gptqmodel_commit: 70579a771423767da2af57b67d2d3adf014eebb6
+gptqmodel_commit: ed96f2e04ec868b04f969733a242ce3b5bb7cb1e
 bits: 2
 group_size: 128
 symmetric: true

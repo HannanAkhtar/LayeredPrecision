@@ -20,7 +20,7 @@ GPTQ_PYTHON="${GPTQ_PYTHON:-$LP_ROOT/envs/gptq_followups/bin/python}"
 if [[ "$EXPERIMENT_ID" == r03 ]]; then
   UPSTREAM_SOURCE="$GPTQ_SOURCE"
   PYTHON="$GPTQ_PYTHON"
-  revision=70579a771423767da2af57b67d2d3adf014eebb6
+  revision=ed96f2e04ec868b04f969733a242ce3b5bb7cb1e
 else
   UPSTREAM_SOURCE="$RRQ_PR_SOURCE"
   PYTHON="$LP_PYTHON"
@@ -47,7 +47,7 @@ assert torch.cuda.is_available(), 'CUDA unavailable'
 print('Torch', torch.__version__, 'Transformers', transformers.__version__)
 PY
 if [[ "$EXPERIMENT_ID" == r03 ]]; then
-  PYTHONPATH="$reference_path${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c 'import gptqmodel; from gptqmodel import GPTQModel'
+  PYTHONPATH="$reference_path${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c 'import gptqmodel; from gptqmodel import BACKEND, GPTQModel; from gptqmodel.quantization import QuantizeConfig; from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear; assert BACKEND.TORCH and GPTQModel and QuantizeConfig and TorchQuantLinear'
 else
   PYTHONPATH="$reference_path${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c 'import auto_round; from auto_round import AutoRound'
 fi

@@ -87,15 +87,43 @@ def autoround(config: dict, source: Path, export: Path, resolved: Path) -> None:
     engine.quantize_and_save(str(export))
 
 
+def materialize_gptq_qdq(packed_model, target: Path) -> int:
+    """Decode pinned GPTQModel v5.7 weights without inventing bias parameters."""
+    import torch
+    from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
+
+    if target.exists():
+        raise FileExistsError(f"QDQ target already exists: {target}")
+    model = packed_model.model
+    modules = dict(model.named_modules())
+    names = [name for name, module in modules.items() if isinstance(module, TorchQuantLinear)]
+    for name in names:
+        module = modules[name]
+        parent_name, field = name.rsplit(".", 1)
+        parent = modules[parent_name]
+        linear = torch.nn.Linear(module.in_features, module.out_features,
+                                 bias=module.bias is not None, device="cpu", dtype=torch.float16)
+        linear.weight = torch.nn.Parameter(module.dequantize_weight().T.detach().to(
+            device="cpu", dtype=torch.float16).contiguous())
+        if module.bias is not None:
+            linear.bias = torch.nn.Parameter(module.bias.detach().to(device="cpu", dtype=torch.float16))
+        setattr(parent, field, linear)
+    if hasattr(model.config, "quantization_config"):
+        del model.config.quantization_config
+    model.save_pretrained(target)
+    packed_model.tokenizer.save_pretrained(target)
+    return len(names)
+
+
 def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
     import torch
     import gptqmodel
     from datasets import load_dataset
     from gptqmodel import BACKEND, GPTQModel
-    from gptqmodel.quantization import GPTQConfig
+    from gptqmodel.quantization import QuantizeConfig
     from transformers import AutoTokenizer
 
-    qcfg = GPTQConfig(bits=2, group_size=128, sym=True, desc_act=False,
+    qcfg = QuantizeConfig(bits=2, group_size=128, sym=True, desc_act=False,
                      act_group_aware=True, damp_percent=0.05,
                      damp_auto_increment=0.01, static_groups=False,
                      true_sequential=True)
@@ -104,8 +132,9 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
         "true_sequential", "format")}
     if actual["bits"] != 2 or actual["group_size"] != 128 or actual["sym"] is not True:
         raise RuntimeError(f"Wrong GPTQ configuration: {actual}")
-    # Save the packed checkpoint first. The upstream 'hf' export calls its own
-    # TorchLinear.dequantize_weight for every module, then writes FP16 QDQ.
+    # Save the packed checkpoint first. The pinned upstream HF exporter adds an
+    # empty bias Parameter to biasless Qwen3 projections, so materialize from
+    # its decoder while preserving the original bias inventory.
     tokenizer = AutoTokenizer.from_pretrained(source, use_fast=False)
     dataset = load_dataset("NeelNanda/pile-10k", split="train")
     dataset = dataset.shuffle(seed=42)
@@ -141,17 +170,18 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
         "hessian": str(qcfg.hessian), "block_size": 128,
         "calibration_sample_count": len(calibration), "calibration_token_sha256": fingerprint.hexdigest(),
         "calibration_construction": "HF shuffle(seed=42), tokenize/truncate to 2048, natural full sequences first, concatenate short samples as fallback; first 128",
-        "backend": "GPTQ_TORCH", "model_dtype": "float16"}, indent=2), encoding="utf-8")
+        "backend": "TORCH", "model_dtype": "float16",
+        "materializer": "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory"}, indent=2), encoding="utf-8")
     model = GPTQModel.load(str(source), qcfg, device="cuda:0", dtype=torch.float16)
     loaded_first = next(model.model.parameters(), None)
     details = json.loads(resolved.read_text())
     details["observed_first_loaded_weight_dtype"] = str(loaded_first.dtype) if loaded_first is not None else None
     resolved.write_text(json.dumps(details, indent=2), encoding="utf-8")
-    model.quantize(calibration, batch_size=1, backend=BACKEND.GPTQ_TORCH,
+    model.quantize(calibration, batch_size=1, backend=BACKEND.TORCH,
                    calibration_sort=None, calibration_data_min_length=2048)
-    from gptqmodel.nn_modules.qlinear.torch import TorchLinear
+    from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
     quantized_modules = {name: module for name, module in model.model.named_modules()
-                         if isinstance(module, TorchLinear)}
+                         if isinstance(module, TorchQuantLinear)}
     if len(quantized_modules) != 252:
         raise RuntimeError(f"GPTQ quantized {len(quantized_modules)} modules instead of 252")
     expected_qdq_hashes = {}
@@ -163,7 +193,11 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
     model.save(str(packed))
     del model
     torch.cuda.empty_cache()
-    GPTQModel.export(str(packed), str(export / "qdq"), format="hf")
+    reloaded = GPTQModel.load(str(packed), backend=BACKEND.TORCH)
+    if materialize_gptq_qdq(reloaded, export / "qdq") != 252:
+        raise RuntimeError("GPTQ QDQ materialization did not cover 252 projections")
+    del reloaded
+    torch.cuda.empty_cache()
     from safetensors import safe_open
     qdq = export / "qdq"
     index = qdq / "model.safetensors.index.json"
@@ -176,7 +210,7 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
         with safe_open(qdq / mapping[name], framework="pt", device="cpu") as handle:
             actual = handle.get_tensor(name)
         if actual.dtype != torch.float16 or hashlib.sha256(actual.numpy().tobytes()).hexdigest() != expected_hash:
-            raise RuntimeError(f"Packed TorchLinear and exported QDQ disagree: {name}")
+            raise RuntimeError(f"Packed TorchQuantLinear and exported QDQ disagree: {name}")
     details = json.loads(resolved.read_text())
     details["packed_to_qdq_exact_projection_parity"] = True
     details["packed_to_qdq_projection_count"] = len(expected_qdq_hashes)

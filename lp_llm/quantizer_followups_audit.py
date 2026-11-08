@@ -34,7 +34,8 @@ def compare_tensor(source: Path, source_map: dict[str, str], output: Path,
                    output_map: dict[str, str], name: str) -> dict:
     left = _tensor_chunks(source, source_map, name)
     right = _tensor_chunks(output, output_map, name)
-    count = changed = nonfinite = 0
+    count = changed = nonfinite = fp16_roundtrip_mismatches = 0
+    source_nonzero_to_export_zero = 0
     sum_sq = signed_sum = max_abs = 0.0
     buckets = [0] * (len(BOUNDS) + 1)
     samples = []
@@ -45,6 +46,9 @@ def compare_tensor(source: Path, source_map: dict[str, str], output: Path,
             raise ValueError(f"Tensor slice mismatch: {name}")
         source_dtype, output_dtype = str(original.dtype), str(actual.dtype)
         expected = original.to(actual.dtype)
+        fp16_roundtrip = original.to(torch.float16).to(actual.dtype)
+        fp16_roundtrip_mismatches += int((fp16_roundtrip != actual).sum())
+        source_nonzero_to_export_zero += int(((expected != 0) & (actual == 0)).sum())
         source_hash.update(original.contiguous().view(torch.uint8).numpy().tobytes())
         output_hash.update(actual.contiguous().view(torch.uint8).numpy().tobytes())
         delta = actual.float() - expected.float()
@@ -78,6 +82,8 @@ def compare_tensor(source: Path, source_map: dict[str, str], output: Path,
         raise ValueError(f"Empty tensor: {name}")
     return {"name": name, "source_dtype": source_dtype, "export_dtype": output_dtype,
             "elements": count, "changed": changed, "changed_fraction": changed / count,
+            "fp16_roundtrip_mismatches": fp16_roundtrip_mismatches,
+            "source_nonzero_to_export_zero": source_nonzero_to_export_zero,
             "max_abs_error_after_cast": max_abs, "rmse_after_cast": math.sqrt(sum_sq / count),
             "mean_signed_error_after_cast": signed_sum / count,
             "nonfinite": nonfinite, "absolute_error_histogram": buckets,

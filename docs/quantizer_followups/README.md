@@ -16,12 +16,50 @@ git pull --ff-only origin experiment/rrq-w2-reproduction
 test "$(git -C /shared/makhtar/lp_llm/references/rrq_pr2308/auto-round rev-parse HEAD)" = 7985c1b0f4eef65fb717511668fda7e347e584c3
 test "$(git -C /shared/makhtar/lp_llm/references/rrq_w2/MatGPTQ rev-parse HEAD)" = 0e5bd93bc53381f7195db870f5408ae04906bb3c
 mkdir -p /shared/makhtar/lp_llm/references/quantizer_followups
-git clone https://github.com/ModelCloud/GPTQModel.git /shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel
-git -C /shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel checkout --detach 70579a771423767da2af57b67d2d3adf014eebb6
+git -C /shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel fetch origin
+git -C /shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel checkout --detach ed96f2e04ec868b04f969733a242ce3b5bb7cb1e
 bash hpc/quantizer_followups/setup_gptq_env.sh
 ```
 
-GPTQModel's pinned source requires newer Torch and Transformers versions than the validated LP environment. The setup script creates `/shared/makhtar/lp_llm/envs/gptq_followups` as a separate environment and installs that source's declared requirements there. It does not modify the LP environment. The GPTQ quantization subprocess uses the separate environment; the MatGPTQ evaluator uses the original LP Python. Verify that the new Torch/CUDA build supports the A10G driver during the smoke job. The reference source must remain unmodified. The AutoRound `RRQ_PR_OVERLAY`, if needed, is validated and applied only to its subprocess. Never export the overlay as a global `PYTHONPATH` before activating Conda.
+The pinned GPTQModel v5.7.0 revision declares Torch >=2.8.0 and Transformers >=4.57.1, compatible with the validated LP versions (Torch 2.9.1+cu128, Transformers 4.57.1). The setup script clones the LP environment into `/shared/makhtar/lp_llm/envs/gptq_followups` and installs GPTQModel with `--no-deps`, so it cannot replace Torch or Transformers. Missing imports must be resolved only inside this clone. The original LP environment remains unchanged and runs MatGPTQ evaluation. The reference source must remain unmodified. The AutoRound `RRQ_PR_OVERLAY`, if needed, is validated and applied only to its subprocess. Never export the overlay as a global `PYTHONPATH` before activating Conda.
+
+The pinned v5.7.0 HF exporter creates empty bias parameters for biasless Qwen3 projections. R03 uses its `TorchQuantLinear.dequantize_weight()` on the packed checkpoint, preserves the original bias inventory, and verifies all 252 FP16 projection tensors against the pre-save decode. This is a materialization workaround, recorded in the resolved configuration; quantization, codes, scales and grouping remain upstream. R03 has **not** passed an AUS GPU smoke test. Do not submit its full experiment until the smoke log is reviewed.
+
+## Recover completed S01/R01/R02 exports
+
+The existing successful `quantization_process.json` records let the runner validate and evaluate without launching AutoRound again. Do not delete or edit the exports. R01/R02's pinned `OptimizedRTNConfig` has no `iters` field; JSON `null` now represents the verified zero-iteration dispatch. For R01/R02, first validate, then evaluate:
+
+```bash
+cd /shared/makhtar/lp_llm/code
+git pull --ff-only origin experiment/rrq-w2-reproduction
+sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_STAGE=encode hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_STAGE=encode hpc/quantizer_followups/run_experiment.sbatch
+# After both encoding markers pass validation, run evaluation one job at a time:
+sbatch --export=ALL,EXPERIMENT_ID=r01 hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r02 hpc/quantizer_followups/run_experiment.sbatch
+```
+
+For S01, first measure every excluded tensor against the source after casting to its export dtype:
+
+```bash
+LP_ROOT=/shared/makhtar/lp_llm
+"$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.quantizer_followups_audit \
+  --source "$LP_ROOT/models/qwen3-8b-base" \
+  --export-root "$LP_ROOT/results/qwen3_8b_base/quantizer_followups/s01/export" \
+  --output "$LP_ROOT/results/qwen3_8b_base/quantizer_followups/s01/excluded_audit.json"
+```
+
+S01 validation remains strict. The audit does not change the export or create a completion marker. A separate repaired variant requires evidence about why the excluded tensor changed.
+
+If every changed excluded tensor has `fp16_roundtrip_mismatches: 0`, the separately identified `s01_fp16_load_repair` path can restore only those excluded source bytes. It copies the raw checkpoint, verifies all 252 quantized projection tensors are byte-identical to the raw export, validates the repaired full checkpoint, and then evaluates it with the same MatGPTQ protocol. The original S01 export and result files are never changed. Review the audit and ensure enough disk space for a second roughly 16 GB checkpoint before running:
+
+```bash
+sbatch --export=ALL,S01_REPAIR_STAGE=encode hpc/quantizer_followups/repair_s01.sbatch
+# Inspect s01_fp16_load_repair/encoding_complete.json and the job log.
+sbatch --export=ALL,S01_REPAIR_STAGE=all hpc/quantizer_followups/repair_s01.sbatch
+```
+
+The repair refuses an unexplained excluded-tensor change or a conflicting partial/repaired checkpoint. The result is a separate materialization variant, not a replacement for the official S01 export.
 
 ## CPU checks and GPU smoke
 
@@ -37,6 +75,7 @@ Submit one smoke job at a time, wait for completion, and inspect its log before 
 
 ```bash
 sbatch --export=ALL,EXPERIMENT_ID=s01,FOLLOWUP_SMOKE=1 hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r03,FOLLOWUP_SMOKE=1 hpc/quantizer_followups/run_experiment.sbatch
 squeue -u "$USER" -o '%.18i %.20j %.2t %.10M %.2D %R'
 ```
 

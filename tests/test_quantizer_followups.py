@@ -20,7 +20,7 @@ from lp_llm.rrq_reference_eval import command as matgptq_command
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTO = ROOT / "outputs/rrq_pr2308_source/auto_round"
-GPTQ = ROOT / "outputs/gptqmodel_source/gptqmodel"
+GPTQ = ROOT / "outputs/gptqmodel_v570_source/gptqmodel"
 PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
@@ -52,9 +52,59 @@ def test_effective_upstream_dispatch_contract():
     assert '@register_dtype("opt_rtn_int_asym")' in neuqi
     assert '@register_dtype("opt_rtn_int_sym_neuqi")' in neuqi
     assert "class Qwen3QModel" in (GPTQ / "models/definitions/qwen3.py").read_text()
-    source = (GPTQ / "quantization/config.py").read_text()
-    assert "class GPTQConfig" in source and "true_sequential: bool = field(default=True)" in source
+    source = (GPTQ / "quantization/config.py").read_text(encoding="utf-8")
+    assert "class QuantizeConfig" in source and "true_sequential: bool = field(default=True)" in source
     assert "def dequantize_model(model:" in (GPTQ / "nn_modules/qlinear/torch.py").read_text()
+    worker = (ROOT / "lp_llm/quantizer_followups_worker.py").read_text()
+    assert "from gptqmodel.quantization import QuantizeConfig" in worker
+    assert "backend=BACKEND.TORCH" in worker
+    assert "module.dequantize_weight().T" in worker
+    assert "bias=module.bias is not None" in worker
+
+
+def test_gptq_materializer_preserves_bias_inventory_and_exact_decode(tmp_path, monkeypatch):
+    from lp_llm.quantizer_followups_worker import materialize_gptq_qdq
+
+    class QuantLinear(torch.nn.Module):
+        def __init__(self, bias):
+            super().__init__()
+            self.in_features, self.out_features = 2, 2
+            self.bias = torch.nn.Parameter(torch.tensor([1., -1.])) if bias else None
+
+        def dequantize_weight(self):
+            return torch.tensor([[1.25, 2.5], [-3.5, 4.25]])
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = torch.nn.Module()
+            self.block.no_bias = QuantLinear(False)
+            self.block.has_bias = QuantLinear(True)
+            self.config = types.SimpleNamespace(quantization_config={"bits": 2})
+
+        def save_pretrained(self, target):
+            Path(target).mkdir()
+            save_file({name: value.detach().contiguous() for name, value in self.state_dict().items()},
+                      Path(target) / "model.safetensors")
+
+    module = types.ModuleType("gptqmodel.nn_modules.qlinear.torch")
+    module.TorchQuantLinear = QuantLinear
+    for name in ("gptqmodel", "gptqmodel.nn_modules", "gptqmodel.nn_modules.qlinear"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    model = Model()
+    packed = types.SimpleNamespace(model=model, tokenizer=types.SimpleNamespace(
+        save_pretrained=lambda target: (Path(target) / "tokenizer_config.json").write_text("{}")))
+    assert materialize_gptq_qdq(packed, tmp_path / "qdq") == 2
+    with __import__("safetensors").safe_open(tmp_path / "qdq/model.safetensors", framework="pt") as handle:
+        assert "block.no_bias.bias" not in handle.keys()
+        assert torch.equal(handle.get_tensor("block.no_bias.weight"),
+                           torch.tensor([[1.25, -3.5], [2.5, 4.25]], dtype=torch.float16))
+        assert torch.equal(handle.get_tensor("block.has_bias.bias"),
+                           torch.tensor([1., -1.], dtype=torch.float16))
+    assert not hasattr(model.config, "quantization_config")
+    with pytest.raises(FileExistsError):
+        materialize_gptq_qdq(packed, tmp_path / "qdq")
 
 
 def test_actual_pinned_dispatch_function(monkeypatch):
@@ -92,7 +142,8 @@ def test_two_bit_grid_and_nonfinite_rejection():
 
 
 def test_pinned_gptq_symmetric_w2_qdq_arithmetic():
-    tree = ast.parse((GPTQ / "quantization/quantizer.py").read_text())
+    pinned_source = (GPTQ / "quantization/quantizer.py").read_text(encoding="utf-8")
+    tree = ast.parse(pinned_source)
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and
                  node.name in {"_replace_zero_scale", "quantize"}]
     namespace = {"torch": torch}
@@ -105,8 +156,8 @@ def test_pinned_gptq_symmetric_w2_qdq_arithmetic():
     assert set(codes.tolist()) <= {0, 1, 2, 3}
     decoded = namespace["quantize"](source, scale, zero, 3, False)
     assert torch.equal(decoded, scale * (codes - zero))
-    assert torch.equal(namespace["quantize"](torch.zeros(4), torch.tensor(0.),
-                                              torch.tensor(float("nan")), 3, False), torch.zeros(4))
+    # The pinned revision avoids zero scales in find_params, before quantize.
+    assert "xmin[tmp] = -1" in pinned_source and "xmax[tmp] = +1" in pinned_source
 
 
 def _checkpoint(directory: Path, weights: dict[str, torch.Tensor]) -> None:
@@ -249,8 +300,98 @@ def test_read_only_excluded_audit_quantifies_head_and_other_tensors(tmp_path):
     assert report["lm_head"]["changed_fraction"] == 0.25
     assert report["lm_head"]["max_abs_error_after_cast"] == 0.5
     assert report["lm_head"]["rmse_after_cast"] == 0.25
+    assert report["lm_head"]["fp16_roundtrip_mismatches"] == 1
     assert report["head_vs_embeddings"]["source"]["different_elements"] == 0
     assert report["head_vs_embeddings"]["export"]["different_elements"] == 1
+
+
+def test_s01_audit_detects_bf16_fp16_underflow_without_changing_export(tmp_path):
+    from lp_llm.quantizer_followups_audit import audit
+    source, export = tmp_path / "source", tmp_path / "export"
+    tiny = torch.tensor([[2.9802322387695312e-8, 1.0]], dtype=torch.bfloat16)
+    original = {"lm_head.weight": tiny,
+                "model.embed_tokens.weight": tiny.clone(),
+                "model.layers.0.self_attn.q_proj.weight": torch.ones(1, 128, dtype=torch.bfloat16)}
+    output = dict(original)
+    output["lm_head.weight"] = tiny.to(torch.float16).to(torch.bfloat16)
+    _checkpoint(source, original)
+    _checkpoint(export, output)
+    report = audit(source, export)
+    assert report["lm_head"]["changed"] == 1
+    assert report["lm_head"]["fp16_roundtrip_mismatches"] == 0
+    assert report["lm_head"]["source_nonzero_to_export_zero"] == 1
+    assert report["lm_head"]["first_mismatches"][0]["export"] == 0.0
+
+
+def test_s01_repair_copies_only_excluded_bytes_and_resumes(tmp_path, monkeypatch):
+    import lp_llm.quantizer_followups_repair as module
+    source = tmp_path / "source"
+    raw_result = tmp_path / "quantizer_followups/s01"
+    raw = raw_result / "export"
+    repaired_result = tmp_path / "quantizer_followups/s01_fp16_load_repair"
+    names = [f"model.layers.{i}.self_attn.q_proj.weight" for i in range(252)]
+    original = {name: torch.tensor([[float(i + 1)]], dtype=torch.bfloat16)
+                for i, name in enumerate(names)}
+    original["lm_head.weight"] = torch.tensor([[2.9802322387695312e-8]], dtype=torch.bfloat16)
+    exported = dict(original)
+    exported["lm_head.weight"] = torch.zeros(1, 1, dtype=torch.bfloat16)
+    _checkpoint(source, original)
+    _checkpoint(raw, exported)
+    pinned = {"id": "s01", "source": {}}
+    atomic_json(raw_result / "run.json", {"identity": pinned})
+    atomic_json(raw_result / "quantization_process.json", {"returncode": 0})
+    (raw_result / "quantization.log").write_text("success")
+    (raw_result / "resolved_config.json").write_text("{}")
+    monkeypatch.setattr(module, "check_revision", lambda *args: None)
+    monkeypatch.setattr(module, "audit_source", lambda *args: {})
+    monkeypatch.setattr(module, "identity", lambda *args: pinned)
+    monkeypatch.setattr(module, "verify_original_checkpoint", lambda *args: None)
+    monkeypatch.setattr(module, "validate_resolved", lambda *args: {})
+    monkeypatch.setattr(module, "audit", lambda *args: {
+        "quantized_projection_names": names,
+        "excluded_tensors": [{"name": "lm_head.weight", "changed": 1,
+                              "source_dtype": "torch.bfloat16", "export_dtype": "torch.bfloat16",
+                              "fp16_roundtrip_mismatches": 0}]})
+
+    def validate(config, input_dir, output_dir):
+        mapping = json.loads((output_dir / "model.safetensors.index.json").read_text())["weight_map"]
+        with __import__("safetensors").safe_open(output_dir / mapping["lm_head.weight"], framework="pt") as handle:
+            assert torch.equal(handle.get_tensor("lm_head.weight"), original["lm_head.weight"])
+        return {"resolved_checkpoint_path": str(output_dir.resolve()), "quantized_projection_count": 252}
+
+    monkeypatch.setattr(module, "validate_checkpoint", validate)
+    first = module.repair(source, raw_result, repaired_result, tmp_path / "upstream",
+                          tmp_path / "matgptq", "encode")
+    second = module.repair(source, raw_result, repaired_result, tmp_path / "upstream",
+                           tmp_path / "matgptq", "encode")
+    assert first == second
+    with __import__("safetensors").safe_open(raw / "model.safetensors", framework="pt") as handle:
+        assert torch.equal(handle.get_tensor("lm_head.weight"), exported["lm_head.weight"])
+    assert len(first["projection_tensor_sha256"]) == 252
+    assert first["restored_excluded_tensors"] == ["lm_head.weight"]
+
+
+def test_s01_repair_rejects_unexplained_excluded_change(tmp_path, monkeypatch):
+    import lp_llm.quantizer_followups_repair as module
+    monkeypatch.setattr(module, "check_revision", lambda *args: None)
+    monkeypatch.setattr(module, "identity", lambda *args: {"id": "s01", "source": {}})
+    monkeypatch.setattr(module, "verify_original_checkpoint", lambda *args: None)
+    monkeypatch.setattr(module, "audit_source", lambda *args: {})
+    monkeypatch.setattr(module, "validate_resolved", lambda *args: {})
+    monkeypatch.setattr(module, "validate_output", lambda *args: {"resolved_checkpoint_path": str(tmp_path)})
+    monkeypatch.setattr(module, "audit", lambda *args: {
+        "quantized_projection_names": [str(i) for i in range(252)],
+        "excluded_tensors": [{"name": "lm_head.weight", "changed": 1,
+                              "fp16_roundtrip_mismatches": 1}]})
+    raw_result = tmp_path / "s01"
+    raw_result.mkdir()
+    atomic_json(raw_result / "run.json", {"identity": {"id": "s01", "source": {}}})
+    atomic_json(raw_result / "quantization_process.json", {"returncode": 0})
+    (raw_result / "quantization.log").write_text("success")
+    (raw_result / "resolved_config.json").write_text("{}")
+    with pytest.raises(ValueError, match="not fully explained"):
+        module.repair(tmp_path, raw_result, tmp_path / "repaired", tmp_path, tmp_path, "encode")
+    assert not (tmp_path / "repaired").exists()
 
 
 def test_recover_successful_export_without_requantization_and_resume_eval(tmp_path, monkeypatch):

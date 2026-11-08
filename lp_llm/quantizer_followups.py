@@ -25,7 +25,7 @@ from .rrq_w2 import MATGPTQ_COMMIT
 from .storage import SIDECARS, atomic_json, sha256
 
 
-GPTQ_COMMIT = "70579a771423767da2af57b67d2d3adf014eebb6"
+GPTQ_COMMIT = "ed96f2e04ec868b04f969733a242ce3b5bb7cb1e"
 CONFIG_ROOT = Path(__file__).resolve().parent.parent / "configs/quantizer_followups"
 IDS = ("s01", "r01", "r02", "r03")
 
@@ -59,7 +59,7 @@ def audit_source(checkout: Path, experiment_id: str) -> dict:
                  "dequant": "gptqmodel/nn_modules/qlinear/torch.py",
                  "gptq": "gptqmodel/quantization/gptq.py",
                  "grid": "gptqmodel/quantization/quantizer.py"}
-        required = {"config": "class GPTQConfig", "qwen3": "class Qwen3QModel",
+        required = {"config": "class QuantizeConfig", "qwen3": "class Qwen3QModel",
                     "export": 'format == "hf"', "dequant": "def dequantize_model",
                     "gptq": "blocksize=128", "grid": "def quantize(x, scale, zero, maxq"}
     else:

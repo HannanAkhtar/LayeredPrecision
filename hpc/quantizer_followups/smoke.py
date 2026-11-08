@@ -29,19 +29,20 @@ def main() -> None:
         tmp = Path(temporary)
         if args.experiment_id == "r03":
             from gptqmodel import BACKEND, GPTQModel
-            from gptqmodel.quantization import GPTQConfig
+            from gptqmodel.quantization import QuantizeConfig
+            from lp_llm.quantizer_followups_worker import materialize_gptq_qdq
 
             tiny.save_pretrained(tmp / "model")
             AutoTokenizer.from_pretrained(args.source, use_fast=False).save_pretrained(tmp / "model")
-            qcfg = GPTQConfig(bits=2, group_size=128, sym=True, desc_act=False,
+            qcfg = QuantizeConfig(bits=2, group_size=128, sym=True, desc_act=False,
                 act_group_aware=True, damp_percent=0.05, damp_auto_increment=0.01,
                 static_groups=False, true_sequential=True)
             model = GPTQModel.load(str(tmp / "model"), qcfg, device="cuda:0", dtype=torch.float16)
-            model.quantize(inputs, batch_size=1, backend=BACKEND.GPTQ_TORCH,
+            model.quantize(inputs, batch_size=1, backend=BACKEND.TORCH,
                            calibration_sort=None, calibration_data_min_length=32)
-            from gptqmodel.nn_modules.qlinear.torch import TorchLinear
+            from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
             quantized_modules = {name: module for name, module in model.model.named_modules()
-                                 if isinstance(module, TorchLinear)}
+                                 if isinstance(module, TorchQuantLinear)}
             assert len(quantized_modules) == 7, f"Expected seven quantized projections, got {len(quantized_modules)}"
             sampled_name, sampled_module = next(iter(quantized_modules.items()))
             expected_qdq = sampled_module.dequantize_weight().T.detach().cpu().half()
@@ -49,7 +50,8 @@ def main() -> None:
             assert (tmp / "packed/config.json").is_file()
             del model
             torch.cuda.empty_cache()
-            GPTQModel.export(str(tmp / "packed"), str(tmp / "qdq"), format="hf")
+            reloaded = GPTQModel.load(str(tmp / "packed"), backend=BACKEND.TORCH)
+            assert materialize_gptq_qdq(reloaded, tmp / "qdq") == 7
             from safetensors import safe_open
             from lp_llm.rrq_pr2308_compare import _weight_map
             weight_name = sampled_name + ".weight"
