@@ -117,6 +117,9 @@ def repair(source: Path, raw_result: Path, target_result: Path, upstream: Path,
     repair_identity = {"id": REPAIR_ID, "original_run_identity": original_identity,
                        "raw_checkpoint": {key: raw_info[key] for key in
                                           ("config_sha256", "index_sha256", "shard_sha256")},
+                       "original_quantization_process_sha256": sha256(raw_result / "quantization_process.json"),
+                       "original_resolved_config_sha256": sha256(raw_result / "resolved_config.json"),
+                       "original_quantization_log_sha256": sha256(raw_result / "quantization.log"),
                        "repair_rule": "restore excluded source bytes after verified FP16 round-trip",
                        "quantized_projection_count": 252}
     marker_path = target_result / "encoding_complete.json"
@@ -147,6 +150,10 @@ def repair(source: Path, raw_result: Path, target_result: Path, upstream: Path,
     current = {"status": "completed_validated", "identity": repair_identity,
                "checkpoint_validation": checkpoint, "projection_tensor_sha256": projection_hashes,
                "restored_excluded_tensors": [entry["name"] for entry in changed],
+               "restored_excluded_evidence": [{key: entry.get(key) for key in
+                   ("name", "elements", "changed", "max_abs_error_after_cast",
+                    "rmse_after_cast", "fp16_roundtrip_mismatches",
+                    "source_nonzero_to_export_zero")} for entry in changed],
                "original_quantization_log_sha256": sha256(raw_result / "quantization.log")}
     if marker:
         if marker != current:

@@ -9,7 +9,7 @@ RRQ_PR_SOURCE="${RRQ_PR_SOURCE:-$LP_ROOT/references/rrq_pr2308/auto-round}"
 GPTQ_SOURCE="${GPTQ_SOURCE:-$LP_ROOT/references/quantizer_followups/GPTQModel}"
 MATGPTQ_SOURCE="${MATGPTQ_SOURCE:-$LP_ROOT/references/rrq_w2/MatGPTQ}"
 LP_PYTHON="${LP_PYTHON:-$LP_ROOT/envs/lp_llm/bin/python}"
-GPTQ_PYTHON="${GPTQ_PYTHON:-$LP_ROOT/envs/gptq_followups/bin/python}"
+GPTQ_PYTHON="${GPTQ_PYTHON:-$LP_ROOT/envs/gptq_followups_v570/bin/python}"
 [[ -x "$LP_PYTHON" && -f "$LP_SOURCE/config.json" && -f "$LP_SOURCE/model.safetensors.index.json" ]] || {
   echo "ERROR: LP Python or pinned source checkpoint is missing" >&2; exit 1;
 }
@@ -47,7 +47,7 @@ assert torch.cuda.is_available(), 'CUDA unavailable'
 print('Torch', torch.__version__, 'Transformers', transformers.__version__)
 PY
 if [[ "$EXPERIMENT_ID" == r03 ]]; then
-  PYTHONPATH="$reference_path${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c 'import gptqmodel; from gptqmodel import BACKEND, GPTQModel; from gptqmodel.quantization import QuantizeConfig; from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear; assert BACKEND.TORCH and GPTQModel and QuantizeConfig and TorchQuantLinear'
+  PYTHONPATH="$reference_path${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c 'import torch, transformers, gptqmodel; from gptqmodel import BACKEND, GPTQModel; from gptqmodel.quantization import QuantizeConfig; from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear; assert torch.__version__.startswith("2.9.1+cu128"), torch.__version__; assert transformers.__version__ == "4.57.1", transformers.__version__; assert BACKEND.TORCH and GPTQModel and QuantizeConfig and TorchQuantLinear'
 else
   PYTHONPATH="$reference_path${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -c 'import auto_round; from auto_round import AutoRound'
 fi

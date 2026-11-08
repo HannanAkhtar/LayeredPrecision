@@ -38,6 +38,13 @@ def test_pinned_configs_and_shared_reference():
     assert cmd[2:] == ["--model_name_or_path", str(Path("/checkpoint")),
                        "--sequence_length", "2048", "--eval_datasets", "wikitext2",
                        "--eval_batch_size", "1", "--dtype", "float16"]
+    setup = (ROOT / "hpc/quantizer_followups/setup_gptq_env.sh").read_text()
+    runner = (ROOT / "hpc/quantizer_followups/run_experiment.sbatch").read_text()
+    extras = (ROOT / "hpc/quantizer_followups/gptq_v570_extras.txt").read_text().splitlines()
+    assert "gptq_followups_v570" in setup and "gptq_followups_v570" in runner
+    assert "--copy --prefix \"$GPTQ_ENV\" --clone \"$LP_ROOT/envs/lp_llm\"" in setup
+    assert setup.count("--no-deps") >= 2
+    assert not any(entry.startswith(("torch=", "transformers=")) for entry in extras)
 
 
 def test_effective_upstream_dispatch_contract():
@@ -256,6 +263,30 @@ def test_resolved_neuqi_identity_rejects_plain_fallback(tmp_path):
         validate_resolved(config, path, checkout)
 
 
+def test_r03_resolved_identity_requires_pinned_backend_and_materializer(tmp_path):
+    checkout = tmp_path / "gptq"
+    checkout.mkdir()
+    path = tmp_path / "resolved.json"
+    record = {"reference_module": str(checkout / "gptqmodel/__init__.py"),
+              "config": {"bits": "2", "group_size": "128", "sym": "True",
+                         "desc_act": "False", "act_group_aware": "True",
+                         "damp_percent": "0.05", "damp_auto_increment": "0.01",
+                         "static_groups": "False", "true_sequential": "True",
+                         "format": "gptq"},
+              "backend": "TORCH", "model_dtype": "float16", "calibration_sample_count": 128,
+              "materializer": "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory",
+              "packed_to_qdq_exact_projection_parity": True,
+              "packed_to_qdq_projection_count": 252}
+    atomic_json(path, record)
+    assert validate_resolved(load_config("r03"), path, checkout) == record
+    for key, bad in (("backend", "AUTO"), ("calibration_sample_count", 0),
+                     ("materializer", "unverified")):
+        changed = dict(record, **{key: bad})
+        atomic_json(path, changed)
+        with pytest.raises(ValueError, match="GPTQ settings"):
+            validate_resolved(load_config("r03"), path, checkout)
+
+
 def test_source_must_match_existing_j05_identity(tmp_path):
     result = tmp_path / "qwen3_8b_base/quantizer_followups/r01"
     prior = tmp_path / "qwen3_8b_base/rrq_w2_reproduction/j05/run.json"
@@ -394,17 +425,18 @@ def test_s01_repair_rejects_unexplained_excluded_change(tmp_path, monkeypatch):
     assert not (tmp_path / "repaired").exists()
 
 
-def test_recover_successful_export_without_requantization_and_resume_eval(tmp_path, monkeypatch):
+@pytest.mark.parametrize("experiment_id", ("r01", "r02"))
+def test_recover_successful_export_without_requantization_and_resume_eval(tmp_path, monkeypatch, experiment_id):
     import lp_llm.quantizer_followups as module
-    config = load_config("r01")
-    result = tmp_path / "r01"
+    config = load_config(experiment_id)
+    result = tmp_path / experiment_id
     export = result / "export/model-w2g128"
     export.mkdir(parents=True)
     (export / "model.safetensors").write_bytes(b"fixture")
     (result / "quantization.log").write_text("upstream complete")
     atomic_json(result / "quantization_process.json", {"returncode": 0})
     atomic_json(result / "resolved_config.json", {"selected_quant_function": "opt_rtn_int_sym_neuqi"})
-    identity = {"id": "r01", "config_sha256": config["config_sha256"], "source": {}}
+    identity = {"id": experiment_id, "config_sha256": config["config_sha256"], "source": {}}
     atomic_json(result / "run.json", {"identity": identity})
     monkeypatch.setattr(module, "audit_source", lambda *args: {"revision": PR_COMMIT})
     monkeypatch.setattr(module, "check_revision", lambda *args: None)
@@ -449,5 +481,23 @@ def test_unverified_export_never_requantizes(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "validate_resolved", lambda *args: {})
     monkeypatch.setattr(module, "run_logged", lambda *args, **kwargs: pytest.fail("quantizer relaunched"))
     with pytest.raises(ValueError, match="Unmarked export"):
+        module.run_one(config, tmp_path / "source", result, tmp_path / "upstream",
+                       tmp_path / "matgptq", "python")
+
+
+def test_recovery_only_mode_refuses_missing_export_without_quantization(tmp_path, monkeypatch):
+    import lp_llm.quantizer_followups as module
+    config = load_config("r01")
+    result = tmp_path / "r01"
+    result.mkdir()
+    ident = {"id": "r01", "source": {}}
+    atomic_json(result / "run.json", {"identity": ident})
+    monkeypatch.setenv("FOLLOWUP_REUSE_EXPORT_ONLY", "1")
+    monkeypatch.setattr(module, "audit_source", lambda *args: {})
+    monkeypatch.setattr(module, "check_revision", lambda *args: None)
+    monkeypatch.setattr(module, "identity", lambda *args: ident)
+    monkeypatch.setattr(module, "verify_original_checkpoint", lambda *args: None)
+    monkeypatch.setattr(module, "run_logged", lambda *args, **kwargs: pytest.fail("quantizer relaunched"))
+    with pytest.raises(ValueError, match="quantization was not launched"):
         module.run_one(config, tmp_path / "source", result, tmp_path / "upstream",
                        tmp_path / "matgptq", "python")

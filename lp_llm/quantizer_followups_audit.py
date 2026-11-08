@@ -146,6 +146,10 @@ def main() -> None:
     value = audit(args.source, args.export_root)
     atomic_json(args.output, value)
     print(json.dumps({"output": str(args.output), "changed_excluded_names": value["changed_excluded_names"],
+                      "changed_excluded_summary": [{key: entry[key] for key in (
+                          "name", "changed", "max_abs_error_after_cast", "rmse_after_cast",
+                          "fp16_roundtrip_mismatches", "source_nonzero_to_export_zero")}
+                          for entry in value["excluded_tensors"] if entry["changed"]],
                       "lm_head": {key: value["lm_head"][key] for key in (
                           "source_dtype", "export_dtype", "elements", "changed",
                           "changed_fraction", "max_abs_error_after_cast", "rmse_after_cast")},

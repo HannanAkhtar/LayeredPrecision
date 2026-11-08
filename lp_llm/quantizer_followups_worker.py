@@ -130,6 +130,7 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
     actual = {key: getattr(qcfg, key) for key in ("bits", "group_size", "sym", "desc_act",
         "act_group_aware", "damp_percent", "damp_auto_increment", "static_groups",
         "true_sequential", "format")}
+    actual["format"] = getattr(actual["format"], "value", actual["format"])
     if actual["bits"] != 2 or actual["group_size"] != 128 or actual["sym"] is not True:
         raise RuntimeError(f"Wrong GPTQ configuration: {actual}")
     # Save the packed checkpoint first. The pinned upstream HF exporter adds an

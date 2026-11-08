@@ -21,7 +21,7 @@ git -C /shared/makhtar/lp_llm/references/quantizer_followups/GPTQModel checkout 
 bash hpc/quantizer_followups/setup_gptq_env.sh
 ```
 
-The pinned GPTQModel v5.7.0 revision declares Torch >=2.8.0 and Transformers >=4.57.1, compatible with the validated LP versions (Torch 2.9.1+cu128, Transformers 4.57.1). The setup script clones the LP environment into `/shared/makhtar/lp_llm/envs/gptq_followups` and installs GPTQModel with `--no-deps`, so it cannot replace Torch or Transformers. Missing imports must be resolved only inside this clone. The original LP environment remains unchanged and runs MatGPTQ evaluation. The reference source must remain unmodified. The AutoRound `RRQ_PR_OVERLAY`, if needed, is validated and applied only to its subprocess. Never export the overlay as a global `PYTHONPATH` before activating Conda.
+The pinned GPTQModel v5.7.0 revision declares Torch >=2.8.0 and Transformers >=4.57.1, compatible with the validated LP versions (Torch 2.9.1+cu128, Transformers 4.57.1). The setup script clones the LP environment into a new `/shared/makhtar/lp_llm/envs/gptq_followups_v570` prefix, installs pinned supplemental requirements with `--no-deps`, then installs GPTQModel with `--no-deps`. It checks the exact Torch and Transformers versions and saves a `pip freeze` lock snapshot. Neither the original LP environment nor the earlier incompatible GPTQ environment is changed. The original LP environment runs MatGPTQ evaluation. The reference source must remain unmodified. The AutoRound `RRQ_PR_OVERLAY`, if needed, is validated and applied only to its subprocess. Never export the overlay as a global `PYTHONPATH` before activating Conda.
 
 The pinned v5.7.0 HF exporter creates empty bias parameters for biasless Qwen3 projections. R03 uses its `TorchQuantLinear.dequantize_weight()` on the packed checkpoint, preserves the original bias inventory, and verifies all 252 FP16 projection tensors against the pre-save decode. This is a materialization workaround, recorded in the resolved configuration; quantization, codes, scales and grouping remain upstream. R03 has **not** passed an AUS GPU smoke test. Do not submit its full experiment until the smoke log is reviewed.
 
@@ -32,11 +32,11 @@ The existing successful `quantization_process.json` records let the runner valid
 ```bash
 cd /shared/makhtar/lp_llm/code
 git pull --ff-only origin experiment/rrq-w2-reproduction
-sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_STAGE=encode hpc/quantizer_followups/run_experiment.sbatch
-sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_STAGE=encode hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_STAGE=encode,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_STAGE=encode,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
 # After both encoding markers pass validation, run evaluation one job at a time:
-sbatch --export=ALL,EXPERIMENT_ID=r01 hpc/quantizer_followups/run_experiment.sbatch
-sbatch --export=ALL,EXPERIMENT_ID=r02 hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r01,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
+sbatch --export=ALL,EXPERIMENT_ID=r02,FOLLOWUP_REUSE_EXPORT_ONLY=1 hpc/quantizer_followups/run_experiment.sbatch
 ```
 
 For S01, first measure every excluded tensor against the source after casting to its export dtype:

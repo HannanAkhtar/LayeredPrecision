@@ -133,13 +133,22 @@ def validate_resolved(config: dict, path: Path, checkout: Path) -> dict:
         raise ValueError("Resolved quantizer was imported from the wrong checkout")
     if config["id"] == "r03":
         observed = record.get("config", {})
-        if (observed.get("bits") != "2" or observed.get("group_size") != "128" or
-                observed.get("sym") != "True" or
+        expected_gptq = {"bits": "2", "group_size": "128", "sym": "True",
+                         "desc_act": "False", "act_group_aware": "True",
+                         "damp_percent": "0.05", "damp_auto_increment": "0.01",
+                         "static_groups": "False", "true_sequential": "True",
+                         "format": "gptq"}
+        if (any(observed.get(key) != value for key, value in expected_gptq.items()) or
+                record.get("backend") != "TORCH" or record.get("model_dtype") != "float16" or
+                record.get("calibration_sample_count") != 128 or
+                record.get("materializer") !=
+                "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory" or
                 record.get("packed_to_qdq_exact_projection_parity") is not True or
                 record.get("packed_to_qdq_projection_count") != 252):
             raise ValueError("GPTQ settings or packed-to-QDQ parity not verified")
     else:
         expected_class = "SignRoundV2Quantizer" if config["id"] == "s01" else "OptimizedRTNQuantizer"
+        expected_config_class = "SignRoundV2Config" if config["id"] == "s01" else "OptimizedRTNConfig"
         settings = record.get("resolved_algorithm", {})
         iterations = settings.get("iters")
         # OptimizedRTNConfig deliberately has no ``iters`` attribute. Existing
@@ -149,6 +158,7 @@ def validate_resolved(config: dict, path: Path, checkout: Path) -> dict:
                 record.get("resolved_config_class") == "OptimizedRTNConfig"):
             iterations = 0
         if (record.get("resolved_quantizer_class") != expected_class or
+                record.get("resolved_config_class") != expected_config_class or
                 iterations != config["iterations"] or
                 settings.get("bits") != 2 or settings.get("group_size") != 128 or
                 settings.get("sym") is not config["symmetric"] or
@@ -372,6 +382,8 @@ def run_one(config: dict, source: Path, result: Path, checkout: Path, matgptq: P
             if not process_path.is_file() or json.loads(process_path.read_text()).get("returncode") != 0:
                 raise ValueError("Unmarked export lacks recorded successful upstream exit; manual inspection required")
         else:
+            if os.environ.get("FOLLOWUP_REUSE_EXPORT_ONLY") == "1":
+                raise ValueError("Recovery-only mode found no existing export; quantization was not launched")
             config_path = result / "worker_config.json"
             atomic_json(config_path, config)
             env = reference_environment(checkout, overlay if config["id"] != "r03" else None, python)

@@ -24,6 +24,8 @@ export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 cd "$LP_CODE"
 EXPERIMENT_ID=s01 bash hpc/quantizer_followups/preflight.sh
 mkdir -p "$RESULT_ROOT/quantizer_followups/.locks"
+exec 8>"$RESULT_ROOT/quantizer_followups/.locks/s01.lock"
+flock -n 8 || { echo "ERROR: original S01 has an active writer" >&2; exit 1; }
 exec 9>"$RESULT_ROOT/quantizer_followups/.locks/s01_fp16_load_repair.lock"
 flock -n 9 || { echo "ERROR: S01 repair already has an active writer" >&2; exit 1; }
 echo "[START] S01 FP16-load repair stage=$stage $(date -Is)"
