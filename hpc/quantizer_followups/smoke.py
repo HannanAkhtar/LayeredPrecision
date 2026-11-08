@@ -30,7 +30,7 @@ def main() -> None:
         if args.experiment_id == "r03":
             from gptqmodel import BACKEND, GPTQModel
             from gptqmodel.quantization import QuantizeConfig
-            from lp_llm.quantizer_followups_worker import materialize_gptq_qdq
+            from lp_llm.quantizer_followups_worker import materialize_gptq_qdq, require_loaded_gptq_quantizer
 
             tiny.save_pretrained(tmp / "model")
             AutoTokenizer.from_pretrained(args.source, use_fast=False).save_pretrained(tmp / "model")
@@ -38,6 +38,7 @@ def main() -> None:
                 act_group_aware=True, damp_percent=0.05, damp_auto_increment=0.01,
                 static_groups=False, true_sequential=True)
             model = GPTQModel.load(str(tmp / "model"), qcfg, device="cuda:0", dtype=torch.float16)
+            require_loaded_gptq_quantizer(model, qcfg)
             model.quantize(inputs, batch_size=1, backend=BACKEND.TORCH,
                            calibration_sort=None, calibration_data_min_length=32)
             from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear

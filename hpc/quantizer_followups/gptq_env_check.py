@@ -74,6 +74,8 @@ def verify(environment: Path, lp_environment: Path, source: Path, mode: str) -> 
     import datasets
     import gptqmodel
     from gptqmodel import BACKEND, GPTQModel
+    from gptqmodel.models.auto import MODEL_MAP
+    from gptqmodel.models.base import BaseQModel
     from gptqmodel.quantization import QuantizeConfig
     from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
 
@@ -115,10 +117,21 @@ def verify(environment: Path, lp_environment: Path, source: Path, mode: str) -> 
                           true_sequential=True)
     if (qcfg.bits, qcfg.group_size, qcfg.sym, getattr(qcfg.format, "value", qcfg.format)) != (2, 128, True, "gptq"):
         raise RuntimeError("Pinned GPTQ quantization API/configuration differs")
-    if (BACKEND.TORCH.value != "torch" or not callable(TorchQuantLinear.dequantize_weight) or
-            "backend" not in inspect.signature(GPTQModel.load).parameters or
-            "backend" not in inspect.signature(GPTQModel.quantize).parameters):
-        raise RuntimeError("Pinned GPTQ load/quantize/decode API differs")
+    qwen3 = MODEL_MAP.get("qwen3")
+    load_parameters = inspect.signature(GPTQModel.load).parameters
+    quantize_parameters = inspect.signature(BaseQModel.quantize).parameters
+    if (BACKEND.TORCH not in TorchQuantLinear.SUPPORTS_BACKENDS or
+            2 not in TorchQuantLinear.SUPPORTS_BITS or
+            128 not in TorchQuantLinear.SUPPORTS_GROUP_SIZE or
+            True not in TorchQuantLinear.SUPPORTS_SYM or
+            qcfg.format not in TorchQuantLinear.SUPPORTS_FORMATS or
+            not callable(TorchQuantLinear.dequantize_weight) or
+            qwen3 is None or not issubclass(qwen3, BaseQModel) or
+            not callable(getattr(qwen3, "quantize", None)) or
+            not {"quantize_config", "backend"} <= load_parameters.keys() or
+            not {"calibration", "backend", "batch_size", "calibration_sort",
+                 "calibration_data_min_length"} <= quantize_parameters.keys()):
+        raise RuntimeError("Pinned GPTQ load -> Qwen3QModel.quantize Torch W2G128 API differs")
     return {"environment": str(environment), "lp_environment": str(lp_environment), "mode": mode,
             "source": str(source), "revision": REVISION, "python": str(Path(sys.executable).resolve()),
             "torch": torch.__version__, "torch_file": str(Path(torch.__file__).resolve()),
@@ -128,7 +141,8 @@ def verify(environment: Path, lp_environment: Path, source: Path, mode: str) -> 
             "gptqmodel_distribution_site": str(installed_site),
             "gptqmodel_version": installed.version,
             "datasets": datasets.__version__, "dependency_versions": dependency_versions,
-            "backend": "TORCH", "bits": 2, "group_size": 128}
+            "backend": "TORCH", "quantization_entrypoint": "GPTQModel.load -> Qwen3QModel.quantize",
+            "bits": 2, "group_size": 128}
 
 
 def main() -> None:

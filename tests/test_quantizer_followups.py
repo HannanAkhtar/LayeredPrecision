@@ -195,6 +195,47 @@ def test_gptq_materializer_preserves_bias_inventory_and_exact_decode(tmp_path, m
         materialize_gptq_qdq(packed, tmp_path / "qdq")
 
 
+def test_pinned_gptq_instance_quantization_api_and_torch_w2g128(monkeypatch):
+    from lp_llm.quantizer_followups_worker import require_loaded_gptq_quantizer
+    facade = ast.parse((GPTQ / "models/auto.py").read_text(encoding="utf-8"))
+    gptq = next(node for node in facade.body if isinstance(node, ast.ClassDef) and node.name == "GPTQModel")
+    assert any(isinstance(node, ast.FunctionDef) and node.name == "load" for node in gptq.body)
+    assert not any(isinstance(node, ast.FunctionDef) and node.name == "quantize" for node in gptq.body)
+    base = ast.parse((GPTQ / "models/base.py").read_text(encoding="utf-8"))
+    base_model = next(node for node in base.body if isinstance(node, ast.ClassDef) and node.name == "BaseQModel")
+    quantize = next(node for node in base_model.body if isinstance(node, ast.FunctionDef) and node.name == "quantize")
+    assert {"calibration", "backend", "batch_size", "calibration_sort", "calibration_data_min_length"} <= {
+        argument.arg for argument in quantize.args.args}
+    torch_linear = (GPTQ / "nn_modules/qlinear/torch.py").read_text(encoding="utf-8")
+    assert "SUPPORTS_BACKENDS = [BACKEND.TORCH]" in torch_linear
+    assert "SUPPORTS_BITS = [2, 3, 4, 8]" in torch_linear
+    assert "SUPPORTS_GROUP_SIZE = [-1, 16, 32, 64, 128" in torch_linear
+
+    class Qwen3QModel:
+        def __init__(self, config):
+            self.quantize_config = config
+
+        def quantize(self, *args, **kwargs):
+            pass
+
+    fake = types.ModuleType("gptqmodel.models.auto")
+    fake.MODEL_MAP = {"qwen3": Qwen3QModel}
+    for name in ("gptqmodel", "gptqmodel.models"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    config = object()
+    require_loaded_gptq_quantizer(Qwen3QModel(config), config)
+    with pytest.raises(RuntimeError, match="did not return"):
+        require_loaded_gptq_quantizer(types.SimpleNamespace(quantize=lambda: None), config)
+    with pytest.raises(RuntimeError, match="did not return"):
+        require_loaded_gptq_quantizer(Qwen3QModel(object()), config)
+    worker = (ROOT / "lp_llm/quantizer_followups_worker.py").read_text()
+    smoke = (ROOT / "hpc/quantizer_followups/smoke.py").read_text()
+    for code in (worker, smoke):
+        assert "require_loaded_gptq_quantizer(model, qcfg)" in code
+        assert "model.quantize(" in code and "backend=BACKEND.TORCH" in code
+
+
 def test_actual_pinned_dispatch_function(monkeypatch):
     source = (AUTO / "data_type/utils.py").read_text()
     function = next(node for node in ast.parse(source).body if isinstance(node, ast.FunctionDef)

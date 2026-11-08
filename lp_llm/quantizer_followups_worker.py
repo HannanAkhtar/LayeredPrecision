@@ -115,6 +115,16 @@ def materialize_gptq_qdq(packed_model, target: Path) -> int:
     return len(names)
 
 
+def require_loaded_gptq_quantizer(model, qcfg) -> None:
+    """The facade loads a Qwen3QModel instance; quantize lives on that instance."""
+    from gptqmodel.models.auto import MODEL_MAP
+
+    qwen3 = MODEL_MAP["qwen3"]
+    if (not isinstance(model, qwen3) or not callable(getattr(model, "quantize", None)) or
+            model.quantize_config is not qcfg):
+        raise RuntimeError("GPTQModel.load did not return the pinned Qwen3 quantization API")
+
+
 def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
     import torch
     import gptqmodel
@@ -174,6 +184,7 @@ def gptq(config: dict, source: Path, export: Path, resolved: Path) -> None:
         "backend": "TORCH", "model_dtype": "float16",
         "materializer": "pinned TorchQuantLinear.dequantize_weight, preserving bias inventory"}, indent=2), encoding="utf-8")
     model = GPTQModel.load(str(source), qcfg, device="cuda:0", dtype=torch.float16)
+    require_loaded_gptq_quantizer(model, qcfg)
     loaded_first = next(model.model.parameters(), None)
     details = json.loads(resolved.read_text())
     details["observed_first_loaded_weight_dtype"] = str(loaded_first.dtype) if loaded_first is not None else None
