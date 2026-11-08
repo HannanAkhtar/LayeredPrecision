@@ -65,6 +65,14 @@ if [[ "${FOLLOWUP_SMOKE:-0}" == 1 ]]; then
   echo "[SMOKE COMPLETE] $EXPERIMENT_ID $(date -Is)"
   exit 0
 fi
+if [[ "$EXPERIMENT_ID" == r03 ]]; then
+  [[ "${R03_FULL_FEASIBILITY_OK:-0}" == 1 ]] || {
+    echo "ERROR: R03 full quantization requires representative-layer feasibility review and R03_FULL_FEASIBILITY_OK=1" >&2
+    exit 1
+  }
+  "$LP_PYTHON" -m lp_llm.r03_resources \
+    --source "$LP_SOURCE" --result-root "$RESULT_ROOT" --scratch "$CODE_STAGE" --strict
+fi
 args=(--experiment-id "$EXPERIMENT_ID" --stage "${FOLLOWUP_STAGE:-all}"
       --source "$LP_SOURCE" --result-root "$RESULT_ROOT"
       --upstream-source "$upstream" --matgptq-source "$MATGPTQ_SOURCE" --python "$python")

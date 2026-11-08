@@ -395,6 +395,50 @@ def test_nested_qdq_validation_and_corruption(tmp_path, experiment_id, asym):
         validate_checkpoint(config, source, export)
 
 
+def test_r03_export_validator_decodes_every_packed_projection(tmp_path):
+    codes = torch.arange(128, dtype=torch.int32).remainder(4).repeat(16, 1)
+    codes_by_input = codes.T.contiguous()
+    shifts = (2 * torch.arange(16, dtype=torch.int32)).view(1, 16, 1)
+    qweight = (codes_by_input.reshape(8, 16, 16) << shifts).sum(1).to(torch.int32)
+    zero = torch.full((1, 16), 2, dtype=torch.int32)
+    qzeros = (zero.reshape(1, 1, 16) << shifts.view(1, 1, 16)).sum(2).to(torch.int32)
+    scales = torch.full((1, 16), 0.25, dtype=torch.float16)
+    g_idx = torch.zeros(128, dtype=torch.int32)
+    qdq = ((codes - 2) * 0.25).half()
+    original = (torch.arange(128).remainder(11).float() / 7 - 0.7).to(torch.bfloat16).repeat(16, 1)
+    source_weights, output_weights, packed_weights = {}, {}, {}
+    for layer in range(36):
+        for kind in PROJECTIONS:
+            prefix = "self_attn" if kind in PROJECTIONS[:4] else "mlp"
+            base = f"model.layers.{layer}.{prefix}.{kind}"
+            source_weights[base + ".weight"] = original.clone()
+            output_weights[base + ".weight"] = qdq.clone()
+            for suffix, tensor in (("qweight", qweight), ("qzeros", qzeros),
+                                   ("scales", scales), ("g_idx", g_idx)):
+                packed_weights[base + "." + suffix] = tensor.clone()
+    source_weights["lm_head.weight"] = torch.tensor([1.0], dtype=torch.bfloat16)
+    output_weights["lm_head.weight"] = torch.tensor([1.0], dtype=torch.float16)
+    source, export = tmp_path / "source", tmp_path / "export"
+    _checkpoint(source, source_weights)
+    _checkpoint(export / "qdq", output_weights)
+    _checkpoint(export / "packed", packed_weights)
+    packed_config = export / "packed/config.json"
+    record = json.loads(packed_config.read_text())
+    record["quantization_config"] = {"bits": 2, "group_size": 128, "sym": True}
+    packed_config.write_text(json.dumps(record))
+    config = load_config("r03")
+    checked = validate_checkpoint(config, source, export)
+    assert checked["quantized_projection_count"] == 252
+    assert checked["packed_code_bytes"] > 0
+    damaged = dict(packed_weights)
+    first = next(name for name in damaged if name.endswith(".qweight"))
+    damaged[first] = damaged[first].clone()
+    damaged[first][0, 0] ^= 1
+    save_file(damaged, export / "packed/model.safetensors")
+    with pytest.raises(ValueError, match="Packed GPTQ projection differs"):
+        validate_checkpoint(config, source, export)
+
+
 def test_resume_identity_and_aggregate(tmp_path):
     marker = tmp_path / "marker.json"
     expected = {"id": "r01"}

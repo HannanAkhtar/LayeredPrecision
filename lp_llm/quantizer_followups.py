@@ -284,7 +284,7 @@ def validate_checkpoint(config: dict, source: Path, export: Path) -> dict:
         raise ValueError("Checkpoint tensor inventory differs from original")
     if config["id"] == "r03":
         expected_bases = {name[:-7] for name in source_map if _eligible(name)}
-        for suffix in ("qweight", "scales", "qzeros"):
+        for suffix in ("qweight", "scales", "qzeros", "g_idx"):
             actual_bases = {name[:-(len(suffix) + 1)] for name in packed_map
                             if name.endswith("." + suffix)}
             if actual_bases != expected_bases:
@@ -309,6 +309,16 @@ def validate_checkpoint(config: dict, source: Path, export: Path) -> dict:
         if _eligible(name):
             if value.ndim != 2 or torch.equal(value, original.to(value.dtype)):
                 raise ValueError(f"Unquantized eligible projection: {name}")
+            if config["id"] == "r03":
+                from types import SimpleNamespace
+                from .quantizer_followups_worker import decode_gptq_w2_packed
+                base = name[:-7]
+                packed_module = SimpleNamespace(bits=2, group_size=128, sym=True,
+                    pack_dtype_bits=32, in_features=value.shape[1], out_features=value.shape[0],
+                    **{suffix: _get(packed, packed_map, f"{base}.{suffix}")
+                       for suffix in ("qweight", "qzeros", "scales", "g_idx")})
+                if value.dtype != torch.float16 or not torch.equal(value, decode_gptq_w2_packed(packed_module)):
+                    raise ValueError(f"Packed GPTQ projection differs from dense QDQ: {name}")
             projections.append(name)
             projected_elements += value.numel()
             checked_groups += _check_all_w2_groups(value)
