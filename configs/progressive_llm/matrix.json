@@ -1,0 +1,18 @@
+{
+  "source_revision": "49e3418fbbbca6ecbdf9608b4d22e5a407081db4",
+  "existing_w2": ["s01", "r02"],
+  "new_points": [
+    {"id": "s01_lp_2p2", "branch": "s01", "depth": 1, "predecessor": null},
+    {"id": "s01_lp_2p2p2", "branch": "s01", "depth": 2, "predecessor": "s01_lp_2p2"},
+    {"id": "s01_lp_2p2p2p2", "branch": "s01", "depth": 3, "predecessor": "s01_lp_2p2p2"},
+    {"id": "r02_lp_2p2", "branch": "r02", "depth": 1, "predecessor": null},
+    {"id": "r02_lp_2p2p2", "branch": "r02", "depth": 2, "predecessor": "r02_lp_2p2"},
+    {"id": "r02_lp_2p2p2p2", "branch": "r02", "depth": 3, "predecessor": "r02_lp_2p2p2"},
+    {"id": "s01_w4", "branch": "s01", "bits": 4, "predecessor": null},
+    {"id": "s01_w6", "branch": "s01", "bits": 6, "predecessor": null},
+    {"id": "s01_w8", "branch": "s01", "bits": 8, "predecessor": null},
+    {"id": "r02_w4", "branch": "r02", "bits": 4, "predecessor": null},
+    {"id": "r02_w6", "branch": "r02", "bits": 6, "predecessor": null},
+    {"id": "r02_w8", "branch": "r02", "bits": 8, "predecessor": null}
+  ]
+}
