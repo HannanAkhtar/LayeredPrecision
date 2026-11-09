@@ -149,6 +149,7 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
                 "bits": bits, "code_sha": proposed, "source": {"test": True},
                 "recipe": {}, "reference_module": str(checkout / "auto_round/__init__.py"),
                 "projection_count": 7,
+                "traversal_metadata_status": "available",
                 "traversed_transformer_blocks": [f"model.layers.{i}" for i in range(36)],
                 "traversed_transformer_block_count": 36,
                 "quantized_projection_names": sorted(f"model.layers.0.{part}.weight" for part in parts),
@@ -166,6 +167,12 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
                 "host_memory_headroom_bytes": 14 * 1024**3 - 1024,
                 "host_memory_10pct_headroom_passed": True,
                 "host_allocation_bytes": 14 * 1024**3, "gpu_total_bytes": 1000}))
+    absent_path = pilots / "s01_w4.json"
+    absent = json.loads(absent_path.read_text())
+    absent.update(traversal_metadata_status="unavailable",
+                  traversed_transformer_blocks=None,
+                  traversed_transformer_block_count=None)
+    absent_path.write_text(json.dumps(absent))
     preflight = '''from pathlib import Path
 from unittest.mock import patch
 from lp_llm import progressive_plan as p
@@ -191,6 +198,13 @@ print("ARCHIVED_PREFLIGHT_VALIDATED")
     assert preflight_result.returncode == 0, preflight_result.stderr
     assert "ARCHIVED_PREFLIGHT_VALIDATED" in preflight_result.stdout
     assert (pilots / f"lp_cross_commit_acceptance_{proposed}.json").is_file()
+    invalid = dict(absent, unselected_projection_source_exact_count=244)
+    absent_path.write_text(json.dumps(invalid))
+    rejected_weights = subprocess.run([sys.executable, str(script), str(result_root),
+        str(checkout), proposed], cwd=staged, env=environment, text=True,
+        capture_output=True, check=False)
+    assert rejected_weights.returncode != 0
+    assert "invalid s01_w4 control layer pilot" in rejected_weights.stderr
     lp_file = staged / "lp_llm/progressive_lp.py"
     lp_file.write_bytes(lp_file.read_bytes() + b"\n# tampered staged code\n")
     rejected = subprocess.run([sys.executable, "-c", code], cwd=staged, env=environment,

@@ -66,6 +66,21 @@ def accepted_lp_pilot_sha(record_sha: str, code_sha: str,
     return LP_PILOT_PREVIOUS_SHA
 
 
+def valid_control_traversal(control: dict) -> bool:
+    """Unavailable AutoRound metadata is distinct from a reported empty traversal."""
+    status = control.get("traversal_metadata_status")
+    blocks = control.get("traversed_transformer_blocks")
+    count = control.get("traversed_transformer_block_count")
+    if status == "unavailable":
+        return blocks is None and count is None
+    if status != "available" or not isinstance(blocks, list):
+        return False
+    return (bool(blocks) and "model.layers.0" in blocks and
+            all(isinstance(block, str) and
+                re.fullmatch(r"model\.layers\.(?:[0-9]|[12][0-9]|3[0-5])", block)
+                for block in blocks) and len(blocks) == len(set(blocks)) == count)
+
+
 def points(root: Path, slots: int) -> list[dict]:
     if slots not in (2, 3):
         raise ValueError("Concurrency cap must be 2 or 3")
@@ -170,14 +185,7 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
                     not Path(control.get("reference_module", "")).resolve().is_relative_to(
                         Path(support.get("upstream_checkout", "/nonexistent")).resolve()) or
                     control.get("projection_count") != 7 or
-                    not isinstance(control.get("traversed_transformer_blocks"), list) or
-                    "model.layers.0" not in control["traversed_transformer_blocks"] or
-                    len(control["traversed_transformer_blocks"]) !=
-                    len(set(control["traversed_transformer_blocks"])) or
-                    any(not re.fullmatch(r"model\.layers\.(?:[0-9]|[12][0-9]|3[0-5])", block)
-                        for block in control["traversed_transformer_blocks"]) or
-                    control.get("traversed_transformer_block_count") !=
-                    len(control["traversed_transformer_blocks"]) or
+                    not valid_control_traversal(control) or
                     control.get("quantized_projection_count") != 7 or
                     control.get("quantized_projection_names") !=
                     sorted(control.get("projections", {})) or

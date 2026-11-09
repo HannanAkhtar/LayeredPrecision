@@ -92,6 +92,13 @@ miss short peaks. The pilot records this upstream value separately and does
 not use it for admission. Compare the new cgroup report with `sacct` after
 the job finishes. Slurm `MaxRSS` is a task
 RSS measure, while the cgroup peak includes charged job memory and cache.
+AutoRound may leave `quant_block_list=None` after successful quantization.
+The report records traversal as `unavailable` in that case, with a null list
+and count. Seven changed first-layer weights and 245 source-exact other
+weights establish coverage; traversal metadata is never filled in from an
+assumed model layout. A post-quantization failure writes
+`s01_w4.failure.<SlurmJobID>.json` with available RSS, cgroup, allocation,
+AutoRound memory readings, and the error. It does not create `s01_w4.json`.
 A 14G Slurm request is 14,336 MiB and fits the reported `RealMemory=15564`
 MiB node inventory. This only establishes schedulability; it does not establish
 that the job can stay below the 12.6 GiB headroom threshold. The full point
@@ -151,7 +158,12 @@ assert r['status'] == 'control_layer_pilot_validated'
 assert r['code_sha'] == subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 assert r['projection_count'] == r['quantized_projection_count'] == 7
 assert r['unselected_projection_source_exact_count'] == 245
-assert len(r['traversed_transformer_blocks']) == 36
+assert r['traversal_metadata_status'] in ('available', 'unavailable')
+if r['traversal_metadata_status'] == 'unavailable':
+    assert r['traversed_transformer_blocks'] is None
+    assert r['traversed_transformer_block_count'] is None
+else:
+    assert 'model.layers.0' in r['traversed_transformer_blocks']
 assert r['host_allocation_bytes'] >= 14 * 1024**3
 assert max(r['slurm_cgroup_peak_bytes'], r['process_peak_rss_kib'] * 1024) < .9 * r['host_allocation_bytes']
 assert r['host_memory_10pct_headroom_passed']

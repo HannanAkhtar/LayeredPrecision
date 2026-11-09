@@ -8,6 +8,7 @@ import gc
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -55,10 +56,12 @@ def verify_unselected_projections(model, read_original, projections, *, layers: 
     return checked
 
 
-def traversed_blocks(quant_block_list, *, layers: int = 36) -> list[str]:
+def traversed_blocks(quant_block_list, *, layers: int = 36) -> list[str] | None:
     """Record AutoRound traversal; weight comparison determines quantization coverage."""
+    if quant_block_list is None:
+        return None
     if not isinstance(quant_block_list, (list, tuple)):
-        raise ValueError("AutoRound block traversal is unavailable")
+        raise ValueError("Malformed AutoRound block traversal")
     names = []
     for group in quant_block_list:
         if not isinstance(group, (list, tuple)):
@@ -106,7 +109,8 @@ def host_memory_assessment(process_peak_kib: int, cgroup_peak_bytes: int,
             "host_memory_10pct_headroom_passed": peak * 10 < allocation_bytes * 9}
 
 
-def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> dict:
+def _run(branch: str, bits: int, source: Path, report: Path, code_sha: str,
+         progress: dict) -> dict:
     import resource
     import torch
     import auto_round
@@ -136,9 +140,15 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
             engine.to_quant_block_names != r"^model\.layers\.0$"):
         raise ValueError("First-layer control selection or algorithm was replaced")
     model, quantization_info = engine.quantize()
+    progress["quantization_completed"] = True
+    progress["stage"] = "post_quantization_validation"
     autoround_peak_ram_gib = float(memory_monitor.peak_ram)
     quantization_process_peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     quantization_cgroup_peak_bytes, _ = slurm_cgroup_peak(os.environ.get("SLURM_JOB_ID", ""))
+    progress.update(autoround_peak_ram_gib=autoround_peak_ram_gib,
+                    autoround_peak_vram=dict(memory_monitor.peak_vram),
+                    after_quantization_process_peak_rss_kib=quantization_process_peak_kib,
+                    after_quantization_cgroup_peak_bytes=quantization_cgroup_peak_bytes)
     blocks = traversed_blocks(getattr(engine, "quant_block_list", None))
     # The returned model remains live; release calibration and engine state before validation.
     del engine, quantization_info
@@ -160,8 +170,10 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
             raise ValueError(f"Control pilot W{bits} grid check failed: {name}")
         measured[name] = {"changed_elements": changed, "elements": value.numel(),
                           "sampled_group_levels": levels}
+        progress["selected_projection_checks_completed"] = len(measured)
     unselected = verify_unselected_projections(
         model, lambda name: source_view(source, source_map, name), projections)
+    progress["unselected_projection_checks_completed"] = unselected
     source_identity = _files(source)
     host_allocation = int(os.environ.get("SLURM_MEM_PER_NODE", "0")) * 1024**2
     cgroup_peak, cgroup_source = slurm_cgroup_peak(os.environ.get("SLURM_JOB_ID", ""))
@@ -172,8 +184,9 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
                     "code_sha": code_sha, "reference_module": str(Path(auto_round.__file__).resolve()),
                     "source": source_identity,
                     "recipe": recipe, "source_layer": 0, "projection_count": len(measured),
+                    "traversal_metadata_status": "unavailable" if blocks is None else "available",
                     "traversed_transformer_blocks": blocks,
-                    "traversed_transformer_block_count": len(blocks),
+                    "traversed_transformer_block_count": None if blocks is None else len(blocks),
                     "quantized_projection_names": sorted(measured),
                     "quantized_projection_count": len(measured),
                     "unselected_projection_source_exact_count": unselected,
@@ -200,6 +213,71 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
                            f"cgroup_peak={cgroup_peak}, headroom={memory['host_memory_headroom_bytes']}")
     atomic_json(report, report_value)
     return report_value
+
+
+def _write_failure_diagnostics(report: Path, branch: str, bits: int, code_sha: str,
+                               progress: dict, error: Exception) -> None:
+    """Keep a failed attempt separate from the validated pilot report."""
+    import resource
+    from .storage import atomic_json
+
+    job_id = os.environ.get("SLURM_JOB_ID", "manual")
+    if not re.fullmatch(r"[0-9]+|manual", job_id):
+        job_id = "invalid_job_id"
+    path = report.with_name(f"{report.stem}.failure.{job_id}.json")
+    if path.exists():
+        raise FileExistsError(f"Refusing to replace existing pilot failure diagnostic: {path}")
+    allocation = int(os.environ.get("SLURM_MEM_PER_NODE", "0")) * 1024**2
+    process_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    diagnostic = {"status": "control_layer_pilot_failed", "branch": branch, "bits": bits,
+                  "code_sha": code_sha, "job_id": job_id, "stage": progress.get("stage"),
+                  "quantization_completed": progress.get("quantization_completed", False),
+                  "selected_projection_checks_completed": progress.get(
+                      "selected_projection_checks_completed", 0),
+                  "unselected_projection_checks_completed": progress.get(
+                      "unselected_projection_checks_completed", 0),
+                  "error_type": type(error).__name__, "error": str(error),
+                  "process_peak_rss_kib": process_kib,
+                  "after_quantization_process_peak_rss_kib": progress.get(
+                      "after_quantization_process_peak_rss_kib"),
+                  "after_quantization_cgroup_peak_bytes": progress.get(
+                      "after_quantization_cgroup_peak_bytes"),
+                  "host_allocation_bytes": allocation,
+                  "cgroup_peak_bytes": None, "cgroup_peak_source": None,
+                  "autoround_peak_ram": {"value": progress.get("autoround_peak_ram_gib"), "unit": "GiB",
+                      "meaning": "sampled process-tree RSS; upstream log labels GB"}}
+    try:
+        peak, source = slurm_cgroup_peak(os.environ.get("SLURM_JOB_ID", ""))
+        diagnostic.update(cgroup_peak_bytes=peak, cgroup_peak_source=source)
+        if allocation > 0:
+            diagnostic.update(host_memory_assessment(process_kib, peak, allocation))
+    except Exception as metric_error:
+        diagnostic["cgroup_measurement_error"] = str(metric_error)
+    try:
+        from auto_round.utils.device import memory_monitor
+        if diagnostic["autoround_peak_ram"]["value"] is None:
+            diagnostic["autoround_peak_ram"]["value"] = float(memory_monitor.peak_ram)
+        diagnostic["autoround_peak_vram"] = progress.get(
+            "autoround_peak_vram", dict(memory_monitor.peak_vram))
+    except Exception as metric_error:
+        diagnostic["autoround_measurement_error"] = str(metric_error)
+    atomic_json(path, diagnostic)
+
+
+def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> dict:
+    if report.exists():
+        raise ValueError("Control pilot validated report already exists")
+    progress = {"stage": "startup", "quantization_completed": False}
+    try:
+        return _run(branch, bits, source, report, code_sha, progress)
+    except Exception as error:
+        if progress["quantization_completed"] and not report.exists():
+            try:
+                _write_failure_diagnostics(report, branch, bits, code_sha, progress, error)
+            except Exception as diagnostic_error:
+                print(f"Pilot failure diagnostic could not be written: {diagnostic_error}",
+                      file=sys.stderr)
+        raise
 
 
 def main() -> None:

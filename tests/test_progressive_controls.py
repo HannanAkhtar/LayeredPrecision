@@ -12,6 +12,7 @@ from lp_llm import progressive_control
 from lp_llm.progressive_control_pilot import (verify_unselected_projections,
     traversed_blocks, slurm_cgroup_peak, host_memory_assessment, _compare_rows,
     source_view)
+from lp_llm import progressive_control_pilot
 
 
 def test_pinned_autoround_exact_block_selector_normalizes_single_layer():
@@ -65,6 +66,115 @@ def test_all_blocks_traversed_while_only_layer_zero_is_quantized():
                            originals["model.layers.0.self_attn.q_proj.weight"])
     with pytest.raises(ValueError, match="Unexpected AutoRound block traversal"):
         traversed_blocks([["model.layers.36"]])
+    assert traversed_blocks(None) is None
+
+
+def test_successful_quantization_with_unavailable_traversal_metadata(tmp_path, monkeypatch):
+    import torch
+    from types import SimpleNamespace
+    from lp_llm import progressive_control_worker, progressive_lp, rrq_pr2308_compare
+
+    paths = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+             "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList()
+    originals = {}
+    for layer_number in range(36):
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.mlp = torch.nn.Module()
+        for path in paths:
+            parent = layer.self_attn if path.startswith("self_attn.") else layer.mlp
+            setattr(parent, path.rsplit(".", 1)[1], torch.nn.Linear(4, 2, bias=False))
+        model.model.layers.append(layer)
+        for path in paths:
+            name = f"model.layers.{layer_number}.{path}.weight"
+            originals[name] = model.get_submodule(
+                f"model.layers.{layer_number}.{path}").weight.detach().clone()
+
+    class Algorithm:
+        bits = 4
+
+    class AutoRound:
+        def __init__(self, **kwargs):
+            self._alg_configs = [kwargs["alg_configs"]]
+            self.to_quant_block_names = kwargs["to_quant_block_names"]
+            self.quant_block_list = None
+        def quantize(self):
+            with torch.no_grad():
+                for path in paths:
+                    model.get_submodule(f"model.layers.0.{path}").weight[0, 0] += 1
+            return model, {}
+
+    auto_round = types.ModuleType("auto_round")
+    auto_round.__file__ = str(tmp_path / "auto_round/__init__.py")
+    auto_round.AutoRound = AutoRound
+    device = types.ModuleType("auto_round.utils.device")
+    device.memory_monitor = SimpleNamespace(peak_ram=14.71, peak_vram={"0": 1.0})
+    monkeypatch.setitem(sys.modules, "auto_round", auto_round)
+    monkeypatch.setitem(sys.modules, "auto_round.utils", types.ModuleType("auto_round.utils"))
+    monkeypatch.setitem(sys.modules, "auto_round.utils.device", device)
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(RUSAGE_SELF=0,
+        getrusage=lambda *_: SimpleNamespace(ru_maxrss=1000)))
+    monkeypatch.setattr(progressive_control_worker, "resolved_recipe",
+                        lambda *_: (Algorithm(), {"test_recipe": True}))
+    monkeypatch.setattr(rrq_pr2308_compare, "_weight_map", lambda *_: {})
+    monkeypatch.setattr(progressive_lp, "_files", lambda *_: {"test_source": True})
+    monkeypatch.setattr(progressive_control_pilot, "source_view",
+                        lambda _source, _map, name: nullcontext(originals[name]))
+    monkeypatch.setattr(progressive_control_pilot, "slurm_cgroup_peak",
+                        lambda *_: (2 * 1024**3, "cgroup_v2_memory.peak"))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda *_: SimpleNamespace(total_memory=1000))
+    monkeypatch.setenv("LP_CONTROL_PILOT", "1")
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "14336")
+    report = tmp_path / "s01_w4.json"
+    result = progressive_control_pilot.run("s01", 4, tmp_path, report, "a" * 40)
+    assert result["status"] == "control_layer_pilot_validated"
+    assert result["traversal_metadata_status"] == "unavailable"
+    assert result["traversed_transformer_blocks"] is None
+    assert result["traversed_transformer_block_count"] is None
+    assert result["quantized_projection_count"] == 7
+    assert result["unselected_projection_source_exact_count"] == 245
+    assert report.is_file() and not list(tmp_path.glob("*.failure.*.json"))
+
+
+def test_post_quantization_failure_records_memory_without_success_report(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    def fail(_branch, _bits, _source, _report, _sha, progress):
+        progress.update(quantization_completed=True,
+                        stage="post_quantization_validation",
+                        selected_projection_checks_completed=3)
+        raise ValueError("selected projection differs")
+
+    device = types.ModuleType("auto_round.utils.device")
+    device.memory_monitor = SimpleNamespace(peak_ram=14.71, peak_vram={"0": 2.0})
+    monkeypatch.setitem(sys.modules, "auto_round.utils.device", device)
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(RUSAGE_SELF=0,
+        getrusage=lambda *_: SimpleNamespace(ru_maxrss=1024)))
+    monkeypatch.setattr(progressive_control_pilot, "_run", fail)
+    monkeypatch.setattr(progressive_control_pilot, "slurm_cgroup_peak",
+                        lambda *_: (13 * 1024**3, "cgroup_v2_memory.peak"))
+    monkeypatch.setenv("SLURM_JOB_ID", "54811")
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", "14336")
+    report = tmp_path / "s01_w4.json"
+    with pytest.raises(ValueError, match="selected projection differs"):
+        progressive_control_pilot.run("s01", 4, tmp_path, report, "a" * 40)
+    assert not report.exists()
+    diagnostic = json.loads((tmp_path / "s01_w4.failure.54811.json").read_text())
+    assert diagnostic["status"] == "control_layer_pilot_failed"
+    assert diagnostic["selected_projection_checks_completed"] == 3
+    assert diagnostic["quantization_completed"] is True
+    assert diagnostic["process_peak_rss_kib"] == 1024
+    assert diagnostic["cgroup_peak_bytes"] == 13 * 1024**3
+    assert diagnostic["host_allocation_bytes"] == 14 * 1024**3
+    assert not diagnostic["host_memory_10pct_headroom_passed"]
+    assert diagnostic["autoround_peak_ram"]["value"] == 14.71
 
 
 def test_slurm_cgroup_peak_requires_job_scoped_counter(tmp_path):
