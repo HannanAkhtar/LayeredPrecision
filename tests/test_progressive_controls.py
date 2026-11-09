@@ -1,11 +1,42 @@
 import sys
 import types
 import json
+import runpy
+from pathlib import Path
 
 import pytest
 
 from lp_llm.progressive_control_worker import resolved_recipe
 from lp_llm import progressive_control
+from lp_llm.progressive_control_pilot import verify_unselected_projections
+
+
+def test_pinned_autoround_exact_block_selector_normalizes_single_layer():
+    find_matching_blocks = runpy.run_path(str(Path(__file__).parent / "fixtures" /
+        "autoround_block_selector_7985c1b.py"))["find_matching_blocks"]
+    blocks = [[f"model.layers.{number}" for number in range(36)]]
+    assert find_matching_blocks(None, blocks, r"^model\.layers\.0$") == [["model.layers.0"]]
+    assert find_matching_blocks(None, blocks, ["model.layers.0"]) == ["model.layers.0"]
+
+
+def test_control_pilot_detects_quantization_outside_selected_block():
+    import torch
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList()
+    for _ in range(2):
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.q_proj = torch.nn.Linear(4, 2, bias=False)
+        model.model.layers.append(layer)
+    original = model.model.layers[1].self_attn.q_proj.weight.detach().clone()
+    assert verify_unselected_projections(model, lambda _: original,
+        ("self_attn.q_proj",), layers=2) == 1
+    with torch.no_grad():
+        model.model.layers[1].self_attn.q_proj.weight[0, 0] += 1
+    with pytest.raises(ValueError, match="Unselected transformer projection changed"):
+        verify_unselected_projections(model, lambda _: original,
+            ("self_attn.q_proj",), layers=2)
 
 
 def test_all_six_control_recipes_keep_pinned_dispatch(monkeypatch):

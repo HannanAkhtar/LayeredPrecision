@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from lp_llm.progressive_plan import admit_submission, main, plan, submit
+from lp_llm.progressive_plan import (LP_PILOT_PREVIOUS_SHA, accepted_lp_pilot_sha,
+                                     admit_submission, main, plan, submit)
 
 
 def test_matrix_has_twelve_points_and_scientific_dependencies(tmp_path):
@@ -45,6 +46,7 @@ def test_submit_uses_afterok_lane_dependencies_and_resumes(tmp_path, monkeypatch
     assert len(commands) == 12
     assert "--dependency=afterok:1001" in commands[1]
     assert "--dependency=afterok:1004" in commands[4]
+    assert "--dependency=afterany:1003" in commands[6]
     assert submit(report, tmp_path / "run_point.sbatch", manifest) == completed
     assert len(commands) == 12
     assert json.loads(manifest.read_text())["job_ids"] == completed["job_ids"]
@@ -54,7 +56,23 @@ def test_submit_uses_afterok_lane_dependencies_and_resumes(tmp_path, monkeypatch
     assert len(other["job_ids"]) == 12
     assert {point["lane"] for point in other["points"]} == {0, 1, 2}
     assert "--dependency=afterok:1013" in commands[13]
-    assert "--dependency=afterok:1019" in commands[19]
+    assert "--dependency=afterany:1019" in commands[19]
+
+
+def test_prior_lp_pilot_acceptance_is_exact_and_requires_unchanged_code(monkeypatch):
+    calls = []
+    def unchanged(command, **_kwargs):
+        calls.append(command)
+        return type("Result", (), {"returncode": 0})()
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.run", unchanged)
+    assert accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40) == LP_PILOT_PREVIOUS_SHA
+    assert len(calls) == 3 and all("progressive_lp.py" in " ".join(c) for c in calls)
+    with pytest.raises(ValueError, match="validated prior"):
+        accepted_lp_pilot_sha("f" * 40, "a" * 40)
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.run",
+                        lambda *_a, **_k: type("Result", (), {"returncode": 1})())
+    with pytest.raises(ValueError, match="implementation differs"):
+        accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40)
 
 
 def test_submit_requires_explicit_review(tmp_path, monkeypatch):

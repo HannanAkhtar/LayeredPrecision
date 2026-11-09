@@ -9,6 +9,24 @@ import time
 from pathlib import Path
 
 
+def verify_unselected_projections(model, read_original, projections, *, layers: int = 36) -> int:
+    import torch
+    checked = 0
+    for layer in range(1, layers):
+        for path in projections:
+            name = f"model.layers.{layer}.{path}.weight"
+            value = model.get_submodule(f"model.layers.{layer}.{path}").weight.detach()
+            if value.device.type == "meta":
+                raise ValueError(f"Unselected pilot weight cannot be audited on meta device: {name}")
+            original = read_original(name)
+            if (value.shape != original.shape or not bool(torch.isfinite(value).all()) or
+                    not torch.equal(value.cpu(), original.to(value.dtype))):
+                raise ValueError(f"Unselected transformer projection changed: {name}")
+            checked += 1
+            del value, original
+    return checked
+
+
 def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> dict:
     import resource
     import torch
@@ -32,10 +50,10 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
         alg_configs=algorithm, format="fake", dataset="NeelNanda/pile-10k",
         nsamples=128, seqlen=2048, batch_size=8, seed=42, model_dtype="float16",
         scale_dtype="fp16", device_map="cuda:0", low_gpu_mem_usage=True,
-        to_quant_block_names=["model.layers.0"])
+        to_quant_block_names=r"^model\.layers\.0$")
     configured = [item for item in engine._alg_configs if isinstance(item, type(algorithm))]
     if (len(configured) != 1 or configured[0].bits != bits or
-            engine.to_quant_block_names != ["model.layers.0"]):
+            engine.to_quant_block_names != r"^model\.layers\.0$"):
         raise ValueError("First-layer control selection or algorithm was replaced")
     model, _ = engine.quantize()
     selected_blocks = getattr(engine, "quant_block_list", None)
@@ -64,11 +82,16 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
         measured[name] = {"changed_elements": changed, "elements": value.numel(),
                           "sampled_group_levels": int(torch.unique(sample).numel())}
         del value, original
+    unselected = verify_unselected_projections(
+        model, lambda name: _get(source, source_map, name), projections)
     report_value = {"status": "control_layer_pilot_validated", "branch": branch, "bits": bits,
                     "quota_status": quota_status(),
                     "code_sha": code_sha, "reference_module": str(Path(auto_round.__file__).resolve()),
                     "source": _files(source),
                     "recipe": recipe, "source_layer": 0, "projection_count": len(measured),
+                    "selected_transformer_blocks": selected_blocks,
+                    "other_transformer_blocks_selected": 0,
+                    "unselected_projection_source_exact_count": unselected,
                     "projections": measured, "runtime_seconds": time.monotonic() - started,
                     "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                     "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated(),

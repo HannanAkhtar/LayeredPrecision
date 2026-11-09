@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from unittest.mock import patch
 import json
 import os
 import math
@@ -11,10 +12,29 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .progressive_lp import BRANCHES, _files, identity, verified_layers
+from .progressive_lp import BRANCHES, _files, identity, validate_repaired_base, verified_layers
 from .progressive_resources import estimate, quota_status
 from .quantizer_followups import PR_COMMIT
 from .storage import atomic_json
+
+
+LP_PILOT_PREVIOUS_SHA = "b650efb085b00b801f0f42543485c84ae9fbbbc0"
+LP_UNCHANGED_PATHS = ("lp_llm/progressive_lp.py", "lp_llm/progressive_run.py",
+                      "lp_llm/progressive_pilot.py", "lp_llm/progressive_base_parity.py",
+                      "lp_llm/quantize.py", "lp_llm/storage.py")
+
+
+def accepted_lp_pilot_sha(record_sha: str, code_sha: str) -> str:
+    if record_sha == code_sha:
+        return code_sha
+    if record_sha != LP_PILOT_PREVIOUS_SHA:
+        raise ValueError("LP pilot code SHA is not the validated prior commit")
+    for command in (["git", "diff", "--quiet", LP_PILOT_PREVIOUS_SHA, code_sha, "--", *LP_UNCHANGED_PATHS],
+                    ["git", "diff", "--quiet", "--", *LP_UNCHANGED_PATHS],
+                    ["git", "diff", "--cached", "--quiet", "--", *LP_UNCHANGED_PATHS]):
+        if subprocess.run(command, check=False).returncode != 0:
+            raise ValueError("LP implementation differs from the validated pilot commit")
+    return LP_PILOT_PREVIOUS_SHA
 
 
 def points(root: Path, slots: int) -> list[dict]:
@@ -54,9 +74,11 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str) -> dict:
         base = result_root / "quantizer_followups" / repair / "export"
         root = result_root / "progressive_llm/pilots" / branch
         record = json.loads((root / "report.json").read_text())
+        validate_repaired_base(branch, source, base)
         ident = identity(branch, source, base)
+        accepted_sha = accepted_lp_pilot_sha(record.get("code_sha"), code_sha)
         if (record.get("status") != "pilot_validated" or record.get("branch") != branch or
-                record.get("code_sha") != code_sha or record.get("identity") != ident or
+                record.get("code_sha") != accepted_sha or record.get("identity") != ident or
                 len(record.get("projection_names", [])) != 7 or
                 record.get("base_checkpoint_source_exact_exclusions") is not True or
                 record.get("base_zero_enhancement_exact") is not True or
@@ -64,32 +86,47 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str) -> dict:
                 record.get("host_allocation_bytes", 0) * 0.9 or
                 record.get("host_allocation_bytes", 0) <= 0):
             raise ValueError(f"Unreviewed or invalid {branch} full-size layer pilot")
-        verified_layers(root, 2, ident, pilot=True)
+        with patch.dict(os.environ, {"FOLLOWUP_CODE_SHA": accepted_sha}):
+            layers = verified_layers(root, 2, ident, pilot=True)
+        if (any(layer.get("code_sha") != accepted_sha or
+                layer.get("encoded_elements", 0) <= 0 or
+                not math.isfinite(layer.get("mse_fp32", float("nan"))) or
+                not math.isfinite(layer.get("normalized_mse_fp32", float("nan")))
+                for layer in layers) or
+                any(any(record.get(key, {}).get(field) != layers[index][field]
+                        for field in ("projection_count", "encoded_elements", "mse_fp32",
+                                      "normalized_mse_fp32", "code_bytes", "metadata_bytes"))
+                    for index, key in enumerate(("first", "second")))):
+            raise ValueError("Prior LP pilot numerical report differs from verified layers")
         parity_path = root / "base_parity/base_parity.json"
         parity = json.loads(parity_path.read_text())
         if (parity.get("status") != "base_parity_validated" or
                 (root / "base_parity/checkpoint").exists() or
                 (root / "base_parity/checkpoint.partial").exists() or
-                parity.get("identity") != ident or parity.get("code_sha") != code_sha or
+                parity.get("identity") != ident or parity.get("code_sha") != accepted_sha or
                 parity.get("corpus", {}).get("token_sha256") !=
                 "8ffcee84dd4b684ec631cb52845e18c9c181ce6fdb8b26d65a4ffdc3d35fbda3" or
                 parity.get("corpus", {}).get("scored_tokens") != 298862 or
                 round(parity.get("evaluation", {}).get("perplexity", -1), 2) !=
                 {"s01": 12.47, "r02": 32.22}[branch]):
             raise ValueError(f"Independent {branch} W2 perplexity parity is unverified")
-        reports[branch] = {"process_peak_rss_kib": record["process_peak_rss_kib"],
+        reports[branch] = {"accepted_pilot_code_sha": accepted_sha,
+                           "cross_commit_acceptance": accepted_sha != code_sha,
+                           "source_base_identity": ident,
+                           "process_peak_rss_kib": record["process_peak_rss_kib"],
                            "artifact_bytes": record["artifact_bytes"],
                            "report": str(root / "report.json"),
                            "base_parity_report": str(parity_path),
                            "base_parity_perplexity": parity["evaluation"]["perplexity"]}
-    support = json.loads((result_root / "progressive_llm/pilots/control_support.json").read_text())
+    support_path = result_root / "progressive_llm/pilots" / f"control_support_{code_sha}.json"
+    support = json.loads(support_path.read_text())
     if (support.get("status") != "control_dispatch_verified" or
             support.get("code_sha") != code_sha or
             support.get("upstream_revision") != PR_COMMIT or
             set(support.get("recipes", {})) !=
             {f"{branch}_w{bits}" for branch in BRANCHES for bits in (4, 6, 8)}):
         raise ValueError("Six pinned monolithic-control dispatches are not verified")
-    reports["control_support"] = str(result_root / "progressive_llm/pilots/control_support.json")
+    reports["control_support"] = str(support_path)
     source_files = _files(source)
     for branch in BRANCHES:
         for bits in (4, 6, 8):
@@ -103,6 +140,16 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str) -> dict:
                     not Path(control.get("reference_module", "")).resolve().is_relative_to(
                         Path(support.get("upstream_checkout", "/nonexistent")).resolve()) or
                     control.get("projection_count") != 7 or
+                    control.get("selected_transformer_blocks") != [["model.layers.0"]] or
+                    control.get("other_transformer_blocks_selected") != 0 or
+                    control.get("unselected_projection_source_exact_count") != 245 or
+                    set(control.get("projections", {})) != {
+                        f"model.layers.0.{part}.weight" for part in
+                        ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                         "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+                    } or
+                    any(item.get("changed_elements", 0) <= 0 for item in
+                        control.get("projections", {}).values()) or
                     control.get("gpu_peak_reserved_bytes", 0) <= 0 or
                     control.get("process_peak_rss_kib", 0) <= 0 or
                     control.get("process_peak_rss_kib", 0) * 1024 >=
@@ -115,6 +162,16 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str) -> dict:
             reports[name] = {"process_peak_rss_kib": control["process_peak_rss_kib"],
                              "gpu_peak_reserved_bytes": control["gpu_peak_reserved_bytes"],
                              "report": str(path)}
+    if any(reports[branch]["cross_commit_acceptance"] for branch in BRANCHES):
+        acceptance = {"status": "prior_lp_pilots_validated", "current_code_sha": code_sha,
+            "prior_code_sha": LP_PILOT_PREVIOUS_SHA,
+            "lp_implementation_paths_verified_unchanged": list(LP_UNCHANGED_PATHS),
+            "accepted": {branch: reports[branch] for branch in BRANCHES}}
+        path = result_root / "progressive_llm/pilots" / f"lp_cross_commit_acceptance_{code_sha}.json"
+        if path.is_file() and json.loads(path.read_text()) != acceptance:
+            raise ValueError("Existing LP cross-commit acceptance report differs")
+        atomic_json(path, acceptance)
+        reports["cross_commit_acceptance_report"] = str(path)
     return reports
 
 
@@ -125,7 +182,7 @@ def plan(root: Path, code_sha: str, *, slots: int = 2) -> dict:
             "quota_status": quota_status(),
             "max_concurrent_gpu_jobs": slots, "qos_submit_jobs_count": 12,
             "point_count": 12, "points": points(root, slots),
-            "dependency_rule": "afterok scientific predecessor plus prior job in same GPU lane"}
+            "dependency_rule": "afterok scientific LP predecessor; afterany scheduling-only lane predecessor"}
 
 
 def submit(manifest: dict, script: Path, output: Path) -> dict:
@@ -146,17 +203,24 @@ def submit(manifest: dict, script: Path, output: Path) -> dict:
     submitted["job_ids"] = job_ids
     for point in manifest["points"]:
         predecessor = point["predecessor"]
-        dependencies = {job_ids[predecessor]} if predecessor else set()
+        scientific = {job_ids[predecessor]} if predecessor else set()
+        scheduling = set()
         lane = point["lane"]
         if lane in lane_last:
-            dependencies.add(lane_last[lane])
+            if lane_last[lane] not in scientific:
+                scheduling.add(lane_last[lane])
         if point["id"] not in job_ids:
             command = ["sbatch", "--parsable",
                 "--export=ALL,LP_MATRIX_ID=" + point["id"] +
                 ",FOLLOWUP_CODE_SHA=" + manifest["code_sha"] +
                 ",LP_MATRIX_ALLOW=1,LP_MATRIX_SLOTS=" + str(manifest["max_concurrent_gpu_jobs"])]
+            dependencies = []
+            if scientific:
+                dependencies.append("afterok:" + ":".join(sorted(scientific)))
+            if scheduling:
+                dependencies.append("afterany:" + ":".join(sorted(scheduling)))
             if dependencies:
-                command.append("--dependency=afterok:" + ":".join(sorted(dependencies)))
+                command.append("--dependency=" + ",".join(dependencies))
             command.append(str(script))
             response = subprocess.check_output(command, text=True).strip()
             job_id = response.split(";")[0]

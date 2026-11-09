@@ -51,8 +51,9 @@ lane 0: s01_lp_2p2 -> s01_lp_2p2p2 -> s01_lp_2p2p2p2 -> s01_w4 -> s01_w6 -> s01_
 lane 1: r02_lp_2p2 -> r02_lp_2p2p2 -> r02_lp_2p2p2p2 -> r02_w4 -> r02_w6 -> r02_w8
 ```
 
-Each arrow becomes `afterok` on the predecessor job. The control jobs are
-scientifically independent; their lane dependencies are scheduling tokens
+Scientific LP predecessor arrows use `afterok`. Independent control jobs use
+`afterany` lane dependencies, which release the lane after a failed pilot or
+control without treating that failure as scientific success. Their dependencies are scheduling tokens
 that cap concurrent allocations. Twelve submitted jobs stay below the QoS
 `GrpSubmitJobs=15` limit. The optional three-lane plan places all controls on
 the third lane and still submits only twelve jobs. The manifest records every
@@ -98,14 +99,13 @@ RESULT_ROOT="$LP_ROOT/results/qwen3_8b_base"
 mkdir -p "$LP_ROOT/logs" "$RESULT_ROOT/progressive_llm/pilots"
 unset LP_MATRIX_SHARED_QUOTA_FREE_GIB
 export LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1
-sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_BRANCH=s01 \
-  hpc/progressive_llm/pilot.sbatch
-sbatch --wait --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_BRANCH=r02 \
-  hpc/progressive_llm/pilot.sbatch
+# The completed S01/R02 LP pilots (54161/54162) are preserved and validated
+# against their original b650efb commit. Do not submit them again.
+scancel 54166 54167 54168 || echo 'One or more old pilot jobs already left the queue'
 PYTHONPATH="$LP_ROOT/references/rrq_pr2308/auto-round:$PWD" \
   "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_support \
   --checkout "$LP_ROOT/references/rrq_pr2308/auto-round" \
-  --output "$RESULT_ROOT/progressive_llm/pilots/control_support.json" --code-sha "$CODE_SHA"
+  --output "$RESULT_ROOT/progressive_llm/pilots/control_support_$CODE_SHA.json" --code-sha "$CODE_SHA"
 ids=(s01_w4 s01_w6 s01_w8 r02_w4 r02_w6 r02_w8)
 declare -a lane_job=()
 declare -a pilot_jobs=()
@@ -113,7 +113,7 @@ for index in "${!ids[@]}"; do
   lane=$((index % 3))
   dependency=()
   if [[ -n "${lane_job[$lane]:-}" ]]; then
-    dependency=("--dependency=afterok:${lane_job[$lane]}")
+    dependency=("--dependency=afterany:${lane_job[$lane]}")
   fi
   lane_job[$lane]=$(sbatch --parsable "${dependency[@]}" \
     --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_CONTROL_ID="${ids[$index]}" \
@@ -157,8 +157,11 @@ export LP_MATRIX_SUBMIT=1 LP_MATRIX_PILOTS_REVIEWED=1
 The first two pilots use all seven real first-layer matrices, independently
 verify the first and second enhancement, and score a separately materialized
 zero-enhancement W2 checkpoint. Six control pilots exercise actual
-one-layer quantization with the pinned 128-sample calibration and algorithm;
-the support audit records dispatch separately. If any upstream control mode
+one-layer quantization with the pinned 128-sample calibration and algorithm.
+Each requires all seven selected projections to change and all 245 projections
+outside layer 0 to remain source-equivalent at their loaded dtype. A meta or
+unavailable outside weight fails the pilot. The support audit records dispatch
+separately. If any upstream control mode
 fails, exclude it and document that mode. A separately identified common
 affine RTN control could be proposed, but it must not be presented as
 SignRoundV2 or NeUQI. Pilot scripts need A10G access and were not run in the
