@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import gc
 import json
 import os
 import re
@@ -10,21 +12,46 @@ import time
 from pathlib import Path
 
 
-def verify_unselected_projections(model, read_original, projections, *, layers: int = 36) -> int:
+@contextmanager
+def source_view(source: Path, mapping: dict[str, str], name: str):
+    """Keep one Safetensors shard mapped while comparing bounded row slices."""
+    from safetensors import safe_open
+    with safe_open(source / mapping[name], framework="pt", device="cpu") as handle:
+        yield handle.get_slice(name)
+
+
+def _shape(view) -> tuple[int, ...]:
+    return tuple(view.get_shape() if hasattr(view, "get_shape") else view.shape)
+
+
+def _compare_rows(value, original, name: str, *, rows: int = 64) -> int:
     import torch
+    if value.device.type == "meta":
+        raise ValueError(f"Pilot projection cannot be audited on meta device: {name}")
+    if _shape(original) != tuple(value.shape):
+        raise ValueError(f"Pilot projection shape differs from source: {name}")
+    changed = 0
+    for first in range(0, value.shape[0], rows):
+        stop = min(first + rows, value.shape[0])
+        loaded = value[first:stop].detach().cpu()
+        source_chunk = original[first:stop].to(loaded.dtype)
+        if not bool(torch.isfinite(loaded).all()):
+            raise ValueError(f"Nonfinite pilot projection: {name}")
+        changed += int(torch.count_nonzero(loaded != source_chunk))
+        del loaded, source_chunk
+    return changed
+
+
+def verify_unselected_projections(model, read_original, projections, *, layers: int = 36) -> int:
     checked = 0
     for layer in range(1, layers):
         for path in projections:
             name = f"model.layers.{layer}.{path}.weight"
-            value = model.get_submodule(f"model.layers.{layer}.{path}").weight.detach()
-            if value.device.type == "meta":
-                raise ValueError(f"Unselected pilot weight cannot be audited on meta device: {name}")
-            original = read_original(name)
-            if (value.shape != original.shape or not bool(torch.isfinite(value).all()) or
-                    not torch.equal(value.cpu(), original.to(value.dtype))):
-                raise ValueError(f"Unselected transformer projection changed: {name}")
+            value = model.get_submodule(f"model.layers.{layer}.{path}").weight
+            with read_original(name) as original:
+                if _compare_rows(value, original, name):
+                    raise ValueError(f"Unselected transformer projection changed: {name}")
             checked += 1
-            del value, original
     return checked
 
 
@@ -46,8 +73,8 @@ def traversed_blocks(quant_block_list, *, layers: int = 36) -> list[str]:
     return names
 
 
-def slurm_cgroup_peak_bytes(job_id: str, *, proc: Path = Path("/proc/self/cgroup"),
-                            root: Path = Path("/sys/fs/cgroup")) -> int:
+def slurm_cgroup_peak(job_id: str, *, proc: Path = Path("/proc/self/cgroup"),
+                      root: Path = Path("/sys/fs/cgroup")) -> tuple[int, str]:
     """Read the job's cgroup peak, including subprocesses and filesystem cache."""
     if not job_id or not proc.is_file():
         raise RuntimeError("Slurm cgroup memory peak is unavailable")
@@ -57,13 +84,26 @@ def slurm_cgroup_peak_bytes(job_id: str, *, proc: Path = Path("/proc/self/cgroup
             continue
         if controllers == "":
             counter = root / relative.lstrip("/") / "memory.peak"
+            source = "cgroup_v2_memory.peak"
         elif "memory" in controllers.split(","):
             counter = root / "memory" / relative.lstrip("/") / "memory.max_usage_in_bytes"
+            source = "cgroup_v1_memory.max_usage_in_bytes"
         else:
             continue
         if counter.is_file():
-            return int(counter.read_text().strip())
+            return int(counter.read_text().strip()), source
     raise RuntimeError("Slurm job cgroup memory peak is unavailable")
+
+
+def host_memory_assessment(process_peak_kib: int, cgroup_peak_bytes: int,
+                           allocation_bytes: int) -> dict:
+    if min(process_peak_kib, cgroup_peak_bytes, allocation_bytes) <= 0:
+        raise ValueError("Missing host memory measurement or allocation")
+    peak = max(process_peak_kib * 1024, cgroup_peak_bytes)
+    return {"host_peak_used_for_headroom_bytes": peak,
+            "host_memory_headroom_bytes": allocation_bytes - peak,
+            "host_memory_headroom_fraction": (allocation_bytes - peak) / allocation_bytes,
+            "host_memory_10pct_headroom_passed": peak * 10 < allocation_bytes * 9}
 
 
 def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> dict:
@@ -71,10 +111,11 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
     import torch
     import auto_round
     from auto_round import AutoRound
+    from auto_round.utils.device import memory_monitor
 
     from .progressive_control_worker import resolved_recipe
     from .progressive_lp import _files
-    from .rrq_pr2308_compare import _get, _weight_map
+    from .rrq_pr2308_compare import _weight_map
     from .storage import atomic_json
     from .progressive_resources import quota_status
 
@@ -94,39 +135,42 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
     if (len(configured) != 1 or configured[0].bits != bits or
             engine.to_quant_block_names != r"^model\.layers\.0$"):
         raise ValueError("First-layer control selection or algorithm was replaced")
-    model, _ = engine.quantize()
+    model, quantization_info = engine.quantize()
+    autoround_peak_ram_gib = float(memory_monitor.peak_ram)
+    quantization_process_peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    quantization_cgroup_peak_bytes, _ = slurm_cgroup_peak(os.environ.get("SLURM_JOB_ID", ""))
     blocks = traversed_blocks(getattr(engine, "quant_block_list", None))
+    # The returned model remains live; release calibration and engine state before validation.
+    del engine, quantization_info
+    gc.collect()
     source_map = _weight_map(source)
     projections = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
                    "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
     measured = {}
     for path in projections:
         name = f"model.layers.0.{path}.weight"
-        value = model.get_submodule(f"model.layers.0.{path}").weight.detach()
-        if value.device.type == "meta":
-            raise ValueError(f"Pilot projection remained on meta device: {name}")
-        value = value.cpu()
-        original = _get(source, source_map, name)
-        if value.shape != original.shape or not bool(torch.isfinite(value).all()):
-            raise ValueError(f"Invalid control pilot projection: {name}")
-        changed = int((value != original.to(value.dtype)).sum())
+        value = model.get_submodule(f"model.layers.0.{path}").weight
+        with source_view(source, source_map, name) as original:
+            changed = _compare_rows(value, original, name)
         if not changed:
             raise ValueError(f"Control pilot projection did not change: {name}")
-        sample = value[0, :128]
-        if torch.unique(sample).numel() > 1 << bits:
+        sample = value[0, :128].detach().cpu()
+        levels = int(torch.unique(sample).numel())
+        if levels > 1 << bits:
             raise ValueError(f"Control pilot W{bits} grid check failed: {name}")
         measured[name] = {"changed_elements": changed, "elements": value.numel(),
-                          "sampled_group_levels": int(torch.unique(sample).numel())}
-        del value, original
+                          "sampled_group_levels": levels}
     unselected = verify_unselected_projections(
-        model, lambda name: _get(source, source_map, name), projections)
+        model, lambda name: source_view(source, source_map, name), projections)
+    source_identity = _files(source)
     host_allocation = int(os.environ.get("SLURM_MEM_PER_NODE", "0")) * 1024**2
-    cgroup_peak = slurm_cgroup_peak_bytes(os.environ.get("SLURM_JOB_ID", ""))
+    cgroup_peak, cgroup_source = slurm_cgroup_peak(os.environ.get("SLURM_JOB_ID", ""))
     process_peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    memory = host_memory_assessment(process_peak, cgroup_peak, host_allocation)
     report_value = {"status": "control_layer_pilot_validated", "branch": branch, "bits": bits,
                     "quota_status": quota_status(),
                     "code_sha": code_sha, "reference_module": str(Path(auto_round.__file__).resolve()),
-                    "source": _files(source),
+                    "source": source_identity,
                     "recipe": recipe, "source_layer": 0, "projection_count": len(measured),
                     "traversed_transformer_blocks": blocks,
                     "traversed_transformer_block_count": len(blocks),
@@ -135,18 +179,25 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
                     "unselected_projection_source_exact_count": unselected,
                     "projections": measured, "runtime_seconds": time.monotonic() - started,
                     "process_peak_rss_kib": process_peak,
+                    "after_quantization_process_peak_rss_kib": quantization_process_peak_kib,
+                    "after_quantization_cgroup_peak_bytes": quantization_cgroup_peak_bytes,
                     "slurm_cgroup_peak_bytes": cgroup_peak,
-                    "slurm_cgroup_peak_source": "memory.peak or memory.max_usage_in_bytes",
+                    "slurm_cgroup_peak_source": cgroup_source,
+                    "autoround_peak_ram": {"value": autoround_peak_ram_gib, "unit": "GiB",
+                        "meaning": "sampled sum of process-tree RSS; upstream log labels GB; not used for resource gate"},
+                    **memory,
                     "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                     "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
                     "gpu_total_bytes": torch.cuda.get_device_properties(0).total_memory,
                     "host_allocation_bytes": host_allocation,
                     "exported_checkpoint_bytes": 0,
                     "scope": "first real Qwen3 layer only; no full-model export"}
-    if (host_allocation < 18 * 1024**3 or
-            max(process_peak * 1024, cgroup_peak) >= 0.9 * host_allocation or
+    if (host_allocation < 14 * 1024**3 or
+            not memory["host_memory_10pct_headroom_passed"] or
             report_value["gpu_peak_reserved_bytes"] >= 0.9 * report_value["gpu_total_bytes"]):
-        raise RuntimeError("Control pilot lacks 10% resource headroom")
+        raise RuntimeError(f"Control pilot lacks 10% resource headroom: "
+                           f"allocation={host_allocation}, process_rss_peak={process_peak * 1024}, "
+                           f"cgroup_peak={cgroup_peak}, headroom={memory['host_memory_headroom_bytes']}")
     atomic_json(report, report_value)
     return report_value
 

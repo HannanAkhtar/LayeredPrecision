@@ -97,7 +97,7 @@ def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
               "host_allocation_12_gib": host_limit_bytes >= 12 * GIB,
               "a10g_free_20_gib": gpu_free_bytes >= 20 * GIB}
     if mode == "control_pilot":
-        checks["control_host_allocation_18_gib"] = host_limit_bytes >= 18 * GIB
+        checks["control_host_allocation_14_gib"] = host_limit_bytes >= 14 * GIB
     return {"status": "capacity_floor_passed" if all(checks.values()) else "capacity_floor_failed",
             "mode": mode, "slots": slots, "sizes": sizes,
             "shared_path": str(shared), "shared_free_bytes": shared_free,

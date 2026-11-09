@@ -197,7 +197,22 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
                         control.get("slurm_cgroup_peak_bytes", 0)) >=
                     control.get("host_allocation_bytes", 0) * 0.9 or
                     control.get("slurm_cgroup_peak_bytes", 0) <= 0 or
-                    control.get("host_allocation_bytes", 0) < 18 * 1024**3 or
+                    control.get("slurm_cgroup_peak_source") not in (
+                        "cgroup_v2_memory.peak", "cgroup_v1_memory.max_usage_in_bytes") or
+                    control.get("after_quantization_cgroup_peak_bytes", 0) <= 0 or
+                    control.get("after_quantization_cgroup_peak_bytes", 0) >
+                    control.get("slurm_cgroup_peak_bytes", 0) or
+                    control.get("after_quantization_process_peak_rss_kib", 0) <= 0 or
+                    control.get("after_quantization_process_peak_rss_kib", 0) >
+                    control.get("process_peak_rss_kib", 0) or
+                    control.get("host_allocation_bytes", 0) < 14 * 1024**3 or
+                    control.get("host_peak_used_for_headroom_bytes") != max(
+                        control.get("process_peak_rss_kib", 0) * 1024,
+                        control.get("slurm_cgroup_peak_bytes", 0)) or
+                    control.get("host_memory_headroom_bytes") != (
+                        control.get("host_allocation_bytes", 0) -
+                        control.get("host_peak_used_for_headroom_bytes", 0)) or
+                    control.get("host_memory_10pct_headroom_passed") is not True or
                     control.get("gpu_peak_reserved_bytes", 0) >=
                     control.get("gpu_total_bytes", 0) * 0.9 or
                     control.get("host_allocation_bytes", 0) <= 0 or

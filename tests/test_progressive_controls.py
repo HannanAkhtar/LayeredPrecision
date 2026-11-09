@@ -2,6 +2,7 @@ import sys
 import types
 import json
 import runpy
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,8 @@ import pytest
 from lp_llm.progressive_control_worker import resolved_recipe
 from lp_llm import progressive_control
 from lp_llm.progressive_control_pilot import (verify_unselected_projections,
-    traversed_blocks, slurm_cgroup_peak_bytes)
+    traversed_blocks, slurm_cgroup_peak, host_memory_assessment, _compare_rows,
+    source_view)
 
 
 def test_pinned_autoround_exact_block_selector_normalizes_single_layer():
@@ -31,12 +33,12 @@ def test_control_pilot_detects_quantization_outside_selected_block():
         layer.self_attn.q_proj = torch.nn.Linear(4, 2, bias=False)
         model.model.layers.append(layer)
     original = model.model.layers[1].self_attn.q_proj.weight.detach().clone()
-    assert verify_unselected_projections(model, lambda _: original,
+    assert verify_unselected_projections(model, lambda _: nullcontext(original),
         ("self_attn.q_proj",), layers=2) == 1
     with torch.no_grad():
         model.model.layers[1].self_attn.q_proj.weight[0, 0] += 1
     with pytest.raises(ValueError, match="Unselected transformer projection changed"):
-        verify_unselected_projections(model, lambda _: original,
+        verify_unselected_projections(model, lambda _: nullcontext(original),
             ("self_attn.q_proj",), layers=2)
 
 
@@ -57,7 +59,7 @@ def test_all_blocks_traversed_while_only_layer_zero_is_quantized():
         originals[name] = layer.self_attn.q_proj.weight.detach().clone()
     with torch.no_grad():
         model.model.layers[0].self_attn.q_proj.weight[0, 0] += 1
-    assert verify_unselected_projections(model, originals.__getitem__,
+    assert verify_unselected_projections(model, lambda name: nullcontext(originals[name]),
         ("self_attn.q_proj",)) == 35
     assert not torch.equal(model.model.layers[0].self_attn.q_proj.weight,
                            originals["model.layers.0.self_attn.q_proj.weight"])
@@ -72,9 +74,45 @@ def test_slurm_cgroup_peak_requires_job_scoped_counter(tmp_path):
     counter.parent.mkdir(parents=True)
     counter.write_text(str(15 * 1024**3))
     proc.write_text("0::/system.slice/slurm/job_123/step_0\n")
-    assert slurm_cgroup_peak_bytes("123", proc=proc, root=root) == 15 * 1024**3
+    assert slurm_cgroup_peak("123", proc=proc, root=root) == (
+        15 * 1024**3, "cgroup_v2_memory.peak")
     with pytest.raises(RuntimeError, match="unavailable"):
-        slurm_cgroup_peak_bytes("124", proc=proc, root=root)
+        slurm_cgroup_peak("124", proc=proc, root=root)
+
+
+def test_bounded_projection_comparison_preserves_exact_counts(tmp_path):
+    import torch
+    from safetensors.torch import save_file
+    class Sliced:
+        def __init__(self, tensor):
+            self.tensor = tensor
+            self.largest_rows = 0
+        def get_shape(self):
+            return self.tensor.shape
+        def __getitem__(self, key):
+            self.largest_rows = max(self.largest_rows, key.stop - key.start)
+            return self.tensor[key]
+    original = torch.zeros(150, 128, dtype=torch.float16)
+    value = original.clone()
+    value[0, 0] += 1
+    value[149, 127] += 1
+    view = Sliced(original)
+    assert _compare_rows(value, view, "projection.weight") == 2
+    assert view.largest_rows <= 64
+    assert host_memory_assessment(10 * 1024**2, 12 * 1024**3,
+                                  14 * 1024**3)["host_memory_10pct_headroom_passed"]
+    assert not host_memory_assessment(10 * 1024**2, 13 * 1024**3,
+                                      14 * 1024**3)["host_memory_10pct_headroom_passed"]
+    with pytest.raises(ValueError, match="shape differs"):
+        _compare_rows(value, Sliced(original[:149]), "projection.weight")
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"projection.weight": original.to(torch.bfloat16)},
+              source / "model.safetensors")
+    with source_view(source, {"projection.weight": "model.safetensors"},
+                     "projection.weight") as mapped:
+        assert _compare_rows(value, mapped, "projection.weight") == 2
+        assert _compare_rows(original, mapped, "projection.weight") == 0
 
 
 def test_all_six_control_recipes_keep_pinned_dispatch(monkeypatch):

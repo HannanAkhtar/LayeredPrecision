@@ -159,7 +159,13 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
                                 for part in parts},
                 "gpu_peak_reserved_bytes": 1, "process_peak_rss_kib": 1,
                 "slurm_cgroup_peak_bytes": 1,
-                "host_allocation_bytes": 18 * 1024**3, "gpu_total_bytes": 1000}))
+                "slurm_cgroup_peak_source": "cgroup_v2_memory.peak",
+                "after_quantization_cgroup_peak_bytes": 1,
+                "after_quantization_process_peak_rss_kib": 1,
+                "host_peak_used_for_headroom_bytes": 1024,
+                "host_memory_headroom_bytes": 14 * 1024**3 - 1024,
+                "host_memory_10pct_headroom_passed": True,
+                "host_allocation_bytes": 14 * 1024**3, "gpu_total_bytes": 1000}))
     preflight = '''from pathlib import Path
 from unittest.mock import patch
 from lp_llm import progressive_plan as p
