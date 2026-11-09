@@ -170,20 +170,34 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
                     not Path(control.get("reference_module", "")).resolve().is_relative_to(
                         Path(support.get("upstream_checkout", "/nonexistent")).resolve()) or
                     control.get("projection_count") != 7 or
-                    control.get("selected_transformer_blocks") != [["model.layers.0"]] or
-                    control.get("other_transformer_blocks_selected") != 0 or
+                    not isinstance(control.get("traversed_transformer_blocks"), list) or
+                    "model.layers.0" not in control["traversed_transformer_blocks"] or
+                    len(control["traversed_transformer_blocks"]) !=
+                    len(set(control["traversed_transformer_blocks"])) or
+                    any(not re.fullmatch(r"model\.layers\.(?:[0-9]|[12][0-9]|3[0-5])", block)
+                        for block in control["traversed_transformer_blocks"]) or
+                    control.get("traversed_transformer_block_count") !=
+                    len(control["traversed_transformer_blocks"]) or
+                    control.get("quantized_projection_count") != 7 or
+                    control.get("quantized_projection_names") !=
+                    sorted(control.get("projections", {})) or
                     control.get("unselected_projection_source_exact_count") != 245 or
                     set(control.get("projections", {})) != {
                         f"model.layers.0.{part}.weight" for part in
                         ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
                          "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
                     } or
-                    any(item.get("changed_elements", 0) <= 0 for item in
-                        control.get("projections", {}).values()) or
+                    any(item.get("changed_elements", 0) <= 0 or
+                        item.get("elements", 0) < item.get("changed_elements", 0) or
+                        not 1 <= item.get("sampled_group_levels", 0) <= 1 << bits
+                        for item in control.get("projections", {}).values()) or
                     control.get("gpu_peak_reserved_bytes", 0) <= 0 or
                     control.get("process_peak_rss_kib", 0) <= 0 or
-                    control.get("process_peak_rss_kib", 0) * 1024 >=
+                    max(control.get("process_peak_rss_kib", 0) * 1024,
+                        control.get("slurm_cgroup_peak_bytes", 0)) >=
                     control.get("host_allocation_bytes", 0) * 0.9 or
+                    control.get("slurm_cgroup_peak_bytes", 0) <= 0 or
+                    control.get("host_allocation_bytes", 0) < 18 * 1024**3 or
                     control.get("gpu_peak_reserved_bytes", 0) >=
                     control.get("gpu_total_bytes", 0) * 0.9 or
                     control.get("host_allocation_bytes", 0) <= 0 or

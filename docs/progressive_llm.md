@@ -71,13 +71,25 @@ pilot also independently materializes each full W2 endpoint into a temporary
 checkpoint, then requires MatGPTQ perplexity parity at 12.47/32.22 before
 removing that job-owned copy; its shared floor therefore includes one dense
 checkpoint plus 5 GiB. It
-requires 12 GiB Slurm host allocation, 20 GiB free A10G memory, 2 GiB local
+requires 12 GiB Slurm host allocation for LP pilots and full points, 18 GiB
+for control pilots, 20 GiB free A10G memory, 2 GiB local
 scratch, shared capacity and an explicitly confirmed *remaining* project
 quota, or the explicit `LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1` operator override.
 The override records `unknown_operator_authorized` and bypasses only the
 formal quota check. Actual filesystem free space, GPU, host RAM, scratch,
 pilot, and checkpoint checks still apply. NFS `df` does not establish quota.
-Neither the tiny tests nor these floors predict full-model peaks.
+Neither the tiny tests nor these floors predict full-model peaks. The control
+pilot records process peak RSS in KiB and the Slurm job cgroup peak in bytes;
+the 10% host headroom check uses the larger value. The earlier AutoRound
+"14–15.5 GB peak RAM" lines do not identify a metric in the supplied log
+excerpt, so they cannot be compared directly to a Slurm cgroup limit. Compare
+the new report with `sacct` after the job finishes. Slurm `MaxRSS` is a task
+RSS measure, while the cgroup peak includes charged job memory and cache.
+An 18G Slurm request is 18,432 MiB. Previously reported A10G nodes had
+`RealMemory=15564` MiB and cannot schedule this pilot; inspect current node
+inventory before submitting. The full point script retains 12G because its
+different workload has no measured host peak yet. Inspect the first full
+point's actual memory before changing that allocation.
 The matrix submission checks the entire remaining matrix floor once. Each
 running point checks its own remaining output and temporary checkpoint floor,
 so prior completed points do not cause a false quota failure. Under the
@@ -101,12 +113,48 @@ unset LP_MATRIX_SHARED_QUOTA_FREE_GIB
 export LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1
 # The completed S01/R02 LP pilots (54161/54162) are preserved and validated
 # against their original b650efb commit. Do not submit them again.
-scancel 54166 54167 54168 || echo 'One or more old pilot jobs already left the queue'
+# Stop if no GPU node can provide the 18G = 18432 MiB request.
+sinfo -N -p gpu -h -o '%N %m' | tee /tmp/lp-control-nodes.txt
+awk '$2 >= 18432 {ok=1} END {if (!ok) exit 1}' /tmp/lp-control-nodes.txt
 PYTHONPATH="$LP_ROOT/references/rrq_pr2308/auto-round:$PWD" \
   "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_support \
   --checkout "$LP_ROOT/references/rrq_pr2308/auto-round" \
   --output "$RESULT_ROOT/progressive_llm/pilots/control_support_$CODE_SHA.json" --code-sha "$CODE_SHA"
-ids=(s01_w4 s01_w6 s01_w8 r02_w4 r02_w6 r02_w8)
+test ! -e "$RESULT_ROOT/progressive_llm/pilots/s01_w4.json"
+first_job=$(sbatch --parsable \
+  --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",LP_CONTROL_ID=s01_w4 \
+  hpc/progressive_llm/control_pilot.sbatch)
+echo "s01_w4 pilot job $first_job"
+```
+
+Wait for this one job to finish. Confirm `COMPLETED` and `0:0`, inspect its
+log, and validate the resulting report before submitting any other control:
+
+```bash
+sacct -j "$first_job" --format=JobID,State,ExitCode,ReqMem,MaxRSS,MaxVMSize
+cat "$RESULT_ROOT/progressive_llm/pilots/s01_w4.json"
+"$LP_ROOT/envs/lp_llm/bin/python" - <<'PY'
+import json
+from pathlib import Path
+root = Path('/shared/makhtar/lp_llm/results/qwen3_8b_base')
+r = json.loads((root / 'progressive_llm/pilots/s01_w4.json').read_text())
+assert r['status'] == 'control_layer_pilot_validated'
+assert r['projection_count'] == r['quantized_projection_count'] == 7
+assert r['unselected_projection_source_exact_count'] == 245
+assert len(r['traversed_transformer_blocks']) == 36
+assert r['host_allocation_bytes'] >= 18 * 1024**3
+assert max(r['slurm_cgroup_peak_bytes'], r['process_peak_rss_kib'] * 1024) < .9 * r['host_allocation_bytes']
+assert all(v['changed_elements'] > 0 for v in r['projections'].values())
+print('S01 W4 CONTROL PILOT VERIFIED')
+PY
+```
+
+Only after the first pilot passes, submit the remaining five with at most
+three running GPUs. `afterany` releases each scheduling lane after a failed
+pilot; scientific LP dependencies remain `afterok`:
+
+```bash
+ids=(s01_w6 s01_w8 r02_w4 r02_w6 r02_w8)
 declare -a lane_job=()
 declare -a pilot_jobs=()
 for index in "${!ids[@]}"; do
@@ -123,10 +171,14 @@ for index in "${!ids[@]}"; do
 done
 squeue -u "$USER" -o '%.18i %.30j %.2t %.20R'
 pilot_job_ids=$(IFS=,; echo "${pilot_jobs[*]}")
-# Run the following only after the six pilots have finished (check squeue).
+```
+
+After all five finish, inspect their reports and verify all eight pilots:
+
+```bash
 sacct -j "$pilot_job_ids" --format=JobID,State,ExitCode
 # Inspect all eight JSON reports before enabling full submission:
-for id in "${ids[@]}"; do
+for id in s01_w4 "${ids[@]}"; do
   cat "$RESULT_ROOT/progressive_llm/pilots/$id.json"
 done
 for branch in s01 r02; do

@@ -66,9 +66,9 @@ def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
     if strict_source and (sizes["source_total_elements"] != TOTAL_PARAMETERS or
                           sizes["projected_elements"] != ELIGIBLE_PARAMETERS):
         raise ValueError("Source parameter inventory differs from pinned Qwen3-8B-Base")
-    if mode not in ("pilot", "matrix", "point") or not shared.is_dir() or not scratch.is_dir():
+    if mode not in ("pilot", "control_pilot", "matrix", "point") or not shared.is_dir() or not scratch.is_dir():
         raise ValueError("Invalid mode or missing real shared/scratch directory")
-    floor = (sizes["one_layer_pilot_shared_floor_bytes"] if mode == "pilot" else
+    floor = (sizes["one_layer_pilot_shared_floor_bytes"] if mode in ("pilot", "control_pilot") else
              sizes["one_point_remaining_shared_floor_bytes"] if mode == "point" else
              sizes["new_matrix_shared_floor_bytes"])
     if quota_gib is None:
@@ -96,6 +96,8 @@ def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
               "local_scratch_2_gib": scratch_free >= 2 * GIB,
               "host_allocation_12_gib": host_limit_bytes >= 12 * GIB,
               "a10g_free_20_gib": gpu_free_bytes >= 20 * GIB}
+    if mode == "control_pilot":
+        checks["control_host_allocation_18_gib"] = host_limit_bytes >= 18 * GIB
     return {"status": "capacity_floor_passed" if all(checks.values()) else "capacity_floor_failed",
             "mode": mode, "slots": slots, "sizes": sizes,
             "shared_path": str(shared), "shared_free_bytes": shared_free,
@@ -113,7 +115,7 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--shared", type=Path, required=True)
     parser.add_argument("--scratch", type=Path, required=True)
-    parser.add_argument("--mode", choices=("pilot", "matrix", "point"), default="matrix")
+    parser.add_argument("--mode", choices=("pilot", "control_pilot", "matrix", "point"), default="matrix")
     parser.add_argument("--slots", type=int, choices=(2, 3), default=2)
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()

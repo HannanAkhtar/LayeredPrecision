@@ -8,7 +8,8 @@ import pytest
 
 from lp_llm.progressive_control_worker import resolved_recipe
 from lp_llm import progressive_control
-from lp_llm.progressive_control_pilot import verify_unselected_projections
+from lp_llm.progressive_control_pilot import (verify_unselected_projections,
+    traversed_blocks, slurm_cgroup_peak_bytes)
 
 
 def test_pinned_autoround_exact_block_selector_normalizes_single_layer():
@@ -37,6 +38,43 @@ def test_control_pilot_detects_quantization_outside_selected_block():
     with pytest.raises(ValueError, match="Unselected transformer projection changed"):
         verify_unselected_projections(model, lambda _: original,
             ("self_attn.q_proj",), layers=2)
+
+
+def test_all_blocks_traversed_while_only_layer_zero_is_quantized():
+    import torch
+    blocks = [[f"model.layers.{index}" for index in range(36)]]
+    assert traversed_blocks(blocks) == blocks[0]
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList()
+    originals = {}
+    for index in range(36):
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.q_proj = torch.nn.Linear(4, 2, bias=False)
+        model.model.layers.append(layer)
+        name = f"model.layers.{index}.self_attn.q_proj.weight"
+        originals[name] = layer.self_attn.q_proj.weight.detach().clone()
+    with torch.no_grad():
+        model.model.layers[0].self_attn.q_proj.weight[0, 0] += 1
+    assert verify_unselected_projections(model, originals.__getitem__,
+        ("self_attn.q_proj",)) == 35
+    assert not torch.equal(model.model.layers[0].self_attn.q_proj.weight,
+                           originals["model.layers.0.self_attn.q_proj.weight"])
+    with pytest.raises(ValueError, match="Unexpected AutoRound block traversal"):
+        traversed_blocks([["model.layers.36"]])
+
+
+def test_slurm_cgroup_peak_requires_job_scoped_counter(tmp_path):
+    proc = tmp_path / "cgroup"
+    root = tmp_path / "sys/fs/cgroup"
+    counter = root / "system.slice/slurm/job_123/step_0/memory.peak"
+    counter.parent.mkdir(parents=True)
+    counter.write_text(str(15 * 1024**3))
+    proc.write_text("0::/system.slice/slurm/job_123/step_0\n")
+    assert slurm_cgroup_peak_bytes("123", proc=proc, root=root) == 15 * 1024**3
+    with pytest.raises(RuntimeError, match="unavailable"):
+        slurm_cgroup_peak_bytes("124", proc=proc, root=root)
 
 
 def test_all_six_control_recipes_keep_pinned_dispatch(monkeypatch):

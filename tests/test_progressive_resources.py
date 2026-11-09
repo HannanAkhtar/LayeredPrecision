@@ -85,6 +85,24 @@ def test_unknown_quota_override_keeps_every_other_capacity_gate(tmp_path, monkey
     assert not low_disk["checks"]["local_scratch_2_gib"]
 
 
+def test_control_pilot_requires_18_gib_without_raising_lp_or_matrix_floor(tmp_path, monkeypatch):
+    source = _source(tmp_path)
+    monkeypatch.setenv("LP_MATRIX_ALLOW_UNKNOWN_QUOTA", "1")
+    monkeypatch.delenv("LP_MATRIX_SHARED_QUOTA_FREE_GIB", raising=False)
+    monkeypatch.setattr("lp_llm.progressive_resources.shutil.disk_usage",
+                        lambda _: SimpleNamespace(free=1000 * GIB))
+    kwargs = dict(quota_gib=None, gpu_free_bytes=22 * GIB, strict_source=False)
+    short = assess(source, tmp_path, tmp_path, mode="control_pilot",
+                   host_limit_bytes=12 * GIB, **kwargs)
+    assert not short["checks"]["control_host_allocation_18_gib"]
+    assert short["status"] == "capacity_floor_failed"
+    assert assess(source, tmp_path, tmp_path, mode="pilot",
+                  host_limit_bytes=12 * GIB, **kwargs)["status"] == "capacity_floor_passed"
+    ready = assess(source, tmp_path, tmp_path, mode="control_pilot",
+                   host_limit_bytes=18 * GIB, **kwargs)
+    assert ready["status"] == "capacity_floor_passed"
+
+
 def test_aggregate_reports_all_pending_points_without_invented_measurements(tmp_path):
     source = _source(tmp_path)
     report = write(source, tmp_path, tmp_path / "aggregate")

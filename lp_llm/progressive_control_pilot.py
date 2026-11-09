@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -25,6 +26,44 @@ def verify_unselected_projections(model, read_original, projections, *, layers: 
             checked += 1
             del value, original
     return checked
+
+
+def traversed_blocks(quant_block_list, *, layers: int = 36) -> list[str]:
+    """Record AutoRound traversal; weight comparison determines quantization coverage."""
+    if not isinstance(quant_block_list, (list, tuple)):
+        raise ValueError("AutoRound block traversal is unavailable")
+    names = []
+    for group in quant_block_list:
+        if not isinstance(group, (list, tuple)):
+            raise ValueError("Malformed AutoRound block traversal")
+        for name in group:
+            if not isinstance(name, str) or not re.fullmatch(r"model\.layers\.[0-9]+", name):
+                raise ValueError("Malformed AutoRound block traversal")
+            names.append(name)
+    if not names or "model.layers.0" not in names or len(names) != len(set(names)) or any(
+            int(name.rsplit(".", 1)[1]) >= layers for name in names):
+        raise ValueError("Unexpected AutoRound block traversal")
+    return names
+
+
+def slurm_cgroup_peak_bytes(job_id: str, *, proc: Path = Path("/proc/self/cgroup"),
+                            root: Path = Path("/sys/fs/cgroup")) -> int:
+    """Read the job's cgroup peak, including subprocesses and filesystem cache."""
+    if not job_id or not proc.is_file():
+        raise RuntimeError("Slurm cgroup memory peak is unavailable")
+    for line in proc.read_text().splitlines():
+        _, controllers, relative = line.split(":", 2)
+        if not re.search(rf"(?:job_|job-){re.escape(job_id)}(?:/|$)", relative):
+            continue
+        if controllers == "":
+            counter = root / relative.lstrip("/") / "memory.peak"
+        elif "memory" in controllers.split(","):
+            counter = root / "memory" / relative.lstrip("/") / "memory.max_usage_in_bytes"
+        else:
+            continue
+        if counter.is_file():
+            return int(counter.read_text().strip())
+    raise RuntimeError("Slurm job cgroup memory peak is unavailable")
 
 
 def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> dict:
@@ -56,10 +95,7 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
             engine.to_quant_block_names != r"^model\.layers\.0$"):
         raise ValueError("First-layer control selection or algorithm was replaced")
     model, _ = engine.quantize()
-    selected_blocks = getattr(engine, "quant_block_list", None)
-    if (selected_blocks is None or len(selected_blocks) != 1 or
-            len(selected_blocks[0]) != 1 or selected_blocks[0][0] != "model.layers.0"):
-        raise ValueError("Control pilot selected more than one decoder layer")
+    blocks = traversed_blocks(getattr(engine, "quant_block_list", None))
     source_map = _weight_map(source)
     projections = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
                    "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
@@ -84,24 +120,31 @@ def run(branch: str, bits: int, source: Path, report: Path, code_sha: str) -> di
         del value, original
     unselected = verify_unselected_projections(
         model, lambda name: _get(source, source_map, name), projections)
+    host_allocation = int(os.environ.get("SLURM_MEM_PER_NODE", "0")) * 1024**2
+    cgroup_peak = slurm_cgroup_peak_bytes(os.environ.get("SLURM_JOB_ID", ""))
+    process_peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     report_value = {"status": "control_layer_pilot_validated", "branch": branch, "bits": bits,
                     "quota_status": quota_status(),
                     "code_sha": code_sha, "reference_module": str(Path(auto_round.__file__).resolve()),
                     "source": _files(source),
                     "recipe": recipe, "source_layer": 0, "projection_count": len(measured),
-                    "selected_transformer_blocks": selected_blocks,
-                    "other_transformer_blocks_selected": 0,
+                    "traversed_transformer_blocks": blocks,
+                    "traversed_transformer_block_count": len(blocks),
+                    "quantized_projection_names": sorted(measured),
+                    "quantized_projection_count": len(measured),
                     "unselected_projection_source_exact_count": unselected,
                     "projections": measured, "runtime_seconds": time.monotonic() - started,
-                    "process_peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                    "process_peak_rss_kib": process_peak,
+                    "slurm_cgroup_peak_bytes": cgroup_peak,
+                    "slurm_cgroup_peak_source": "memory.peak or memory.max_usage_in_bytes",
                     "gpu_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                     "gpu_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
                     "gpu_total_bytes": torch.cuda.get_device_properties(0).total_memory,
-                    "host_allocation_bytes": int(os.environ.get("SLURM_MEM_PER_NODE", "0")) * 1024**2,
+                    "host_allocation_bytes": host_allocation,
                     "exported_checkpoint_bytes": 0,
                     "scope": "first real Qwen3 layer only; no full-model export"}
-    if (report_value["host_allocation_bytes"] and
-            report_value["process_peak_rss_kib"] * 1024 >= 0.9 * report_value["host_allocation_bytes"] or
+    if (host_allocation < 18 * 1024**3 or
+            max(process_peak * 1024, cgroup_peak) >= 0.9 * host_allocation or
             report_value["gpu_peak_reserved_bytes"] >= 0.9 * report_value["gpu_total_bytes"]):
         raise RuntimeError("Control pilot lacks 10% resource headroom")
     atomic_json(report, report_value)

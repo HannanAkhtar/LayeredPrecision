@@ -83,10 +83,13 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
     workspace = Path(__file__).resolve().parents[1]
     checkout, staged = tmp_path / "checkout", tmp_path / "stage"
     subprocess.run(["git", "clone", "--quiet", str(workspace), str(checkout)], check=True)
-    shutil.copy2(workspace / "lp_llm/progressive_plan.py", checkout / "lp_llm/progressive_plan.py")
+    for file in ("lp_llm/progressive_plan.py", "lp_llm/progressive_control_pilot.py",
+                 "lp_llm/progressive_resources.py"):
+        shutil.copy2(workspace / file, checkout / file)
     shutil.copy2(workspace / "hpc/progressive_llm/run_point.sbatch",
                  checkout / "hpc/progressive_llm/run_point.sbatch")
     subprocess.run(["git", "-C", str(checkout), "add", "lp_llm/progressive_plan.py",
+                    "lp_llm/progressive_control_pilot.py", "lp_llm/progressive_resources.py",
                     "hpc/progressive_llm/run_point.sbatch"], check=True)
     subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
                     "user.email=test@example.com", "commit", "-qm", "proposed archive"], check=True)
@@ -145,13 +148,18 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
                 "status": "control_layer_pilot_validated", "branch": branch,
                 "bits": bits, "code_sha": proposed, "source": {"test": True},
                 "recipe": {}, "reference_module": str(checkout / "auto_round/__init__.py"),
-                "projection_count": 7, "selected_transformer_blocks": [["model.layers.0"]],
-                "other_transformer_blocks_selected": 0,
+                "projection_count": 7,
+                "traversed_transformer_blocks": [f"model.layers.{i}" for i in range(36)],
+                "traversed_transformer_block_count": 36,
+                "quantized_projection_names": sorted(f"model.layers.0.{part}.weight" for part in parts),
+                "quantized_projection_count": 7,
                 "unselected_projection_source_exact_count": 245,
-                "projections": {f"model.layers.0.{part}.weight": {"changed_elements": 1}
+                "projections": {f"model.layers.0.{part}.weight": {"changed_elements": 1,
+                    "elements": 2, "sampled_group_levels": 2}
                                 for part in parts},
                 "gpu_peak_reserved_bytes": 1, "process_peak_rss_kib": 1,
-                "host_allocation_bytes": 12 * 1024**3, "gpu_total_bytes": 1000}))
+                "slurm_cgroup_peak_bytes": 1,
+                "host_allocation_bytes": 18 * 1024**3, "gpu_total_bytes": 1000}))
     preflight = '''from pathlib import Path
 from unittest.mock import patch
 from lp_llm import progressive_plan as p

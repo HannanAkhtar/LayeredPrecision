@@ -4,7 +4,7 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=12G
+#SBATCH --mem=18G
 #SBATCH --time=04:00:00
 #SBATCH --output=/shared/makhtar/lp_llm/logs/%x-%j.out
 set -euo pipefail
@@ -34,7 +34,7 @@ rm -- "$CODE_STAGE/code.tar"
 export PYTHONPATH="$RRQ_PR_SOURCE:$CODE_STAGE${PYTHONPATH:+:$PYTHONPATH}" LP_CONTROL_PILOT=1
 cd "$CODE_STAGE"
 "$LP_PYTHON" -m lp_llm.progressive_resources --source "$LP_SOURCE" \
-  --shared "$RESULT_ROOT" --scratch "$CODE_STAGE" --mode pilot --strict
+  --shared "$RESULT_ROOT" --scratch "$CODE_STAGE" --mode control_pilot --strict
 branch="${LP_CONTROL_ID%%_*}"
 bits="${LP_CONTROL_ID##*w}"
 report="$RESULT_ROOT/progressive_llm/pilots/$LP_CONTROL_ID.json"
