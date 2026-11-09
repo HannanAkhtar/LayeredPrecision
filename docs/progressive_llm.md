@@ -135,7 +135,7 @@ for branch in s01 r02; do
 done
 "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_plan verify-pilots \
   --source "$LP_ROOT/models/qwen3-8b-base" --result-root "$RESULT_ROOT" \
-  --code-sha "$CODE_SHA"
+  --code-sha "$CODE_SHA" --code-repo "$PWD"
 "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_plan dry-run \
   --result-root "$RESULT_ROOT" --code-sha "$CODE_SHA" --slots 3 \
   --manifest "$RESULT_ROOT/progressive_llm/planned_jobs.json"
@@ -149,7 +149,7 @@ checks the existing QoS 15-job limit and records each job ID and admission:
 export LP_MATRIX_SUBMIT=1 LP_MATRIX_PILOTS_REVIEWED=1
 "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_plan submit \
   --source "$LP_ROOT/models/qwen3-8b-base" --result-root "$RESULT_ROOT" \
-  --code-sha "$CODE_SHA" --slots 3 \
+  --code-sha "$CODE_SHA" --code-repo "$PWD" --slots 3 \
   --manifest "$RESULT_ROOT/progressive_llm/planned_jobs.json" \
   --script hpc/progressive_llm/run_point.sbatch
 ```

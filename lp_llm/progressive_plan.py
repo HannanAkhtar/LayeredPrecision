@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import io
+import tarfile
 from unittest.mock import patch
 import json
 import os
@@ -24,16 +26,43 @@ LP_UNCHANGED_PATHS = ("lp_llm/progressive_lp.py", "lp_llm/progressive_run.py",
                       "lp_llm/quantize.py", "lp_llm/storage.py")
 
 
-def accepted_lp_pilot_sha(record_sha: str, code_sha: str) -> str:
+def verify_executed_code(code_repo: Path, code_sha: str, staged_root: Path) -> None:
+    code_repo, staged_root = code_repo.resolve(), staged_root.resolve()
+    if not (code_repo / ".git").exists() or not staged_root.is_dir():
+        raise ValueError("Explicit trusted Git checkout and staged code directory are required")
+    kind = subprocess.check_output(["git", "-C", str(code_repo), "cat-file", "-t", code_sha],
+                                   text=True).strip()
+    if kind != "commit":
+        raise ValueError("Requested code SHA is not a commit in the trusted checkout")
+    archive = subprocess.check_output(["git", "-C", str(code_repo), "archive",
+                                       "--format=tar", code_sha, "lp_llm"])
+    tracked = set()
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as stream:
+        for member in stream:
+            if not member.isfile() or not member.name.endswith(".py"):
+                continue
+            tracked.add(member.name)
+            expected = stream.extractfile(member).read()
+            path = staged_root / member.name
+            if not path.is_file() or path.read_bytes() != expected:
+                raise ValueError(f"Executed code differs from requested commit: {member.name}")
+    actual = {path.relative_to(staged_root).as_posix() for path in
+              (staged_root / "lp_llm").rglob("*.py")}
+    if not tracked or actual != tracked:
+        raise ValueError("Staged Python module inventory differs from requested commit")
+
+
+def accepted_lp_pilot_sha(record_sha: str, code_sha: str,
+                          code_repo: Path, staged_root: Path) -> str:
+    verify_executed_code(code_repo, code_sha, staged_root)
     if record_sha == code_sha:
         return code_sha
     if record_sha != LP_PILOT_PREVIOUS_SHA:
         raise ValueError("LP pilot code SHA is not the validated prior commit")
-    for command in (["git", "diff", "--quiet", LP_PILOT_PREVIOUS_SHA, code_sha, "--", *LP_UNCHANGED_PATHS],
-                    ["git", "diff", "--quiet", "--", *LP_UNCHANGED_PATHS],
-                    ["git", "diff", "--cached", "--quiet", "--", *LP_UNCHANGED_PATHS]):
-        if subprocess.run(command, check=False).returncode != 0:
-            raise ValueError("LP implementation differs from the validated pilot commit")
+    command = ["git", "-C", str(code_repo.resolve()), "diff", "--quiet",
+               LP_PILOT_PREVIOUS_SHA, code_sha, "--", *LP_UNCHANGED_PATHS]
+    if subprocess.run(command, check=False).returncode != 0:
+        raise ValueError("LP implementation differs from the validated pilot commit")
     return LP_PILOT_PREVIOUS_SHA
 
 
@@ -66,7 +95,7 @@ def points(root: Path, slots: int) -> list[dict]:
     return result
 
 
-def verify_pilots(source: Path, result_root: Path, code_sha: str) -> dict:
+def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Path) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", code_sha):
         raise ValueError("Invalid reviewed code SHA")
     reports = {}
@@ -76,7 +105,8 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str) -> dict:
         record = json.loads((root / "report.json").read_text())
         validate_repaired_base(branch, source, base)
         ident = identity(branch, source, base)
-        accepted_sha = accepted_lp_pilot_sha(record.get("code_sha"), code_sha)
+        accepted_sha = accepted_lp_pilot_sha(record.get("code_sha"), code_sha,
+                                            code_repo, Path(__file__).resolve().parents[1])
         if (record.get("status") != "pilot_validated" or record.get("branch") != branch or
                 record.get("code_sha") != accepted_sha or record.get("identity") != ident or
                 len(record.get("projection_names", [])) != 7 or
@@ -261,6 +291,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("dry-run", "verify-pilots", "submit"))
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--code-repo", type=Path,
+                        help="Trusted original Git checkout, required for pilot verification")
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--code-sha", required=True)
     parser.add_argument("--slots", type=int, choices=(2, 3), default=2)
@@ -269,15 +301,16 @@ def main() -> None:
                         default=Path("hpc/progressive_llm/run_point.sbatch"))
     args = parser.parse_args()
     if args.action == "verify-pilots":
-        if args.source is None:
-            parser.error("verify-pilots requires --source")
-        print(json.dumps(verify_pilots(args.source, args.result_root, args.code_sha), indent=2))
+        if args.source is None or args.code_repo is None:
+            parser.error("verify-pilots requires --source and --code-repo")
+        print(json.dumps(verify_pilots(args.source, args.result_root, args.code_sha,
+                                       args.code_repo), indent=2))
         return
     manifest = plan(args.result_root, args.code_sha, slots=args.slots)
     if args.action == "submit":
-        if args.source is None or args.manifest is None:
-            parser.error("submit requires --source and --manifest")
-        verify_pilots(args.source, args.result_root, args.code_sha)
+        if args.source is None or args.manifest is None or args.code_repo is None:
+            parser.error("submit requires --source, --manifest and --code-repo")
+        verify_pilots(args.source, args.result_root, args.code_sha, args.code_repo)
         manifest["admission"] = admit_submission(args.source, args.result_root, args.slots)
         actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         if actual != args.code_sha:

@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -65,14 +68,120 @@ def test_prior_lp_pilot_acceptance_is_exact_and_requires_unchanged_code(monkeypa
         calls.append(command)
         return type("Result", (), {"returncode": 0})()
     monkeypatch.setattr("lp_llm.progressive_plan.subprocess.run", unchanged)
-    assert accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40) == LP_PILOT_PREVIOUS_SHA
-    assert len(calls) == 3 and all("progressive_lp.py" in " ".join(c) for c in calls)
+    monkeypatch.setattr("lp_llm.progressive_plan.verify_executed_code", lambda *_: None)
+    assert accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40, Path("repo"), Path("stage")) == LP_PILOT_PREVIOUS_SHA
+    assert len(calls) == 1 and "progressive_lp.py" in " ".join(calls[0])
     with pytest.raises(ValueError, match="validated prior"):
-        accepted_lp_pilot_sha("f" * 40, "a" * 40)
+        accepted_lp_pilot_sha("f" * 40, "a" * 40, Path("repo"), Path("stage"))
     monkeypatch.setattr("lp_llm.progressive_plan.subprocess.run",
                         lambda *_a, **_k: type("Result", (), {"returncode": 1})())
     with pytest.raises(ValueError, match="implementation differs"):
-        accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40)
+        accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40, Path("repo"), Path("stage"))
+
+
+def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
+    workspace = Path(__file__).resolve().parents[1]
+    checkout, staged = tmp_path / "checkout", tmp_path / "stage"
+    subprocess.run(["git", "clone", "--quiet", str(workspace), str(checkout)], check=True)
+    shutil.copy2(workspace / "lp_llm/progressive_plan.py", checkout / "lp_llm/progressive_plan.py")
+    shutil.copy2(workspace / "hpc/progressive_llm/run_point.sbatch",
+                 checkout / "hpc/progressive_llm/run_point.sbatch")
+    subprocess.run(["git", "-C", str(checkout), "add", "lp_llm/progressive_plan.py",
+                    "hpc/progressive_llm/run_point.sbatch"], check=True)
+    subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
+                    "user.email=test@example.com", "commit", "-qm", "proposed archive"], check=True)
+    proposed = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                                       text=True).strip()
+    staged.mkdir()
+    archive = subprocess.check_output(["git", "-C", str(checkout), "archive", proposed])
+    import tarfile, io
+    with tarfile.open(fileobj=io.BytesIO(archive)) as stream:
+        for member in stream:
+            if member.isfile():
+                target = staged / member.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(stream.extractfile(member).read())
+    assert not (staged / ".git").exists()
+    assert '--code-repo "$LP_CODE"' in (staged / "hpc/progressive_llm/run_point.sbatch").read_text()
+    environment = dict(os.environ, PYTHONPATH=str(staged))
+    code = ("from pathlib import Path; from lp_llm.progressive_plan import "
+            "accepted_lp_pilot_sha; print(accepted_lp_pilot_sha(" +
+            repr(LP_PILOT_PREVIOUS_SHA) + ", " + repr(proposed) +
+            ", Path(" + repr(str(checkout)) + "), Path.cwd()))")
+    result = subprocess.run([sys.executable, "-c", code], cwd=staged, env=environment,
+                            text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == LP_PILOT_PREVIOUS_SHA
+    result_root = tmp_path / "results"
+    pilots = result_root / "progressive_llm/pilots"
+    metrics = {"projection_count": 7, "encoded_elements": 1, "mse_fp32": 0.1,
+               "normalized_mse_fp32": 0.2, "code_bytes": 1, "metadata_bytes": 1}
+    for branch, ppl in (("s01", 12.47), ("r02", 32.22)):
+        root = pilots / branch
+        (root / "base_parity").mkdir(parents=True)
+        (root / "report.json").write_text(json.dumps({"status": "pilot_validated",
+            "branch": branch, "code_sha": LP_PILOT_PREVIOUS_SHA,
+            "identity": {"branch": branch}, "projection_names": list(range(7)),
+            "base_checkpoint_source_exact_exclusions": True,
+            "base_zero_enhancement_exact": True, "process_peak_rss_kib": 1,
+            "host_allocation_bytes": 12 * 1024**3, "artifact_bytes": 1,
+            "first": metrics, "second": metrics}))
+        (root / "base_parity/base_parity.json").write_text(json.dumps({
+            "status": "base_parity_validated", "identity": {"branch": branch},
+            "code_sha": LP_PILOT_PREVIOUS_SHA,
+            "corpus": {"token_sha256": "8ffcee84dd4b684ec631cb52845e18c9c181ce6fdb8b26d65a4ffdc3d35fbda3",
+                       "scored_tokens": 298862}, "evaluation": {"perplexity": ppl}}))
+    from lp_llm.quantizer_followups import PR_COMMIT
+    recipes = {f"{branch}_w{bits}": {} for branch in ("s01", "r02") for bits in (4, 6, 8)}
+    (pilots / f"control_support_{proposed}.json").write_text(json.dumps({
+        "status": "control_dispatch_verified", "code_sha": proposed,
+        "upstream_revision": PR_COMMIT, "upstream_checkout": str(checkout),
+        "recipes": recipes}))
+    parts = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+             "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    for branch in ("s01", "r02"):
+        for bits in (4, 6, 8):
+            (pilots / f"{branch}_w{bits}.json").write_text(json.dumps({
+                "status": "control_layer_pilot_validated", "branch": branch,
+                "bits": bits, "code_sha": proposed, "source": {"test": True},
+                "recipe": {}, "reference_module": str(checkout / "auto_round/__init__.py"),
+                "projection_count": 7, "selected_transformer_blocks": [["model.layers.0"]],
+                "other_transformer_blocks_selected": 0,
+                "unselected_projection_source_exact_count": 245,
+                "projections": {f"model.layers.0.{part}.weight": {"changed_elements": 1}
+                                for part in parts},
+                "gpu_peak_reserved_bytes": 1, "process_peak_rss_kib": 1,
+                "host_allocation_bytes": 12 * 1024**3, "gpu_total_bytes": 1000}))
+    preflight = '''from pathlib import Path
+from unittest.mock import patch
+from lp_llm import progressive_plan as p
+import sys
+root, repo, sha = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+layer = {"code_sha": p.LP_PILOT_PREVIOUS_SHA, "projection_count": 7,
+         "encoded_elements": 1, "mse_fp32": 0.1, "normalized_mse_fp32": 0.2,
+         "code_bytes": 1, "metadata_bytes": 1}
+with patch.object(p, "validate_repaired_base", return_value={}), \\
+     patch.object(p, "identity", side_effect=lambda branch, *_: {"branch": branch}), \\
+     patch.object(p, "verified_layers", return_value=[layer, layer]), \\
+     patch.object(p, "_files", return_value={"test": True}):
+    report = p.verify_pilots(root, root, sha, repo)
+assert report["s01"]["cross_commit_acceptance"]
+assert report["r02"]["cross_commit_acceptance"]
+print("ARCHIVED_PREFLIGHT_VALIDATED")
+'''
+    script = staged / "preflight_fixture.py"
+    script.write_text(preflight)
+    preflight_result = subprocess.run([sys.executable, str(script), str(result_root),
+        str(checkout), proposed], cwd=staged, env=environment, text=True,
+        capture_output=True, check=False)
+    assert preflight_result.returncode == 0, preflight_result.stderr
+    assert "ARCHIVED_PREFLIGHT_VALIDATED" in preflight_result.stdout
+    assert (pilots / f"lp_cross_commit_acceptance_{proposed}.json").is_file()
+    lp_file = staged / "lp_llm/progressive_lp.py"
+    lp_file.write_bytes(lp_file.read_bytes() + b"\n# tampered staged code\n")
+    rejected = subprocess.run([sys.executable, "-c", code], cwd=staged, env=environment,
+                              text=True, capture_output=True, check=False)
+    assert rejected.returncode != 0 and "Executed code differs" in rejected.stderr
 
 
 def test_submit_requires_explicit_review(tmp_path, monkeypatch):

@@ -36,7 +36,7 @@ cd "$CODE_STAGE"
   --shared "$RESULT_ROOT" --scratch "$CODE_STAGE" --mode point \
   --slots "${LP_MATRIX_SLOTS:-2}" --strict
 "$LP_PYTHON" -m lp_llm.progressive_plan verify-pilots --source "$LP_SOURCE" \
-  --result-root "$RESULT_ROOT" --code-sha "$FOLLOWUP_CODE_SHA"
+  --result-root "$RESULT_ROOT" --code-sha "$FOLLOWUP_CODE_SHA" --code-repo "$LP_CODE"
 mkdir -p "$RESULT_ROOT/progressive_llm/.locks"
 exec 9>"$RESULT_ROOT/progressive_llm/.locks/$LP_MATRIX_ID.lock"
 flock -n 9 || { echo 'ERROR: point writer already active' >&2; exit 1; }
