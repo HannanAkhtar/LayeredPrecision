@@ -105,11 +105,16 @@ historical failed Slurm jobs, producing commit, unchanged numerical code,
 source identity, LP chunks and evaluation log, W4 pinned recipe and process,
 all 252 projections, source-exact exclusions, and projection hashes. It writes
 `progressive_llm/recovery/<CODE_SHA>/stage_a_scientific_audit.json` without
-moving or rewriting the original export.
+moving or rewriting the original export. It also writes a separate SHA-256
+seal for that audit; GPU evaluation rejects a modified audit before reading
+checkpoint data.
 
 Only after that report passes, `recover_w4_evaluate.sbatch` can evaluate the
 original partial export under a new 15G job. It stores results in a separate
-recovery directory. The old job IDs and 12G allocation remain recorded as
+recovery directory. The GPU job loads the completed CPU audit and verifies
+source, checkpoint, LP artifacts, and original provenance with streaming
+SHA-256 reads; it does not repeat CPU tensor comparisons or AutoRound.
+The old job IDs and 12G allocation remain recorded as
 failed. `progressive_stage_a_recovery verify` reports the W4 recovery job's
 actual memory use and Slurm status. Stage B remains blocked by the original
 LP job's failed resource certification; scientific acceptance does not turn

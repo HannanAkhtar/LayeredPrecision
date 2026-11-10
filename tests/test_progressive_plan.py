@@ -197,10 +197,12 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
         shutil.copy2(workspace / file, checkout / file)
     shutil.copy2(workspace / "hpc/progressive_llm/run_point.sbatch",
                  checkout / "hpc/progressive_llm/run_point.sbatch")
+    (checkout / "archive-integration-marker.txt").write_text("proposed archive\n")
     subprocess.run(["git", "-C", str(checkout), "add", "lp_llm/progressive_plan.py",
                     "lp_llm/progressive_control_pilot.py", "lp_llm/progressive_resources.py",
                     "lp_llm/progressive_lp.py", "lp_llm/progressive_prerequisites.py",
-                    "hpc/progressive_llm/run_point.sbatch"], check=True)
+                    "hpc/progressive_llm/run_point.sbatch",
+                    "archive-integration-marker.txt"], check=True)
     subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
                     "user.email=test@example.com", "commit", "-qm", "proposed archive"], check=True)
     proposed = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"],

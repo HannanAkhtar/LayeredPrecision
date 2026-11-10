@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,9 @@ def test_stage_a_audit_preserves_partial_and_original_provenance(tmp_path, monke
     source, root, checkout = tmp_path / "source", tmp_path / "results", tmp_path / "auto-round"
     source.mkdir(); checkout.mkdir()
     monkeypatch.setenv("SLURM_JOB_ID", "60000")
+    layer = root / "progressive_llm/s01/layer1"
+    layer.mkdir(parents=True)
+    (layer / "encoding_complete.json").write_text("{}")
     lp_result = root / "progressive_llm/evaluation/s01_lp_2p2"
     lp_result.mkdir(parents=True)
     ident = {"source": {"hash": "source"}}
@@ -28,6 +32,7 @@ def test_stage_a_audit_preserves_partial_and_original_provenance(tmp_path, monke
         "slurm_cgroup_peak_bytes": 15_439_818_752}))
     w4 = root / "progressive_llm/controls/s01_w4"
     (w4 / "export.partial").mkdir(parents=True)
+    (w4 / "export.partial/shard.safetensors").write_bytes(b"checkpoint")
     (w4 / "run.json").write_text(json.dumps({"identity": {**ident,
         "code_sha": recovery.ORIGINAL_SHA}}))
     (w4 / "quantization_process.json").write_text(json.dumps({"returncode": 0}))
@@ -118,3 +123,117 @@ def test_recovered_w4_evaluation_is_separate_and_idempotent(tmp_path, monkeypatc
     (resource_dir / "s01_w4_recovery-60001.json").write_text(json.dumps(high))
     with pytest.raises(ValueError, match="resource evidence differs"):
         recovery.verify_recovery(record, tmp_path)
+
+
+def test_evaluate_action_uses_cpu_audit_without_running_full_audit(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_ID", "60001")
+    monkeypatch.setattr(recovery, "audit", lambda *_: pytest.fail("full CPU audit on GPU"))
+    monkeypatch.setattr(recovery, "validate_control", lambda *_:
+                        pytest.fail("full tensor comparison on GPU"))
+    record = {"status": "stage_a_science_validated_resource_uncertified"}
+    monkeypatch.setattr(recovery, "load_audited_inputs", lambda *_: record)
+    monkeypatch.setattr(recovery, "evaluate_w4", lambda *_a, **_k:
+                        {"status": "completed_validated"})
+    monkeypatch.setattr(sys, "argv", ["recovery", "evaluate", "--source", str(tmp_path),
+        "--result-root", str(tmp_path), "--code-sha", "a" * 40,
+        "--code-repo", str(tmp_path), "--autoround", str(tmp_path),
+        "--output", str(tmp_path / "audit.json"), "--matgptq", str(tmp_path)])
+    recovery.main()
+
+
+def test_gpu_hash_gate_rejects_changed_checkpoint_without_tensor_decoding(tmp_path, monkeypatch):
+    sha = "a" * 40
+    source = tmp_path / "source"
+    source.mkdir()
+    result = tmp_path / "results"
+    w4 = result / "progressive_llm/controls/s01_w4"
+    partial = w4 / "export.partial"
+    partial.mkdir(parents=True)
+    shard = partial / "model.safetensors"
+    shard.write_bytes(b"original packed bytes")
+    for name in ("run.json", "quantization_process.json", "worker_config.json",
+                 "resolved_config.json", "excluded_repair.json", "quantization.log"):
+        (w4 / name).write_text(name)
+    layer = result / "progressive_llm/s01/layer1"
+    layer.mkdir(parents=True)
+    (layer / "chunk.bin").write_bytes(b"encoded")
+    evaluation = result / "progressive_llm/evaluation/s01_lp_2p2"
+    evaluation.mkdir(parents=True)
+    (evaluation / "full.json").write_text("{}")
+    resource = result / f"progressive_llm/job_resources/s01_lp_2p2-{recovery.LP_JOB}.json"
+    resource.parent.mkdir(parents=True)
+    resource.write_text("{}")
+    audit_path = result / "progressive_llm/recovery" / sha / "stage_a_scientific_audit.json"
+    audit_path.parent.mkdir(parents=True)
+    names = ("run.json", "quantization_process.json", "worker_config.json",
+             "resolved_config.json", "excluded_repair.json", "quantization.log")
+    record = {"status": "stage_a_science_validated_resource_uncertified",
+        "code_sha": sha, "original_code_sha": recovery.ORIGINAL_SHA,
+        "prerequisite_job_id": "55356", "recovery_validation_job_id": "60000",
+        "resource_certification": "not_satisfied_by_original_12_gib_jobs",
+        "lp": {"original_job_id": recovery.LP_JOB,
+               "original_slurm": {"job_id": recovery.LP_JOB},
+               "layer_snapshot": recovery._snapshot_tree(layer),
+               "evaluation_snapshot": recovery._snapshot_tree(evaluation),
+               "original_resource_report_sha256": recovery.sha256(resource)},
+        "w4": {"original_job_id": recovery.W4_JOB,
+               "original_quantization_code_sha": recovery.ORIGINAL_SHA,
+               "original_slurm": {"job_id": recovery.W4_JOB},
+               "original_identity": {"source": {"hash": "source"},
+                                     "code_sha": recovery.ORIGINAL_SHA,
+                                     "upstream_revision": recovery.PR_COMMIT},
+               "partial_export": str(partial), "process": {"returncode": 0},
+               "repair": {"quantized_projection_byte_identical": True},
+               "checkpoint_validation": {"quantized_projection_count": 252,
+                   "checkpoint": {"resolved_checkpoint_path": str(partial),
+                                  "shard_sha256": {shard.name: recovery.sha256(shard)}}},
+               "provenance_sha256": {name: recovery.sha256(w4 / name) for name in names},
+               "export_snapshot": recovery._snapshot_tree(partial)}}
+    audit_path.write_text(json.dumps(record))
+    audit_path.with_name(audit_path.name + ".sha256.json").write_text(json.dumps({
+        "code_sha": sha, "recovery_validation_job_id": "60000",
+        "audit_sha256": recovery.sha256(audit_path)}))
+    monkeypatch.setattr(recovery, "verify_report", lambda *_:
+                        {"slurm_job_id": "55356", "source_identity": {"hash": "source"}})
+    monkeypatch.setattr(recovery, "_failed_slurm_job", lambda job: {"job_id": job})
+    monkeypatch.setattr(recovery.subprocess, "check_output", lambda *_a, **_k:
+                        "60000|COMPLETED|0:0\n")
+    monkeypatch.setattr(recovery.subprocess, "run", lambda *_a, **_k:
+                        SimpleNamespace(returncode=0))
+    monkeypatch.setattr(recovery, "check_revision", lambda *_: None)
+    monkeypatch.setattr(recovery, "_source_hashes", lambda *_: None)
+    monkeypatch.setattr(recovery, "_resolved_matches", lambda *_: None)
+    monkeypatch.setattr(recovery, "validate_control", lambda *_:
+                        pytest.fail("tensor decoding on GPU"))
+    assert recovery.load_audited_inputs(source, result, sha, tmp_path, tmp_path,
+                                       audit_path) == record
+    shard.write_bytes(b"tampered checkpoint")
+    with pytest.raises(ValueError, match="checkpoint changed"):
+        recovery.load_audited_inputs(source, result, sha, tmp_path, tmp_path, audit_path)
+    shard.write_bytes(b"original packed bytes")
+    (w4 / "run.json").write_text("changed provenance")
+    with pytest.raises(ValueError, match="provenance changed"):
+        recovery.load_audited_inputs(source, result, sha, tmp_path, tmp_path, audit_path)
+    (w4 / "run.json").write_text("run.json")
+    changed = dict(record, code_sha="b" * 40)
+    audit_path.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="audit integrity differs"):
+        recovery.load_audited_inputs(source, result, sha, tmp_path, tmp_path, audit_path)
+
+
+def test_streaming_source_hashes_reject_modified_shard(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in ("config.json", "model.safetensors.index.json", "model-1.safetensors"):
+        (source / name).write_bytes(name.encode())
+    monkeypatch.setattr("lp_llm.rrq_pr2308_compare._weight_map",
+                        lambda *_: {"weight": "model-1.safetensors"})
+    expected = {"tensor_names": ["weight"],
+        "config_sha256": recovery.sha256(source / "config.json"),
+        "index_sha256": recovery.sha256(source / "model.safetensors.index.json"),
+        "shard_sha256": {"model-1.safetensors": recovery.sha256(
+            source / "model-1.safetensors")}}
+    recovery._source_hashes(source, expected)
+    (source / "model-1.safetensors").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="source shard changed"):
+        recovery._source_hashes(source, expected)

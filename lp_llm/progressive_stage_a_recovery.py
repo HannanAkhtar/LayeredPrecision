@@ -14,7 +14,7 @@ from unittest.mock import patch
 from .progressive_control import _resolved_matches, control_identity, validate_control
 from .progressive_lp import identity, verified_layers
 from .progressive_prerequisites import verify_report
-from .quantizer_followups import TOKEN_SHA256
+from .quantizer_followups import PR_COMMIT, TOKEN_SHA256
 from .rrq_reference_eval import corpus_identity, run as evaluate_matgptq, check_revision
 from .rrq_w2 import MATGPTQ_COMMIT
 from .storage import atomic_json, sha256
@@ -40,6 +40,119 @@ def _failed_slurm_job(job_id: str) -> dict:
     if len(fields) != 3 or fields[0] != job_id or fields[1] != "FAILED" or fields[2] == "0:0":
         raise ValueError(f"Original Stage A Slurm failure differs: {job_id}: {rows}")
     return {"job_id": job_id, "state": fields[1], "exit_code": fields[2]}
+
+
+def _snapshot_tree(root: Path) -> dict:
+    """Stream hashes of every export file; never materialize checkpoint tensors."""
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("W4 partial export directory is missing or linked")
+    files = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"Linked W4 artifact: {path}")
+        if path.is_file():
+            files[path.relative_to(root).as_posix()] = {
+                "size": path.stat().st_size, "sha256": sha256(path)}
+    if not files:
+        raise ValueError("W4 partial export has no files")
+    return {"path": str(root.resolve()), "files": files}
+
+
+def _source_hashes(source: Path, expected: dict) -> None:
+    """Confirm the original source bytes using bounded streaming reads."""
+    from .rrq_pr2308_compare import _weight_map
+    mapping = _weight_map(source)
+    if sorted(mapping) != expected.get("tensor_names"):
+        raise ValueError("Original source tensor inventory changed")
+    paths = {"config_sha256": source / "config.json",
+             "index_sha256": source / "model.safetensors.index.json"}
+    for field, path in paths.items():
+        if path.is_symlink() or sha256(path) != expected.get(field):
+            raise ValueError(f"Original source {field} changed")
+    if set(mapping.values()) != set(expected.get("shard_sha256", {})):
+        raise ValueError("Original source shard inventory changed")
+    for name, digest in expected["shard_sha256"].items():
+        path = source / name
+        if path.is_symlink() or sha256(path) != digest:
+            raise ValueError(f"Original source shard changed: {name}")
+
+
+def load_audited_inputs(source: Path, result_root: Path, code_sha: str,
+                        code_repo: Path, checkout: Path, audit_path: Path) -> dict:
+    """GPU entry: verify CPU audit and stream file hashes without tensor decoding."""
+    expected_path = (result_root / "progressive_llm/recovery" / code_sha /
+                     "stage_a_scientific_audit.json")
+    if audit_path.resolve() != expected_path.resolve() or audit_path.is_symlink():
+        raise ValueError("Recovery audit path differs from pinned code SHA")
+    seal_path = audit_path.with_name(audit_path.name + ".sha256.json")
+    if seal_path.is_symlink():
+        raise ValueError("Recovery audit seal is linked")
+    seal = json.loads(seal_path.read_text())
+    if (seal.get("code_sha") != code_sha or
+            seal.get("audit_sha256") != sha256(audit_path)):
+        raise ValueError("CPU recovery audit integrity differs")
+    prerequisite = verify_report(source, result_root, code_sha, code_repo)
+    record = json.loads(audit_path.read_text())
+    if (record.get("status") != "stage_a_science_validated_resource_uncertified" or
+            record.get("code_sha") != code_sha or
+            record.get("original_code_sha") != ORIGINAL_SHA or
+            record.get("prerequisite_job_id") != prerequisite["slurm_job_id"] or
+            record.get("resource_certification") !=
+                "not_satisfied_by_original_12_gib_jobs" or
+            record.get("lp", {}).get("original_job_id") != LP_JOB or
+            record.get("w4", {}).get("original_job_id") != W4_JOB or
+            record.get("w4", {}).get("original_quantization_code_sha") != ORIGINAL_SHA):
+        raise ValueError("CPU recovery audit provenance differs")
+    audit_job = str(record.get("recovery_validation_job_id", ""))
+    if not audit_job.isdigit() or seal.get("recovery_validation_job_id") != audit_job:
+        raise ValueError("CPU recovery Slurm job ID missing")
+    rows = subprocess.check_output(["sacct", "-n", "-P", "-X", "-j", audit_job,
+        "-o", "JobIDRaw,State,ExitCode"], text=True).strip().splitlines()
+    if rows != [f"{audit_job}|COMPLETED|0:0"]:
+        raise ValueError("CPU recovery audit Slurm job did not complete successfully")
+    if (_failed_slurm_job(LP_JOB) != record["lp"].get("original_slurm") or
+            _failed_slurm_job(W4_JOB) != record["w4"].get("original_slurm")):
+        raise ValueError("Original failed Slurm provenance changed")
+    if subprocess.run(["git", "-C", str(code_repo), "diff", "--quiet", ORIGINAL_SHA,
+                       code_sha, "--", *LP_NUMERICAL_PATHS], check=False).returncode:
+        raise ValueError("LP numerical implementation changed since original Stage A job")
+    check_revision(checkout, PR_COMMIT)
+    _source_hashes(source, prerequisite["source_identity"])
+    original_identity = record["w4"].get("original_identity", {})
+    if (original_identity.get("source") != prerequisite["source_identity"] or
+            original_identity.get("code_sha") != ORIGINAL_SHA or
+            original_identity.get("upstream_revision") != PR_COMMIT):
+        raise ValueError("Original W4 source or code identity differs")
+    w4_root = result_root / "progressive_llm/controls/s01_w4"
+    partial = w4_root / "export.partial"
+    if (record["w4"].get("partial_export") != str(partial) or
+            (w4_root / "encoding_complete.json").exists() or
+            record["w4"].get("process", {}).get("returncode") != 0 or
+            record["w4"].get("repair", {}).get("quantized_projection_byte_identical") is not True or
+            record["w4"].get("checkpoint_validation", {}).get("quantized_projection_count") != 252):
+        raise ValueError("Original W4 partial checkpoint identity differs")
+    _resolved_matches(w4_root / "resolved_config.json", "s01", 4, checkout)
+    for name, digest in record["w4"]["provenance_sha256"].items():
+        if sha256(w4_root / name) != digest:
+            raise ValueError(f"Original W4 provenance changed: {name}")
+    if _snapshot_tree(partial) != record["w4"].get("export_snapshot"):
+        raise ValueError("W4 checkpoint changed since CPU audit")
+    checkpoint = record["w4"]["checkpoint_validation"]["checkpoint"]
+    resolved = Path(checkpoint["resolved_checkpoint_path"])
+    if not resolved.is_relative_to(partial) or not resolved.is_dir():
+        raise ValueError("Audited W4 checkpoint path differs")
+    for name, digest in checkpoint["shard_sha256"].items():
+        if record["w4"]["export_snapshot"]["files"][
+                (resolved / name).relative_to(partial).as_posix()]["sha256"] != digest:
+            raise ValueError("Audited W4 shard identity differs")
+    lp_root = result_root / "progressive_llm/s01/layer1"
+    lp_result = result_root / "progressive_llm/evaluation/s01_lp_2p2"
+    if (_snapshot_tree(lp_root) != record["lp"].get("layer_snapshot") or
+            _snapshot_tree(lp_result) != record["lp"].get("evaluation_snapshot") or
+            sha256(result_root / f"progressive_llm/job_resources/s01_lp_2p2-{LP_JOB}.json") !=
+            record["lp"].get("original_resource_report_sha256")):
+        raise ValueError("Original LP result or resource evidence changed")
+    return record
 
 
 def audit(source: Path, result_root: Path, code_sha: str, code_repo: Path,
@@ -108,6 +221,9 @@ def audit(source: Path, result_root: Path, code_sha: str, code_repo: Path,
     validated = validate_control(source, partial, 4)
     if validated["projection_tensor_sha256"] != repair["raw_projection_tensor_sha256"]:
         raise ValueError("Repaired W4 projections differ from original quantized bytes")
+    provenance_names = ("run.json", "quantization_process.json", "worker_config.json",
+                        "resolved_config.json", "excluded_repair.json", "quantization.log")
+    provenance_hashes = {name: sha256(w4_root / name) for name in provenance_names}
     report = {"status": "stage_a_science_validated_resource_uncertified",
               "code_sha": code_sha, "original_code_sha": ORIGINAL_SHA,
               "recovery_validation_job_id": str(validation_job_id),
@@ -127,10 +243,15 @@ def audit(source: Path, result_root: Path, code_sha: str, code_repo: Path,
                      "full_json_sha256": sha256(full_path),
                      "evaluation_log_sha256": full["evaluation_log_sha256"],
                      "perplexity": full["evaluation"]["perplexity"],
+                     "layer_snapshot": _snapshot_tree(lp_root / "layer1"),
+                     "evaluation_snapshot": _snapshot_tree(lp_result),
                      "encoded_layer": layers[0]},
               "w4": {"original_job_id": W4_JOB, "original_quantization_code_sha": ORIGINAL_SHA,
                      "original_slurm": w4_slurm,
                      "partial_export": str(partial), "process": process,
+                     "original_identity": original_ident,
+                     "provenance_sha256": provenance_hashes,
+                     "export_snapshot": _snapshot_tree(partial),
                      "quantization_log_sha256": sha256(w4_root / "quantization.log"),
                      "repair": repair, "checkpoint_validation": validated},
               "resource_certification": "not_satisfied_by_original_12_gib_jobs"}
@@ -139,6 +260,14 @@ def audit(source: Path, result_root: Path, code_sha: str, code_repo: Path,
             raise ValueError("Existing Stage A recovery audit differs")
     else:
         atomic_json(output, report)
+    seal_path = output.with_name(output.name + ".sha256.json")
+    seal = {"code_sha": code_sha, "recovery_validation_job_id": str(validation_job_id),
+            "audit_sha256": sha256(output)}
+    if seal_path.exists():
+        if json.loads(seal_path.read_text()) != seal:
+            raise ValueError("Existing CPU recovery audit seal differs")
+    else:
+        atomic_json(seal_path, seal)
     return report
 
 
@@ -236,15 +365,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--matgptq", type=Path)
     args = parser.parse_args()
-    if args.action == "verify":
-        verify_report(args.source, args.result_root, args.code_sha, args.code_repo)
-        record = json.loads(args.output.read_text())
-        if record.get("code_sha") != args.code_sha:
-            raise ValueError("Stage A recovery audit code SHA differs")
-        record = verify_recovery(record, args.result_root)
-    else:
+    if args.action == "audit":
         record = audit(args.source, args.result_root, args.code_sha, args.code_repo,
                        args.autoround, args.output)
+    else:
+        record = load_audited_inputs(args.source, args.result_root, args.code_sha,
+                                     args.code_repo, args.autoround, args.output)
+    if args.action == "verify":
+        record = verify_recovery(record, args.result_root)
     if args.action == "evaluate":
         if args.matgptq is None:
             parser.error("evaluate requires --matgptq")
