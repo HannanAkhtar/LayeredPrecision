@@ -92,6 +92,29 @@ def _watched_inventory(source: Path, result_root: Path, code_sha: str) -> dict:
     return inventory
 
 
+def _same_cross_node_inventory(recorded: dict, current: dict) -> bool:
+    """Filesystem device numbers identify mounts on a node, not NFS files."""
+    if not isinstance(recorded, dict) or set(recorded) != set(current):
+        return False
+    fields = {"size", "mtime_ns", "ctime_ns", "inode", "device"}
+    for label, actual in current.items():
+        expected = recorded[label]
+        if (not isinstance(expected, dict) or set(expected) != {"path", "files"} or
+                expected["path"] != actual["path"] or
+                not isinstance(expected["files"], dict) or
+                set(expected["files"]) != set(actual["files"])):
+            return False
+        for name, stat in actual["files"].items():
+            prior = expected["files"][name]
+            if (not isinstance(prior, dict) or set(prior) != fields or
+                    set(stat) != fields or
+                    not isinstance(prior["device"], int) or
+                    not isinstance(stat["device"], int) or
+                    any(prior[field] != stat[field] for field in fields - {"device"})):
+                return False
+    return True
+
+
 def verify_report(source: Path, result_root: Path, code_sha: str,
                   code_repo: Path, *, staged_root: Path | None = None) -> dict:
     """No tensor reads or checkpoint hashes; reject any watched metadata change."""
@@ -201,7 +224,8 @@ def verify_report(source: Path, result_root: Path, code_sha: str,
             any(acceptance["accepted"][branch] != record["bases"][branch]
                 for branch in ("s01", "r02"))):
         raise ValueError("Historical LP cross-commit acceptance differs")
-    if record.get("inventory") != _watched_inventory(source, result_root, code_sha):
+    if not _same_cross_node_inventory(record.get("inventory"),
+                                      _watched_inventory(source, result_root, code_sha)):
         raise ValueError("Prerequisite file metadata changed; run full CPU verification")
     verify_executed_code(code_repo, code_sha,
                          staged_root or Path(__file__).resolve().parents[1])
@@ -237,7 +261,8 @@ def verified_input_identity(directory: Path, *, branch: str | None = None) -> di
                                 Path(os.environ["LP_CODE"]))
         _REPORT_CACHE[key] = checked, _report_stamp(report)
     record = _REPORT_CACHE[key][0]
-    if record["inventory"] != _watched_inventory(source, result_root, code_sha):
+    if not _same_cross_node_inventory(record["inventory"],
+                                      _watched_inventory(source, result_root, code_sha)):
         raise ValueError("Prerequisite inputs changed during experiment")
     if directory.is_symlink():
         raise ValueError("Prerequisite input directory link is not allowed")

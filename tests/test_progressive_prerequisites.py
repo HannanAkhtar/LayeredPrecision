@@ -1,4 +1,5 @@
 import json
+import copy
 import sys
 from pathlib import Path
 
@@ -147,6 +148,66 @@ def test_mismatched_report_and_missing_artifact_fail_closed(tmp_path, monkeypatc
     (result / "quantizer_followups/r02_fp16_load_repair/export/model-1.safetensors").unlink()
     with pytest.raises(ValueError, match="metadata changed"):
         gate.verify_report(source, result, SHA, tmp_path)
+
+
+def test_cross_node_device_ids_do_not_invalidate_audited_files(tmp_path, monkeypatch):
+    source, result, checked = fixture_tree(tmp_path)
+    monkeypatch.setattr("lp_llm.progressive_plan.verify_pilots", lambda *_: checked)
+    monkeypatch.setattr("lp_llm.progressive_plan.verify_executed_code", lambda *_: None)
+    report = gate.verify_full(source, result, SHA, tmp_path, job_id="55356")
+    recorded = copy.deepcopy(report)
+    for root in recorded["inventory"].values():
+        for stat in root["files"].values():
+            stat["device"] = 57
+    gate.report_path(result, SHA).write_text(json.dumps(recorded))
+    real_inventory = gate._watched_inventory
+    def login_inventory(*args):
+        inventory = real_inventory(*args)
+        for root in inventory.values():
+            for stat in root["files"].values():
+                stat["device"] = 59
+        return inventory
+    monkeypatch.setattr(gate, "_watched_inventory", login_inventory)
+    assert gate.verify_report(source, result, SHA, tmp_path)["inventory"] == recorded["inventory"]
+    monkeypatch.setenv("LP_PREREQUISITE_REPORT", str(gate.report_path(result, SHA)))
+    monkeypatch.setenv("FOLLOWUP_CODE_SHA", SHA)
+    monkeypatch.setenv("RESULT_ROOT", str(result))
+    monkeypatch.setenv("LP_SOURCE", str(source))
+    monkeypatch.setenv("LP_CODE", str(tmp_path))
+    gate._REPORT_CACHE.clear()
+    assert _files(source) == recorded["source_identity"]
+    assert _files(source) == recorded["source_identity"]  # cached report path
+    for field in ("size", "mtime_ns", "ctime_ns", "inode"):
+        def changed(*args):
+            inventory = login_inventory(*args)
+            stat = next(iter(inventory["source"]["files"].values()))
+            stat[field] += 1
+            return inventory
+        monkeypatch.setattr(gate, "_watched_inventory", changed)
+        with pytest.raises(ValueError, match="metadata changed"):
+            gate.verify_report(source, result, SHA, tmp_path)
+        with pytest.raises(ValueError, match="inputs changed"):
+            _files(source)
+    monkeypatch.setattr(gate, "_watched_inventory", login_inventory)
+    def added(*args):
+        inventory = login_inventory(*args)
+        inventory["source"]["files"]["new-file"] = next(iter(
+            inventory["source"]["files"].values())).copy()
+        return inventory
+    monkeypatch.setattr(gate, "_watched_inventory", added)
+    with pytest.raises(ValueError, match="metadata changed"):
+        gate.verify_report(source, result, SHA, tmp_path)
+
+
+def test_prior_commit_report_cannot_be_reassigned(tmp_path, monkeypatch):
+    source, result, checked = fixture_tree(tmp_path)
+    monkeypatch.setattr("lp_llm.progressive_plan.verify_pilots", lambda *_: checked)
+    monkeypatch.setattr("lp_llm.progressive_plan.verify_executed_code", lambda *_: None)
+    gate.verify_full(source, result, SHA, tmp_path, job_id="55356")
+    proposed = "b" * 40
+    gate.report_path(result, proposed).write_bytes(gate.report_path(result, SHA).read_bytes())
+    with pytest.raises(ValueError, match="schema, identity or provenance"):
+        gate.verify_report(source, result, proposed, tmp_path)
 
 
 def test_gpu_script_uses_report_gate_and_keeps_output_validation():

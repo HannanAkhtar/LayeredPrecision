@@ -81,8 +81,10 @@ tail -n 40 "$RESULT_ROOT/progressive_llm/prerequisites/prerequisites_$CODE_SHA.j
 
 Require Slurm `COMPLETED`, exit code `0:0`, and a successful lightweight
 report check before Stage A. The report contains verified SHA-256 identities;
-the lightweight gate checks current size, timestamps, inode, device, and file
-inventory without rereading checkpoint tensors. These metadata checks catch
+the lightweight gate checks current size, timestamps, inode, path, and file
+inventory without rereading checkpoint tensors. It records the filesystem
+device ID for diagnostics but does not compare that node-local ID across AUS
+nodes. These metadata checks catch
 ordinary changes but cannot prove that a file owner with write access did not
 restore metadata after modifying contents. If file integrity is uncertain,
 rerun the full CPU audit before submitting more jobs. Any metadata mismatch
