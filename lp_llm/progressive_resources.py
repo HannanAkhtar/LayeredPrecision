@@ -20,9 +20,9 @@ def quota_status() -> str:
     return "site_confirmed" if os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else "unknown_unapproved"
 
 
-def estimate(source: Path, *, slots: int = 2) -> dict:
-    if slots not in (2, 3):
-        raise ValueError("LP matrix GPU cap must be two or three")
+def estimate(source: Path, *, slots: int = 14) -> dict:
+    if not 1 <= slots <= 14:
+        raise ValueError("LP matrix job cap must be 1 through 14")
     config, tensors = _headers(source)
     if (config.get("model_type") != "qwen3" or config.get("num_hidden_layers") != 36 or
             config.get("hidden_size") != 4096):
@@ -41,8 +41,9 @@ def estimate(source: Path, *, slots: int = 2) -> dict:
     # 5% accommodates per-chunk Safetensors headers and JSON manifests; this is modeled.
     one_residual_floor = math.ceil((residual_code + residual_scales) * 1.05)
     controls = 6 * math.ceil(dense * 1.02)
+    simultaneous_lp_checkpoints = min(slots, 2)  # one active point per scientific branch
     matrix = (2 * 3 * one_residual_floor + controls +
-              slots * math.ceil(dense * 1.02) + 10 * GIB)
+              simultaneous_lp_checkpoints * math.ceil(dense * 1.02) + 10 * GIB)
     point = one_residual_floor + math.ceil(dense * 1.05) + 5 * GIB
     return {"source_dense_payload_bytes": dense, "source_total_elements": total_elements,
             "projected_elements": projected,
@@ -50,7 +51,8 @@ def estimate(source: Path, *, slots: int = 2) -> dict:
             "one_e2_fp32_scale_bytes": residual_scales,
             "one_e2_modeled_floor_bytes": one_residual_floor,
             "six_monolithic_qdq_modeled_floor_bytes": controls,
-            "concurrent_temporary_eval_checkpoint_floor_bytes": slots * math.ceil(dense * 1.02),
+            "concurrent_temporary_eval_checkpoint_floor_bytes":
+                simultaneous_lp_checkpoints * math.ceil(dense * 1.02),
             "new_matrix_shared_floor_bytes": matrix,
             "one_point_remaining_shared_floor_bytes": point,
             "one_layer_pilot_shared_floor_bytes": max(5 * GIB,
@@ -59,7 +61,7 @@ def estimate(source: Path, *, slots: int = 2) -> dict:
 
 
 def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
-           slots: int = 2, quota_gib: float | None = None,
+           slots: int = 14, quota_gib: float | None = None,
            gpu_free_bytes: int | None = None, host_limit_bytes: int | None = None,
            strict_source: bool = True) -> dict:
     sizes = estimate(source, slots=slots)
@@ -116,7 +118,7 @@ def main() -> None:
     parser.add_argument("--shared", type=Path, required=True)
     parser.add_argument("--scratch", type=Path, required=True)
     parser.add_argument("--mode", choices=("pilot", "control_pilot", "matrix", "point"), default="matrix")
-    parser.add_argument("--slots", type=int, choices=(2, 3), default=2)
+    parser.add_argument("--slots", type=int, default=14)
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
     report = assess(args.source, args.shared, args.scratch, mode=args.mode, slots=args.slots)

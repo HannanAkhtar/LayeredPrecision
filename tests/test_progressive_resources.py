@@ -28,12 +28,12 @@ def _source(tmp_path):
 def test_matrix_estimate_counts_codes_scales_controls_and_concurrent_qdq(tmp_path):
     source = _source(tmp_path)
     two = estimate(source, slots=2)
-    three = estimate(source, slots=3)
+    three = estimate(source, slots=14)
     assert two["projected_elements"] == 252 * 16 * 128
     assert two["projection_group_count"] == 252 * 16
     assert two["one_e2_code_bytes"] == 252 * 16 * 128 // 4
     assert two["one_e2_fp32_scale_bytes"] == 252 * 16 * 4
-    assert three["new_matrix_shared_floor_bytes"] > two["new_matrix_shared_floor_bytes"]
+    assert three["new_matrix_shared_floor_bytes"] == two["new_matrix_shared_floor_bytes"]
     assert two["new_matrix_shared_floor_bytes"] > two["one_point_remaining_shared_floor_bytes"]
 
 

@@ -12,7 +12,7 @@ from lp_llm.progressive_plan import (LP_PILOT_PREVIOUS_SHA, accepted_lp_pilot_sh
 
 
 def test_matrix_has_twelve_points_and_scientific_dependencies(tmp_path):
-    report = plan(tmp_path, "a" * 40, slots=2)
+    report = plan(tmp_path, "a" * 40, slots=14)
     assert report["status"] == "dry_run_not_submitted"
     assert report["qos_submit_jobs_count"] == 12
     assert len(report["points"]) == 12
@@ -20,11 +20,10 @@ def test_matrix_has_twelve_points_and_scientific_dependencies(tmp_path):
     assert lookup["s01_lp_2p2p2"]["predecessor"] == "s01_lp_2p2"
     assert lookup["s01_lp_2p2p2p2"]["predecessor"] == "s01_lp_2p2p2"
     assert lookup["r02_lp_2p2p2"]["predecessor"] == "r02_lp_2p2"
-    assert {item["lane"] for item in report["points"]} == {0, 1}
+    assert all("lane" not in item for item in report["points"])
     assert len({item["output"] for item in report["points"]}) == 12
     assert len({item["id"] for item in report["points"] if item["kind"] == "control"}) == 6
-    three = plan(tmp_path, "a" * 40, slots=3)
-    assert {item["lane"] for item in three["points"]} == {0, 1, 2}
+    assert plan(tmp_path, "a" * 40, slots=14)["max_concurrent_gpu_jobs"] == 14
     static = json.loads((Path(__file__).resolve().parents[1] /
                          "configs/progressive_llm/matrix.json").read_text())
     assert [item["id"] for item in static["new_points"]] == [item["id"] for item in report["points"]]
@@ -32,11 +31,13 @@ def test_matrix_has_twelve_points_and_scientific_dependencies(tmp_path):
         item["predecessor"] for item in report["points"]]
 
 
-def test_submit_uses_afterok_lane_dependencies_and_resumes(tmp_path, monkeypatch):
-    report = plan(tmp_path, "a" * 40, slots=2)
+def test_submit_uses_only_scientific_dependencies_and_resumes(tmp_path, monkeypatch):
+    report = plan(tmp_path, "a" * 40, slots=14)
     commands = []
 
     def fake_sbatch(command, *, text):
+        if command[0] == "squeue":
+            return ""
         commands.append(command)
         return str(1000 + len(commands))
 
@@ -44,22 +45,67 @@ def test_submit_uses_afterok_lane_dependencies_and_resumes(tmp_path, monkeypatch
     monkeypatch.setenv("LP_MATRIX_PILOTS_REVIEWED", "1")
     monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output", fake_sbatch)
     manifest = tmp_path / "jobs.json"
+    stage_a = {"s01_w4", "s01_lp_2p2"}
+    first = submit(report, tmp_path / "run_point.sbatch", manifest, selected=stage_a)
+    assert first["status"] == "submitted" and set(first["job_ids"]) == stage_a
     completed = submit(report, tmp_path / "run_point.sbatch", manifest)
     assert completed["status"] == "submitted" and len(completed["job_ids"]) == 12
     assert len(commands) == 12
-    assert "--dependency=afterok:1001" in commands[1]
-    assert "--dependency=afterok:1004" in commands[4]
-    assert "--dependency=afterany:1003" in commands[6]
+    assert any("--dependency=afterok:1001" in command for command in commands)
+    assert all(not any("--dependency" in part for part in command)
+               for command in commands if any("LP_MATRIX_ID=s01_w4" in part or
+                   "LP_MATRIX_ID=r02_w4" in part for part in command))
     assert submit(report, tmp_path / "run_point.sbatch", manifest) == completed
     assert len(commands) == 12
     assert json.loads(manifest.read_text())["job_ids"] == completed["job_ids"]
-    three = plan(tmp_path, "a" * 40, slots=3)
-    other = submit(three, tmp_path / "run_point.sbatch", tmp_path / "three.json")
-    assert other["max_concurrent_gpu_jobs"] == 3
-    assert len(other["job_ids"]) == 12
-    assert {point["lane"] for point in other["points"]} == {0, 1, 2}
-    assert "--dependency=afterok:1013" in commands[13]
-    assert "--dependency=afterany:1019" in commands[19]
+
+
+def test_partial_submission_respects_fourteen_account_jobs(tmp_path, monkeypatch):
+    report = plan(tmp_path, "a" * 40)
+    submitted = []
+    active = [str(i) for i in range(13)]
+    def fake(command, *, text):
+        if command[0] == "squeue":
+            return "\n".join(active)
+        submitted.append(command)
+        return str(2000 + len(submitted))
+    monkeypatch.setenv("LP_MATRIX_SUBMIT", "1")
+    monkeypatch.setenv("LP_MATRIX_PILOTS_REVIEWED", "1")
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output", fake)
+    output = tmp_path / "jobs.json"
+    partial = submit(report, tmp_path / "job.sbatch", output)
+    assert partial["status"] == "partially_submitted"
+    assert len(partial["job_ids"]) == 1
+    assert len(submitted) == 1
+    active.clear()
+    complete = submit(report, tmp_path / "job.sbatch", output)
+    assert complete["status"] == "submitted"
+    assert len(complete["job_ids"]) == 12
+    assert len(submitted) == 12
+
+
+def test_full_account_and_unresolved_intent_fail_closed(tmp_path, monkeypatch):
+    report = plan(tmp_path, "a" * 40)
+    calls = []
+    active = [str(i) for i in range(14)]
+    def fake(command, *, text):
+        if command[0] == "squeue":
+            return "\n".join(active)
+        calls.append(command)
+        return "3001"
+    monkeypatch.setenv("LP_MATRIX_SUBMIT", "1")
+    monkeypatch.setenv("LP_MATRIX_PILOTS_REVIEWED", "1")
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output", fake)
+    output = tmp_path / "jobs.json"
+    first = submit(report, tmp_path / "job.sbatch", output)
+    assert first["status"] == "partially_submitted" and not calls
+    active.clear()
+    intent = output.with_name(output.name + ".intents") / "s01_lp_2p2.json"
+    intent.parent.mkdir(parents=True)
+    intent.write_text('{"status":"submission_in_progress"}')
+    with pytest.raises(FileExistsError, match="Unresolved Slurm submission"):
+        submit(report, tmp_path / "job.sbatch", output)
+    assert not calls
 
 
 def test_prior_lp_pilot_acceptance_is_exact_and_requires_unchanged_code(monkeypatch):
@@ -135,7 +181,18 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
             "corpus": {"token_sha256": "8ffcee84dd4b684ec631cb52845e18c9c181ce6fdb8b26d65a4ffdc3d35fbda3",
                        "scored_tokens": 298862}, "evaluation": {"perplexity": ppl}}))
     from lp_llm.quantizer_followups import PR_COMMIT
-    recipes = {f"{branch}_w{bits}": {} for branch in ("s01", "r02") for bits in (4, 6, 8)}
+    recipes = {f"{branch}_w{bits}": {"branch": branch, "bits": bits,
+        "group_size": 128, "sym": branch == "s01",
+        "algorithm_class": "SignRoundV2Config" if branch == "s01" else "OptimizedRTNConfig",
+        "quantizer_class": "SignRoundV2Quantizer" if branch == "s01" else "OptimizedRTNQuantizer",
+        "iterations": 200 if branch == "s01" else 0,
+        "enable_neuqi": branch == "r02",
+        "selected_quant_function": "opt_rtn_int_asym" if branch == "r02" else None,
+        "function_name": "quant_tensor_opt_rtn_asym" if branch == "r02" else None,
+        "neuqi_grid": {"coarse": 256, "fine": 64} if branch == "r02" else None,
+        "calibration": {"dataset": "NeelNanda/pile-10k", "nsamples": 128,
+                        "seqlen": 2048, "batch_size": 8, "seed": 42}}
+        for branch in ("s01", "r02") for bits in (4, 6, 8)}
     (pilots / f"control_support_{proposed}.json").write_text(json.dumps({
         "status": "control_dispatch_verified", "code_sha": proposed,
         "upstream_revision": PR_COMMIT, "upstream_checkout": str(checkout),
@@ -147,7 +204,8 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
             (pilots / f"{branch}_w{bits}.json").write_text(json.dumps({
                 "status": "control_layer_pilot_validated", "branch": branch,
                 "bits": bits, "code_sha": proposed, "source": {"test": True},
-                "recipe": {}, "reference_module": str(checkout / "auto_round/__init__.py"),
+                "recipe": recipes[f"{branch}_w{bits}"],
+                "reference_module": str(checkout / "auto_round/__init__.py"),
                 "projection_count": 7,
                 "traversal_metadata_status": "available",
                 "traversed_transformer_blocks": [f"model.layers.{i}" for i in range(36)],
@@ -173,6 +231,9 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
                   traversed_transformer_blocks=None,
                   traversed_transformer_block_count=None)
     absent_path.write_text(json.dumps(absent))
+    for branch in ("s01", "r02"):
+        for bits in (4, 6, 8):
+            (pilots / f"{branch}_w{bits}.json").unlink()
     preflight = '''from pathlib import Path
 from unittest.mock import patch
 from lp_llm import progressive_plan as p
@@ -198,13 +259,6 @@ print("ARCHIVED_PREFLIGHT_VALIDATED")
     assert preflight_result.returncode == 0, preflight_result.stderr
     assert "ARCHIVED_PREFLIGHT_VALIDATED" in preflight_result.stdout
     assert (pilots / f"lp_cross_commit_acceptance_{proposed}.json").is_file()
-    invalid = dict(absent, unselected_projection_source_exact_count=244)
-    absent_path.write_text(json.dumps(invalid))
-    rejected_weights = subprocess.run([sys.executable, str(script), str(result_root),
-        str(checkout), proposed], cwd=staged, env=environment, text=True,
-        capture_output=True, check=False)
-    assert rejected_weights.returncode != 0
-    assert "invalid s01_w4 control layer pilot" in rejected_weights.stderr
     lp_file = staged / "lp_llm/progressive_lp.py"
     lp_file.write_bytes(lp_file.read_bytes() + b"\n# tampered staged code\n")
     rejected = subprocess.run([sys.executable, "-c", code], cwd=staged, env=environment,

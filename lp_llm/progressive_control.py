@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,7 @@ def validate_control(source: Path, export_root: Path, bits: int,
     if set(source_map) != set(output_map):
         raise ValueError("Control tensor inventory differs from source")
     changed, excluded = sampled_groups = 0, 0, 0
+    squared_error = source_energy = projection_elements = 0
     projection_hashes = {}
     for name in sorted(source_map):
         with safe_open(source / source_map[name], framework="pt", device="cpu") as handle:
@@ -67,6 +69,12 @@ def validate_control(source: Path, export_root: Path, bits: int,
                             raise ValueError(f"Control group exceeds W{bits} grid: {name}")
                         sampled_groups += 1
             changed += 1
+            for first in range(0, value.shape[0], 64):
+                left = original[first:first + 64].float()
+                delta = value[first:first + 64].float() - left
+                squared_error += float(delta.double().square().sum())
+                source_energy += float(left.double().square().sum())
+                projection_elements += delta.numel()
             projection_hashes[name] = _tensor_hash(checkpoint / output_map[name], name)
         else:
             if not torch.equal(value, original):
@@ -78,6 +86,11 @@ def validate_control(source: Path, export_root: Path, bits: int,
               "source_exact_excluded_tensor_count": excluded,
               "projection_tensor_sha256": projection_hashes,
               "sampled_group_grid_checks": sampled_groups,
+              "distortion": {"mse_fp32": squared_error / projection_elements,
+                  "normalized_mse_fp32": squared_error / source_energy if source_energy else None,
+                  "sqnr_db_fp32": 10 * math.log10(source_energy / squared_error)
+                  if squared_error and source_energy else None,
+                  "projection_elements": projection_elements},
               "nominal_projection_bits": bits,
               "actual_checkpoint_file_bytes": sum(path.stat().st_size for path in checkpoint.iterdir()
                                                   if path.is_file()),

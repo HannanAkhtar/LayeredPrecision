@@ -81,9 +81,12 @@ def valid_control_traversal(control: dict) -> bool:
                 for block in blocks) and len(blocks) == len(set(blocks)) == count)
 
 
+MAX_ACTIVE_JOBS = 14
+
+
 def points(root: Path, slots: int) -> list[dict]:
-    if slots not in (2, 3):
-        raise ValueError("Concurrency cap must be 2 or 3")
+    if not 1 <= slots <= MAX_ACTIVE_JOBS:
+        raise ValueError("Maximum active jobs must be between 1 and 14")
     result = []
     for branch in BRANCHES:
         predecessor = None
@@ -103,9 +106,6 @@ def points(root: Path, slots: int) -> list[dict]:
                            "bits": bits, "predecessor": None,
                            "output": str(root / "progressive_llm/controls" / name),
                            "stage": "encode_validate_evaluate"})
-    for point in result:
-        point["lane"] = (0 if point["branch"] == "s01" else 1) if slots == 2 else (
-            2 if point["kind"] == "control" else 0 if point["branch"] == "s01" else 1)
     assert len(result) == 12 and len({p["id"] for p in result}) == 12
     return result
 
@@ -171,64 +171,26 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
             set(support.get("recipes", {})) !=
             {f"{branch}_w{bits}" for branch in BRANCHES for bits in (4, 6, 8)}):
         raise ValueError("Six pinned monolithic-control dispatches are not verified")
-    reports["control_support"] = str(support_path)
-    source_files = _files(source)
     for branch in BRANCHES:
         for bits in (4, 6, 8):
-            name = f"{branch}_w{bits}"
-            path = result_root / "progressive_llm/pilots" / f"{name}.json"
-            control = json.loads(path.read_text())
-            if (control.get("status") != "control_layer_pilot_validated" or
-                    control.get("branch") != branch or control.get("bits") != bits or
-                    control.get("code_sha") != code_sha or control.get("source") != source_files or
-                    control.get("recipe") != support["recipes"][name] or
-                    not Path(control.get("reference_module", "")).resolve().is_relative_to(
-                        Path(support.get("upstream_checkout", "/nonexistent")).resolve()) or
-                    control.get("projection_count") != 7 or
-                    not valid_control_traversal(control) or
-                    control.get("quantized_projection_count") != 7 or
-                    control.get("quantized_projection_names") !=
-                    sorted(control.get("projections", {})) or
-                    control.get("unselected_projection_source_exact_count") != 245 or
-                    set(control.get("projections", {})) != {
-                        f"model.layers.0.{part}.weight" for part in
-                        ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
-                         "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
-                    } or
-                    any(item.get("changed_elements", 0) <= 0 or
-                        item.get("elements", 0) < item.get("changed_elements", 0) or
-                        not 1 <= item.get("sampled_group_levels", 0) <= 1 << bits
-                        for item in control.get("projections", {}).values()) or
-                    control.get("gpu_peak_reserved_bytes", 0) <= 0 or
-                    control.get("process_peak_rss_kib", 0) <= 0 or
-                    max(control.get("process_peak_rss_kib", 0) * 1024,
-                        control.get("slurm_cgroup_peak_bytes", 0)) >=
-                    control.get("host_allocation_bytes", 0) * 0.9 or
-                    control.get("slurm_cgroup_peak_bytes", 0) <= 0 or
-                    control.get("slurm_cgroup_peak_source") not in (
-                        "cgroup_v2_memory.peak", "cgroup_v1_memory.max_usage_in_bytes") or
-                    control.get("after_quantization_cgroup_peak_bytes", 0) <= 0 or
-                    control.get("after_quantization_cgroup_peak_bytes", 0) >
-                    control.get("slurm_cgroup_peak_bytes", 0) or
-                    control.get("after_quantization_process_peak_rss_kib", 0) <= 0 or
-                    control.get("after_quantization_process_peak_rss_kib", 0) >
-                    control.get("process_peak_rss_kib", 0) or
-                    control.get("host_allocation_bytes", 0) < 14 * 1024**3 or
-                    control.get("host_peak_used_for_headroom_bytes") != max(
-                        control.get("process_peak_rss_kib", 0) * 1024,
-                        control.get("slurm_cgroup_peak_bytes", 0)) or
-                    control.get("host_memory_headroom_bytes") != (
-                        control.get("host_allocation_bytes", 0) -
-                        control.get("host_peak_used_for_headroom_bytes", 0)) or
-                    control.get("host_memory_10pct_headroom_passed") is not True or
-                    control.get("gpu_peak_reserved_bytes", 0) >=
-                    control.get("gpu_total_bytes", 0) * 0.9 or
-                    control.get("host_allocation_bytes", 0) <= 0 or
-                    control.get("gpu_total_bytes", 0) <= 0):
-                raise ValueError(f"Unreviewed or invalid {name} control layer pilot")
-            reports[name] = {"process_peak_rss_kib": control["process_peak_rss_kib"],
-                             "gpu_peak_reserved_bytes": control["gpu_peak_reserved_bytes"],
-                             "report": str(path)}
+            recipe = support["recipes"][f"{branch}_w{bits}"]
+            if (recipe.get("branch") != branch or recipe.get("bits") != bits or
+                    recipe.get("group_size") != 128 or
+                    recipe.get("sym") is not (branch == "s01") or
+                    recipe.get("algorithm_class") !=
+                    ("SignRoundV2Config" if branch == "s01" else "OptimizedRTNConfig") or
+                    recipe.get("quantizer_class") !=
+                    ("SignRoundV2Quantizer" if branch == "s01" else "OptimizedRTNQuantizer") or
+                    recipe.get("iterations") != (200 if branch == "s01" else 0) or
+                    recipe.get("enable_neuqi") is not (branch == "r02") or
+                    recipe.get("calibration") != {"dataset": "NeelNanda/pile-10k",
+                        "nsamples": 128, "seqlen": 2048, "batch_size": 8, "seed": 42} or
+                    (branch == "r02" and (recipe.get("selected_quant_function") !=
+                        "opt_rtn_int_asym" or recipe.get("function_name") !=
+                        "quant_tensor_opt_rtn_asym" or recipe.get("neuqi_grid") !=
+                        {"coarse": 256, "fine": 64}))):
+                raise ValueError("Pinned full-control recipe support audit differs")
+    reports["control_support"] = str(support_path)
     if any(reports[branch]["cross_commit_acceptance"] for branch in BRANCHES):
         acceptance = {"status": "prior_lp_pilots_validated", "current_code_sha": code_sha,
             "prior_code_sha": LP_PILOT_PREVIOUS_SHA,
@@ -242,24 +204,31 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
     return reports
 
 
-def plan(root: Path, code_sha: str, *, slots: int = 2) -> dict:
+verify_prerequisites = verify_pilots  # Historical LP pilots remain required; control pilots do not.
+
+
+def plan(root: Path, code_sha: str, *, slots: int = MAX_ACTIVE_JOBS) -> dict:
     if not re.fullmatch(r"[0-9a-f]{40}", code_sha):
         raise ValueError("Invalid pinned code SHA")
     return {"status": "dry_run_not_submitted", "code_sha": code_sha,
             "quota_status": quota_status(),
-            "max_concurrent_gpu_jobs": slots, "qos_submit_jobs_count": 12,
+            "max_concurrent_gpu_jobs": slots, "max_account_active_jobs": MAX_ACTIVE_JOBS,
+            "qos_submit_jobs_count": 12,
             "point_count": 12, "points": points(root, slots),
-            "dependency_rule": "afterok scientific LP predecessor; afterany scheduling-only lane predecessor"}
+            "dependency_rule": "afterok scientific LP predecessor only"}
 
 
-def submit(manifest: dict, script: Path, output: Path) -> dict:
+def _submit(manifest: dict, script: Path, output: Path,
+            *, selected: set[str] | None = None) -> dict:
     if (os.environ.get("LP_MATRIX_SUBMIT") != "1" or
             os.environ.get("LP_MATRIX_PILOTS_REVIEWED") != "1"):
         raise ValueError("LP_MATRIX_SUBMIT=1 and LP_MATRIX_PILOTS_REVIEWED=1 are required")
     submitted = dict(manifest)
     submitted["status"] = "submitting"
     job_ids = {}
-    lane_last = {}
+    all_ids = {point["id"] for point in manifest["points"]}
+    if selected is not None and (not selected or not selected <= all_ids):
+        raise ValueError("Unknown or empty matrix point selection")
     if output.exists():
         previous = json.loads(output.read_text())
         if previous.get("code_sha") != manifest["code_sha"] or previous.get("points") != manifest["points"]:
@@ -268,38 +237,58 @@ def submit(manifest: dict, script: Path, output: Path) -> dict:
         if not isinstance(job_ids, dict) or any(not re.fullmatch(r"[0-9]+", str(v)) for v in job_ids.values()):
             raise ValueError("Existing matrix job IDs are invalid")
     submitted["job_ids"] = job_ids
+    newly_submitted: set[str] = set()
     for point in manifest["points"]:
+        if selected is not None and point["id"] not in selected:
+            continue
         predecessor = point["predecessor"]
-        scientific = {job_ids[predecessor]} if predecessor else set()
-        scheduling = set()
-        lane = point["lane"]
-        if lane in lane_last:
-            if lane_last[lane] not in scientific:
-                scheduling.add(lane_last[lane])
+        if predecessor and predecessor not in job_ids:
+            continue  # A later resume can submit it after the predecessor is recorded.
         if point["id"] not in job_ids:
+            if Path(point["output"]).exists():
+                raise FileExistsError(f"Untracked point output requires inspection: {point['id']}")
+            intent = output.with_name(output.name + ".intents") / (point["id"] + ".json")
+            if intent.exists():
+                raise FileExistsError(f"Unresolved Slurm submission requires inspection: {intent}")
+            active = {line.strip() for line in subprocess.check_output(
+                ["squeue", "-h", "-r", "-A", "acc-makhtar", "-o", "%i"],
+                text=True).splitlines() if line.strip()}
+            if len(active | newly_submitted) >= min(MAX_ACTIVE_JOBS,
+                    manifest["max_concurrent_gpu_jobs"]):
+                break
             command = ["sbatch", "--parsable",
                 "--export=ALL,LP_MATRIX_ID=" + point["id"] +
                 ",FOLLOWUP_CODE_SHA=" + manifest["code_sha"] +
                 ",LP_MATRIX_ALLOW=1,LP_MATRIX_SLOTS=" + str(manifest["max_concurrent_gpu_jobs"])]
-            dependencies = []
-            if scientific:
-                dependencies.append("afterok:" + ":".join(sorted(scientific)))
-            if scheduling:
-                dependencies.append("afterany:" + ":".join(sorted(scheduling)))
-            if dependencies:
-                command.append("--dependency=" + ",".join(dependencies))
+            if predecessor:
+                command.append("--dependency=afterok:" + job_ids[predecessor])
             command.append(str(script))
+            atomic_json(intent, {"status": "submission_in_progress", "point": point["id"],
+                                 "code_sha": manifest["code_sha"], "command": command})
             response = subprocess.check_output(command, text=True).strip()
             job_id = response.split(";")[0]
             if not re.fullmatch(r"[0-9]+", job_id):
                 raise ValueError(f"Unexpected sbatch job ID: {response}")
             job_ids[point["id"]] = job_id
+            newly_submitted.add(job_id)
             submitted["job_ids"] = job_ids
             atomic_json(output, submitted)
-        lane_last[lane] = job_ids[point["id"]]
-    submitted["status"] = "submitted"
+            intent.unlink()
+    target = selected if selected is not None else all_ids
+    submitted["status"] = "submitted" if target <= set(job_ids) else "partially_submitted"
     atomic_json(output, submitted)
     return submitted
+
+
+def submit(manifest: dict, script: Path, output: Path,
+           *, selected: set[str] | None = None) -> dict:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lock = output.with_name(output.name + ".submit.lock")
+    lock.mkdir()  # Atomic across the shared filesystem; a stale lock fails closed.
+    try:
+        return _submit(manifest, script, output, selected=selected)
+    finally:
+        lock.rmdir()
 
 
 def admit_submission(source: Path, result_root: Path, slots: int) -> dict:
@@ -326,18 +315,21 @@ def admit_submission(source: Path, result_root: Path, slots: int) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("dry-run", "verify-pilots", "submit"))
+    parser.add_argument("action", choices=("dry-run", "verify-pilots",
+                                           "verify-prerequisites", "submit"))
     parser.add_argument("--source", type=Path)
     parser.add_argument("--code-repo", type=Path,
                         help="Trusted original Git checkout, required for pilot verification")
     parser.add_argument("--result-root", type=Path, required=True)
     parser.add_argument("--code-sha", required=True)
-    parser.add_argument("--slots", type=int, choices=(2, 3), default=2)
+    parser.add_argument("--slots", type=int, default=MAX_ACTIVE_JOBS,
+                        help="Maximum active account jobs, 1 through 14")
+    parser.add_argument("--only", nargs="+", help="Submit only these matrix point IDs")
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--script", type=Path,
                         default=Path("hpc/progressive_llm/run_point.sbatch"))
     args = parser.parse_args()
-    if args.action == "verify-pilots":
+    if args.action in ("verify-pilots", "verify-prerequisites"):
         if args.source is None or args.code_repo is None:
             parser.error("verify-pilots requires --source and --code-repo")
         print(json.dumps(verify_pilots(args.source, args.result_root, args.code_sha,
@@ -353,12 +345,8 @@ def main() -> None:
         if actual != args.code_sha:
             raise ValueError("Submission code SHA differs from current checkout")
         prior = json.loads(args.manifest.read_text()) if args.manifest.is_file() else {}
-        remaining = 12 - len(prior.get("job_ids", {}))
-        existing_jobs = subprocess.check_output(["squeue", "-h", "-u",
-            os.environ["USER"], "-o", "%i"], text=True).splitlines()
-        if len(existing_jobs) + remaining > 15:
-            raise ValueError("QoS GrpSubmitJobs=15 would be exceeded by this submission")
-        manifest = submit(manifest, args.script, args.manifest)
+        manifest = submit(manifest, args.script, args.manifest,
+                          selected=set(args.only) if args.only else None)
     elif args.manifest:
         if args.manifest.exists():
             previous = json.loads(args.manifest.read_text())

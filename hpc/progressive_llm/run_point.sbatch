@@ -26,7 +26,32 @@ export FOLLOWUP_CODE_SHA
 [[ "$FOLLOWUP_CODE_SHA" =~ ^[0-9a-f]{40}$ && -x "$LP_PYTHON" ]] || { echo 'ERROR: code SHA or LP Python invalid' >&2; exit 1; }
 git -C "$LP_CODE" cat-file -e "$FOLLOWUP_CODE_SHA^{commit}"
 CODE_STAGE=$(mktemp -d "${SLURM_TMPDIR:-/tmp}/lp-matrix-${SLURM_JOB_ID:-manual}.XXXXXXXX")
-trap 'rm -rf -- "$CODE_STAGE"' EXIT
+RESOURCE_DIR="$RESULT_ROOT/progressive_llm/job_resources"
+TIME_DIR="$CODE_STAGE/resource_times"
+mkdir -p "$RESOURCE_DIR" "$TIME_DIR"
+[[ -x /usr/bin/time ]] || { echo 'ERROR: /usr/bin/time is required for peak RSS' >&2; exit 1; }
+finish() {
+  status=$?
+  trap - EXIT
+  set +e
+  "$LP_PYTHON" -m lp_llm.progressive_job_resources \
+    --output "$RESOURCE_DIR/$LP_MATRIX_ID-${SLURM_JOB_ID}.json" \
+    --time-dir "$TIME_DIR" --job-id "${SLURM_JOB_ID:-}" \
+    --allocation-mib "${SLURM_MEM_PER_NODE:-0}" --exit-code "$status" --point "$LP_MATRIX_ID"
+  measured=$?
+  rm -rf -- "$CODE_STAGE"
+  if (( measured != 0 && status == 0 )); then status=$measured; fi
+  if (( status == 0 )); then
+    echo "[LP MATRIX POINT VALIDATED] id=$LP_MATRIX_ID commit=$FOLLOWUP_CODE_SHA"
+  fi
+  exit "$status"
+}
+trap finish EXIT
+measure() {
+  stage=$1
+  shift
+  /usr/bin/time -f '%M' -o "$TIME_DIR/$stage.rss_kib" "$@"
+}
 git -C "$LP_CODE" archive --format=tar --output="$CODE_STAGE/code.tar" "$FOLLOWUP_CODE_SHA"
 tar -xf "$CODE_STAGE/code.tar" -C "$CODE_STAGE"
 rm -- "$CODE_STAGE/code.tar"
@@ -34,8 +59,8 @@ export PYTHONPATH="$CODE_STAGE${PYTHONPATH:+:$PYTHONPATH}"
 cd "$CODE_STAGE"
 "$LP_PYTHON" -m lp_llm.progressive_resources --source "$LP_SOURCE" \
   --shared "$RESULT_ROOT" --scratch "$CODE_STAGE" --mode point \
-  --slots "${LP_MATRIX_SLOTS:-2}" --strict
-"$LP_PYTHON" -m lp_llm.progressive_plan verify-pilots --source "$LP_SOURCE" \
+  --slots "${LP_MATRIX_SLOTS:-14}" --strict
+"$LP_PYTHON" -m lp_llm.progressive_plan verify-prerequisites --source "$LP_SOURCE" \
   --result-root "$RESULT_ROOT" --code-sha "$FOLLOWUP_CODE_SHA" --code-repo "$LP_CODE"
 mkdir -p "$RESULT_ROOT/progressive_llm/.locks"
 exec 9>"$RESULT_ROOT/progressive_llm/.locks/$LP_MATRIX_ID.lock"
@@ -47,9 +72,9 @@ case "$LP_MATRIX_ID" in
     base="$RESULT_ROOT/quantizer_followups/${branch}_fp16_load_repair/export"
     root="$RESULT_ROOT/progressive_llm/$branch"
     result="$RESULT_ROOT/progressive_llm/evaluation/$LP_MATRIX_ID"
-    "$LP_PYTHON" -m lp_llm.progressive_run encode --branch "$branch" --depth "$depth" \
+    measure encode "$LP_PYTHON" -m lp_llm.progressive_run encode --branch "$branch" --depth "$depth" \
       --source "$LP_SOURCE" --base "$base" --root "$root"
-    "$LP_PYTHON" -m lp_llm.progressive_run evaluate --branch "$branch" --depth "$depth" \
+    measure evaluate "$LP_PYTHON" -m lp_llm.progressive_run evaluate --branch "$branch" --depth "$depth" \
       --source "$LP_SOURCE" --base "$base" --root "$root" \
       --result "$result" --matgptq "$MATGPTQ_SOURCE"
     ;;
@@ -57,13 +82,12 @@ case "$LP_MATRIX_ID" in
     branch="${LP_MATRIX_ID%%_*}"
     bits="${LP_MATRIX_ID##*w}"
     result="$RESULT_ROOT/progressive_llm/controls/$LP_MATRIX_ID"
-    "$LP_PYTHON" -m lp_llm.progressive_control --branch "$branch" --bits "$bits" \
+    measure encode "$LP_PYTHON" -m lp_llm.progressive_control --branch "$branch" --bits "$bits" \
       --source "$LP_SOURCE" --result "$result" --checkout "$RRQ_PR_SOURCE" \
       --matgptq "$MATGPTQ_SOURCE" --stage encode
-    "$LP_PYTHON" -m lp_llm.progressive_control --branch "$branch" --bits "$bits" \
+    measure evaluate "$LP_PYTHON" -m lp_llm.progressive_control --branch "$branch" --bits "$bits" \
       --source "$LP_SOURCE" --result "$result" --checkout "$RRQ_PR_SOURCE" \
       --matgptq "$MATGPTQ_SOURCE" --stage evaluate
     ;;
   *) echo "ERROR: unknown matrix point $LP_MATRIX_ID" >&2; exit 1;;
 esac
-echo "[LP MATRIX POINT VALIDATED] id=$LP_MATRIX_ID commit=$FOLLOWUP_CODE_SHA"
