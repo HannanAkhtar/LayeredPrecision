@@ -4,7 +4,7 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=12G
+#SBATCH --mem=15G
 #SBATCH --time=12:00:00
 #SBATCH --output=/shared/makhtar/lp_llm/logs/%x-%j.out
 set -euo pipefail

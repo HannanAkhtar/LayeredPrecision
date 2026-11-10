@@ -96,7 +96,9 @@ def assess(source: Path, shared: Path, scratch: Path, *, mode: str = "matrix",
     checks = {"shared_filesystem_floor": shared_free >= floor,
               "site_confirmed_shared_quota": allow_unknown or (quota_bytes is not None and quota_bytes >= floor),
               "local_scratch_2_gib": scratch_free >= 2 * GIB,
-              "host_allocation_12_gib": host_limit_bytes >= 12 * GIB,
+              "host_allocation_15_gib" if mode in ("matrix", "point") else
+              "host_allocation_12_gib": host_limit_bytes >=
+              (15 if mode in ("matrix", "point") else 12) * GIB,
               "a10g_free_20_gib": gpu_free_bytes >= 20 * GIB}
     if mode == "control_pilot":
         checks["control_host_allocation_14_gib"] = host_limit_bytes >= 14 * GIB

@@ -358,3 +358,26 @@ def test_resolved_control_rejects_changed_calibration_or_quantizer(tmp_path):
         path.write_text(json.dumps(changed))
         with pytest.raises(ValueError, match="resolved recipe"):
             progressive_control._resolved_matches(path, "r02", 6, checkout)
+def test_validate_control_checks_all_projections_and_exclusion(tmp_path, monkeypatch):
+    import torch
+    from safetensors.torch import save_file
+    from lp_llm import progressive_control as control
+    source, export = tmp_path / "source", tmp_path / "export"
+    source.mkdir(); export.mkdir()
+    names = [f"model.layers.{i}.self_attn.q_proj.weight" for i in range(252)]
+    original = {name: torch.ones((1, 128), dtype=torch.float16) for name in names}
+    original["model.layers.0.input_layernorm.weight"] = torch.ones(1, dtype=torch.float16)
+    changed = {name: tensor.clone() for name, tensor in original.items()}
+    for name in names:
+        changed[name][0, 0] = 2
+    save_file(original, str(source / "model.safetensors"))
+    save_file(changed, str(export / "model.safetensors"))
+    mapping = {name: "model.safetensors" for name in original}
+    monkeypatch.setattr(control, "validate_output", lambda *_:
+                        {"resolved_checkpoint_path": str(export)})
+    monkeypatch.setattr(control, "_weight_map", lambda *_: mapping)
+    monkeypatch.setattr(control, "_eligible", lambda name: name in names)
+    result = control.validate_control(source, export, 4)
+    assert result["quantized_projection_count"] == 252
+    assert result["source_exact_excluded_tensor_count"] == 1
+    assert len(result["projection_tensor_sha256"]) == 252

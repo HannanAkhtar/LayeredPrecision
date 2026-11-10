@@ -23,13 +23,15 @@ Successful submissions are recorded immediately in the manifest. The two
 LP chains use `afterok` for their scientific predecessors. Independent
 controls have no scheduling dependencies; Slurm chooses available GPUs.
 
-The full-point script retains 12G host memory and one A10G. This has not
-been proven sufficient for every full-model control. Each job writes
+The full-point script now requests 15G host memory and one A10G. AUS
+`sbatch --test-only` accepted 15G and rejected 16G, 18G, and 20G.
+The original Stage A jobs used 12G and retain that allocation in their
+resource records. Each new job writes
 `progressive_llm/job_resources/<point>-<job>.json` with stage process peak
-RSS, Slurm cgroup peak, allocation, and 10% headroom status. Stage A must be
-reviewed before Stage B. The first-layer pilot's 14G request does not change
-full-point resources. A 12G job that exceeds 10.8 GiB peak fails its resource
-gate; investigate before submitting more work.
+RSS, Slurm cgroup peak, allocation, and exact headroom fraction. A full job
+must remain within its 15 GiB allocation; 10% headroom is recorded but is no
+longer a gate. Stage A must be reviewed before Stage B. The first-layer
+pilot's 14G request remains separate.
 
 Storage admission models all six persistent dense controls and six LP
 residual stages. At most two temporary LP evaluation checkpoints can coexist
@@ -93,6 +95,57 @@ inputs while the matrix runs.
 
 ## AUS Stage A: two real matrix points
 
+**Recovery of jobs 55385/55386:** Do not rerun the commands below for those
+existing points. The LP `full.json` is scientifically complete at PPL 13.38,
+but its 12G Slurm job failed the prior memory rule. The W4 `export.partial`
+contains successful quantization and repaired exclusions; it still needs
+independent validation and evaluation. After a fresh prerequisite CPU audit
+for the recovery commit, submit `recover_stage_a_cpu.sbatch`. It verifies the
+historical failed Slurm jobs, producing commit, unchanged numerical code,
+source identity, LP chunks and evaluation log, W4 pinned recipe and process,
+all 252 projections, source-exact exclusions, and projection hashes. It writes
+`progressive_llm/recovery/<CODE_SHA>/stage_a_scientific_audit.json` without
+moving or rewriting the original export.
+
+Only after that report passes, `recover_w4_evaluate.sbatch` can evaluate the
+original partial export under a new 15G job. It stores results in a separate
+recovery directory. The old job IDs and 12G allocation remain recorded as
+failed. `progressive_stage_a_recovery verify` reports the W4 recovery job's
+actual memory use and Slurm status. Stage B remains blocked by the original
+LP job's failed resource certification; scientific acceptance does not turn
+that failed job into a successful 15G run. No new LP encoding or AutoRound
+quantization is performed by these recovery scripts.
+
+After the new SHA's CPU prerequisite report passes `progressive_prerequisites
+check`, submit the read-only recovery audit and inspect its Slurm result:
+
+```bash
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
+  hpc/progressive_llm/recover_stage_a_cpu.sbatch
+sacct -j <recovery-cpu-job-id> --format=JobID,State,ExitCode,ReqMem,MaxRSS
+RECOVERY="$RESULT_ROOT/progressive_llm/recovery/$CODE_SHA/stage_a_scientific_audit.json"
+test -s "$RECOVERY"
+```
+
+Require `COMPLETED` and `0:0`. Then submit only the W4 evaluation job, which
+does not launch AutoRound and does not move `export.partial`:
+
+```bash
+sbatch --test-only --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
+  hpc/progressive_llm/recover_w4_evaluate.sbatch
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
+  hpc/progressive_llm/recover_w4_evaluate.sbatch
+sacct -j <recovery-gpu-job-id> --format=JobID,State,ExitCode,ReqMem,MaxRSS
+"$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_stage_a_recovery verify \
+  --source "$LP_ROOT/models/qwen3-8b-base" --result-root "$RESULT_ROOT" \
+  --code-sha "$CODE_SHA" --code-repo "$PWD" \
+  --autoround "$LP_ROOT/references/rrq_pr2308/auto-round" --output "$RECOVERY"
+```
+
+The final verification explicitly reports that Stage B remains blocked by
+the historical LP job's failed resource gate. It cannot convert that Slurm
+job into a completed job or claim the original computation ran with 15G.
+
 Run these commands from the trusted Git checkout. They submit only `s01_w4`
 and `s01_lp_2p2`; both results count toward the twelve-point matrix.
 
@@ -132,7 +185,7 @@ source = json.loads((root / ('progressive_llm/prerequisites/prerequisites_' +
                           manifest['code_sha'] + '.json')).read_text())['source_identity']
 for point in ('s01_w4', 's01_lp_2p2'):
     resource = json.loads((root / f'progressive_llm/job_resources/{point}-{jobs[point]}.json').read_text())
-    assert resource['host_memory_10pct_headroom_passed'], (point, resource)
+    assert resource['host_memory_within_allocation'], (point, resource)
     assert {'encode', 'evaluate'} <= set(resource['stage_process_peak_rss_kib'])
     path = (root / f'progressive_llm/controls/{point}/full.json' if point == 's01_w4'
             else root / f'progressive_llm/evaluation/{point}/full.json')

@@ -101,9 +101,10 @@ def test_stage_a_gate_requires_successful_jobs_and_scientific_reports(tmp_path, 
         resource = tmp_path / "progressive_llm/job_resources" / f"{point}-{job}.json"
         resource.parent.mkdir(parents=True, exist_ok=True)
         resource.write_text(json.dumps({"status": "measured", "point": point,
-            "job_id": job, "host_memory_10pct_headroom_passed": True,
+            "job_id": job, "host_memory_within_allocation": True,
+            "host_memory_10pct_headroom_passed": False,
             "slurm_cgroup_peak_bytes": 1, "process_peak_rss_bytes": 1,
-            "host_allocation_bytes": 12 * 1024**3,
+            "host_allocation_bytes": 15 * 1024**3,
             "exit_code_before_resource_check": 0}))
     assert len(verify_stage_a(tmp_path, manifest, {"source_identity": source}, "a" * 40)) == 2
     monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output",

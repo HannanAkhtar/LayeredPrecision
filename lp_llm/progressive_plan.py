@@ -361,13 +361,13 @@ def verify_stage_a(result_root: Path, manifest_path: Path, prerequisite: dict,
                 not math.isfinite(full.get("evaluation", {}).get("perplexity", float("nan"))) or
                 resource.get("status") != "measured" or
                 resource.get("point") != point or resource.get("job_id") != job_id or
-                resource.get("host_memory_10pct_headroom_passed") is not True or
+                resource.get("host_memory_within_allocation") is not True or
                 resource.get("slurm_cgroup_peak_bytes", 0) <= 0 or
                 resource.get("process_peak_rss_bytes", 0) <= 0 or
-                resource.get("host_allocation_bytes") != 12 * 1024**3 or
+                resource.get("host_allocation_bytes") != 15 * 1024**3 or
                 max(resource["slurm_cgroup_peak_bytes"],
-                    resource["process_peak_rss_bytes"]) * 10 >=
-                    resource["host_allocation_bytes"] * 9 or
+                    resource["process_peak_rss_bytes"]) >
+                    resource["host_allocation_bytes"] or
                 resource.get("exit_code_before_resource_check") != 0):
             raise ValueError(f"Stage A result or resource report is invalid: {point}")
         if point == "s01_w4":

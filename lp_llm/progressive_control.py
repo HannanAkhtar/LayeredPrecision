@@ -45,7 +45,7 @@ def validate_control(source: Path, export_root: Path, bits: int,
     source_map, output_map = _weight_map(source), _weight_map(checkpoint)
     if set(source_map) != set(output_map):
         raise ValueError("Control tensor inventory differs from source")
-    changed, excluded = sampled_groups = 0, 0, 0
+    changed = excluded = sampled_groups = 0
     squared_error = source_energy = projection_elements = 0
     projection_hashes = {}
     for name in sorted(source_map):

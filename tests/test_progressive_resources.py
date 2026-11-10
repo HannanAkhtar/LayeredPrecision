@@ -57,6 +57,11 @@ def test_matrix_preflight_fails_unknown_quota_even_when_df_reports_space(tmp_pat
     point = assess(source, tmp_path, tmp_path, mode="point", quota_gib=20,
                    gpu_free_bytes=22 * GIB, host_limit_bytes=12 * GIB,
                    strict_source=False)
+    assert point["status"] == "capacity_floor_failed"
+    assert not point["checks"]["host_allocation_15_gib"]
+    point = assess(source, tmp_path, tmp_path, mode="point", quota_gib=20,
+                   gpu_free_bytes=22 * GIB, host_limit_bytes=15 * GIB,
+                   strict_source=False)
     assert point["status"] == "capacity_floor_passed"
     assert point["shared_floor_bytes"] < assess(
         source, tmp_path, tmp_path, mode="matrix", quota_gib=20,
