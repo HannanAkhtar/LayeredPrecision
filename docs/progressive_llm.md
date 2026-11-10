@@ -45,6 +45,10 @@ partition has only 15564 MiB. The audit therefore requests 4 CPUs, 32 GiB,
 and no GPU on `hpc`. It stages the requested Git commit, runs the pinned
 AutoRound dispatch audit and full repaired-base/pilot verification, and writes
 `progressive_llm/prerequisites/prerequisites_<CODE_SHA>.json` only on success.
+It invokes the existing LP interpreter directly; the CPU node needs neither
+Conda shell initialization nor the GPU job's site-local `env.sh`. A CPU-only
+preflight checks the pinned Torch and Transformers versions and prerequisite
+imports before reading checkpoints.
 An existing report does not skip the full CPU audit; a successful repeat saves
 the previous report under a `superseded.<job_id>.json` name. Failures write a
 separate `failure.<job_id>.json` diagnostic.

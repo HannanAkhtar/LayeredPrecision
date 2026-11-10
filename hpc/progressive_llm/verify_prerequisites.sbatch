@@ -21,9 +21,8 @@ FOLLOWUP_CODE_SHA="${FOLLOWUP_CODE_SHA:?Set the reviewed code SHA}"
 }
 [[ "$FOLLOWUP_CODE_SHA" =~ ^[0-9a-f]{40}$ && -x "$LP_PYTHON" ]] || exit 1
 git -C "$LP_CODE" cat-file -e "$FOLLOWUP_CODE_SHA^{commit}"
-source /opt/miniconda/etc/profile.d/conda.sh
-conda activate "$LP_ROOT/envs/lp_llm"
-source "$LP_ROOT/env.sh"
+# This audit only reads local artifacts. The pinned LP interpreter is sufficient;
+# Conda activation and env.sh are not required on CPU nodes.
 STAGE=$(mktemp -d "${SLURM_TMPDIR:-/tmp}/lp-prerequisites-${SLURM_JOB_ID}.XXXXXXXX")
 trap 'rm -rf -- "$STAGE"' EXIT
 git -C "$LP_CODE" archive --format=tar --output="$STAGE/code.tar" "$FOLLOWUP_CODE_SHA"
@@ -56,6 +55,11 @@ trap finish EXIT
 exec 9>"$RESULT_ROOT/progressive_llm/.locks/prerequisites-$FOLLOWUP_CODE_SHA.lock"
 flock -n 9 || { echo 'ERROR: prerequisite verification already running' >&2; exit 1; }
 echo "[PREREQUISITE VERIFICATION STARTED] job=$SLURM_JOB_ID report=$REPORT"
+"$LP_PYTHON" -m lp_llm.progressive_cpu_preflight \
+  "$LP_ROOT/envs/lp_llm" "$LP_PYTHON" || {
+    echo 'ERROR: LP interpreter or CPU prerequisite imports are unavailable on this node' >&2
+    exit 1
+  }
 SUPPORT="$RESULT_ROOT/progressive_llm/pilots/control_support_$FOLLOWUP_CODE_SHA.json"
 "$LP_PYTHON" -m lp_llm.progressive_support \
   --checkout "$RRQ_PR_SOURCE" --output "$SUPPORT" \
