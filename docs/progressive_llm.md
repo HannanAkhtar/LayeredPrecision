@@ -110,10 +110,20 @@ seal for that audit; GPU evaluation rejects a modified audit before reading
 checkpoint data.
 
 Only after that report passes, `recover_w4_evaluate.sbatch` can evaluate the
-original partial export under a new 15G job. It stores results in a separate
-recovery directory. The GPU job loads the completed CPU audit and verifies
-source, checkpoint, LP artifacts, and original provenance with streaming
-SHA-256 reads; it does not repeat CPU tensor comparisons or AutoRound.
+original partial export under a new 15G job. The export lacks tokenizer assets.
+The new CPU audit records SHA-256 and sizes of `tokenizer.json`,
+`tokenizer_config.json`, `vocab.json`, and `merges.txt` from the pinned source;
+`special_tokens_map.json` is not required. The GPU job verifies those bytes
+and the audited checkpoint with streaming hashes, then creates a separate
+`s01_w4_view`: hardlinks to the audited model files and read-only copies of
+the four tokenizer files. This does not duplicate the checkpoint shards or
+alter `export.partial`. The view's manifest, complete inventory, source
+tokenizer hashes, model hashes, and hardlink identities are checked before
+and after evaluation and on resume. Both `corpus_identity()` and the official
+MatGPTQ evaluator use that same view. The token SHA-256 and 298862 scored-token
+gate remain unchanged. Keep the original export and source files operationally
+read-only while jobs run; a changed byte makes the integrity check fail.
+The GPU job does not repeat CPU tensor comparisons or AutoRound.
 The old job IDs and 12G allocation remain recorded as
 failed. `progressive_stage_a_recovery verify` reports the W4 recovery job's
 actual memory use and Slurm status. Stage B remains blocked by the original

@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,8 @@ from lp_llm import progressive_stage_a_recovery as recovery
 def test_stage_a_audit_preserves_partial_and_original_provenance(tmp_path, monkeypatch):
     source, root, checkout = tmp_path / "source", tmp_path / "results", tmp_path / "auto-round"
     source.mkdir(); checkout.mkdir()
+    for name in recovery.TOKENIZER_FILES:
+        (source / name).write_bytes(name.encode())
     monkeypatch.setenv("SLURM_JOB_ID", "60000")
     layer = root / "progressive_llm/s01/layer1"
     layer.mkdir(parents=True)
@@ -76,45 +80,73 @@ def test_stage_a_audit_preserves_partial_and_original_provenance(tmp_path, monke
 def test_recovered_w4_evaluation_is_separate_and_idempotent(tmp_path, monkeypatch):
     checkpoint = tmp_path / "export.partial"
     checkpoint.mkdir()
+    for name in ("config.json", "model.safetensors.index.json", "model.safetensors"):
+        (checkpoint / name).write_bytes(name.encode())
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in recovery.TOKENIZER_FILES:
+        (source / name).write_bytes(name.encode())
+    snapshot = recovery._snapshot_tree(checkpoint)
+    if os.name == "nt":
+        # The Windows test sandbox disallows hardlinks; Linux jobs use os.link.
+        monkeypatch.setattr(recovery.os, "link", lambda left, right: shutil.copyfile(left, right))
+        monkeypatch.setattr(recovery, "_same_inode", lambda *_: True)
     record = {"status": "stage_a_science_validated_resource_uncertified",
               "code_sha": "a" * 40,
+              "source_tokenizer_files": recovery._tokenizer_snapshot(source),
               "original_code_sha": recovery.ORIGINAL_SHA,
               "lp": {"original_job_id": recovery.LP_JOB},
               "resource_certification": "not_satisfied_by_original_12_gib_jobs",
               "w4": {"original_job_id": recovery.W4_JOB,
                      "partial_export": str(checkpoint),
-                     "checkpoint_validation": {"quantized_projection_count": 252}}}
+                     "export_snapshot": snapshot,
+                     "checkpoint_validation": {"quantized_projection_count": 252,
+                         "checkpoint": {"resolved_checkpoint_path": str(checkpoint)}}}}
     monkeypatch.setattr(recovery, "check_revision", lambda *_: None)
-    monkeypatch.setattr(recovery, "corpus_identity", lambda *_: {
-        "token_sha256": recovery.TOKEN_SHA, "scored_tokens": 298862})
     calls = []
+    def corpus(path):
+        calls.append(("corpus", path))
+        return {"token_sha256": recovery.TOKEN_SHA, "scored_tokens": 298862}
+    monkeypatch.setattr(recovery, "corpus_identity", corpus)
     def evaluate(_checkout, path, log, **_):
-        calls.append(path)
+        calls.append(("evaluate", path))
         log.write_text("PPL 13.0")
         return {"perplexity": 13.0}
     monkeypatch.setattr(recovery, "evaluate_matgptq", evaluate)
-    monkeypatch.setattr(recovery, "sha256", lambda *_: "loghash")
-    output = tmp_path / "recovery"
-    first = recovery.evaluate_w4(record, tmp_path, output, "60001")
+    output = tmp_path / "progressive_llm/recovery" / ("a" * 40) / "s01_w4"
+    output.parent.mkdir(parents=True)
+    first = recovery.evaluate_w4(record, tmp_path, output, "60001", source)
     assert first["original_quantization_job_id"] == recovery.W4_JOB
     assert first["recovery_evaluation_job_id"] == "60001"
-    assert checkpoint.is_dir() and len(calls) == 1
-    assert recovery.evaluate_w4(record, tmp_path, output, "60002") == first
-    assert len(calls) == 1
+    view = output.parent / "s01_w4_view"
+    assert calls == [("corpus", view), ("evaluate", view)]
+    if os.name != "nt":
+        assert recovery._same_inode(view / "model.safetensors", checkpoint / "model.safetensors")
+    assert (view / "tokenizer.json").stat().st_ino != (source / "tokenizer.json").stat().st_ino
+    assert not (view / "special_tokens_map.json").exists()
+    assert checkpoint.is_dir()
+    assert recovery.evaluate_w4(record, tmp_path, output, "60002", source) == first
+    assert len(calls) == 2
+    manifest_path = view / "evaluation_view.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_path.chmod(0o666)
+    manifest_path.unlink()
+    with pytest.raises(ValueError, match="manifest differs"):
+        recovery.evaluate_w4(record, tmp_path, output, "60002", source)
+    manifest_path.write_bytes(manifest_bytes)
+    (source / "merges.txt").unlink()
+    with pytest.raises(ValueError, match="Pinned source tokenizer file unavailable"):
+        recovery.evaluate_w4(record, tmp_path, output, "60002", source)
+    (source / "merges.txt").write_bytes(b"merges.txt")
     resource_dir = tmp_path / "progressive_llm/job_resources"
     resource_dir.mkdir(parents=True)
     (resource_dir / "s01_w4_recovery-60001.json").write_text(json.dumps({
         "job_id": "60001", "host_allocation_bytes": 15 * 1024**3,
         "host_memory_within_allocation": True, "exit_code_before_resource_check": 0,
         "slurm_cgroup_peak_bytes": 1, "process_peak_rss_bytes": 1}))
-    actual = tmp_path / "progressive_llm/recovery" / ("a" * 40) / "s01_w4"
-    actual.parent.mkdir(parents=True)
-    # The admission reader uses the deployed recovery path, not an original result path.
-    import shutil
-    shutil.copytree(output, actual)
     monkeypatch.setattr(recovery.subprocess, "check_output", lambda *_a, **_k:
                         "60001|COMPLETED|0:0\n")
-    checked = recovery.verify_recovery(record, tmp_path)
+    checked = recovery.verify_recovery(record, tmp_path, source)
     assert checked["stage_b_admission"] == "blocked_pending_lp_full_run_memory_certification"
     high = {"job_id": "60001", "host_allocation_bytes": 15 * 1024**3,
             "host_memory_within_allocation": False, "exit_code_before_resource_check": 0,
@@ -122,7 +154,20 @@ def test_recovered_w4_evaluation_is_separate_and_idempotent(tmp_path, monkeypatc
             "process_peak_rss_bytes": 1}
     (resource_dir / "s01_w4_recovery-60001.json").write_text(json.dumps(high))
     with pytest.raises(ValueError, match="resource evidence differs"):
-        recovery.verify_recovery(record, tmp_path)
+        recovery.verify_recovery(record, tmp_path, source)
+    (source / "tokenizer.json").write_bytes(b"modified tokenizer")
+    with pytest.raises(ValueError, match="tokenizer differs from CPU recovery audit"):
+        recovery.evaluate_w4(record, tmp_path, output, "60002", source)
+    (source / "tokenizer.json").write_bytes(b"tokenizer.json")
+    (view / "tokenizer.json").chmod(0o666)
+    (view / "tokenizer.json").write_bytes(b"tampered token!")
+    with pytest.raises(ValueError, match="tokenizer changed"):
+        recovery.evaluate_w4(record, tmp_path, output, "60002", source)
+    (view / "tokenizer.json").write_bytes(b"tokenizer.json")
+    (view / "model.safetensors").write_bytes(b"modified weights")
+    with pytest.raises(ValueError, match="Checkpoint differs from CPU audit|Evaluation view model file changed"):
+        recovery.evaluate_w4(record, tmp_path, output, "60002", source)
+    assert len(calls) == 2
 
 
 def test_evaluate_action_uses_cpu_audit_without_running_full_audit(tmp_path, monkeypatch):
@@ -145,6 +190,8 @@ def test_gpu_hash_gate_rejects_changed_checkpoint_without_tensor_decoding(tmp_pa
     sha = "a" * 40
     source = tmp_path / "source"
     source.mkdir()
+    for name in recovery.TOKENIZER_FILES:
+        (source / name).write_bytes(name.encode())
     result = tmp_path / "results"
     w4 = result / "progressive_llm/controls/s01_w4"
     partial = w4 / "export.partial"
@@ -169,6 +216,7 @@ def test_gpu_hash_gate_rejects_changed_checkpoint_without_tensor_decoding(tmp_pa
              "resolved_config.json", "excluded_repair.json", "quantization.log")
     record = {"status": "stage_a_science_validated_resource_uncertified",
         "code_sha": sha, "original_code_sha": recovery.ORIGINAL_SHA,
+        "source_tokenizer_files": recovery._tokenizer_snapshot(source),
         "prerequisite_job_id": "55356", "recovery_validation_job_id": "60000",
         "resource_certification": "not_satisfied_by_original_12_gib_jobs",
         "lp": {"original_job_id": recovery.LP_JOB,
