@@ -23,6 +23,7 @@ source "$LP_ROOT/env.sh"
 unset TRANSFORMERS_CACHE
 FOLLOWUP_CODE_SHA="${FOLLOWUP_CODE_SHA:-$(git -C "$LP_CODE" rev-parse HEAD)}"
 export FOLLOWUP_CODE_SHA
+export LP_ROOT LP_CODE LP_SOURCE RESULT_ROOT
 [[ "$FOLLOWUP_CODE_SHA" =~ ^[0-9a-f]{40}$ && -x "$LP_PYTHON" ]] || { echo 'ERROR: code SHA or LP Python invalid' >&2; exit 1; }
 git -C "$LP_CODE" cat-file -e "$FOLLOWUP_CODE_SHA^{commit}"
 CODE_STAGE=$(mktemp -d "${SLURM_TMPDIR:-/tmp}/lp-matrix-${SLURM_JOB_ID:-manual}.XXXXXXXX")
@@ -60,7 +61,8 @@ cd "$CODE_STAGE"
 "$LP_PYTHON" -m lp_llm.progressive_resources --source "$LP_SOURCE" \
   --shared "$RESULT_ROOT" --scratch "$CODE_STAGE" --mode point \
   --slots "${LP_MATRIX_SLOTS:-14}" --strict
-"$LP_PYTHON" -m lp_llm.progressive_plan verify-prerequisites --source "$LP_SOURCE" \
+export LP_PREREQUISITE_REPORT="$RESULT_ROOT/progressive_llm/prerequisites/prerequisites_$FOLLOWUP_CODE_SHA.json"
+"$LP_PYTHON" -m lp_llm.progressive_prerequisites check --source "$LP_SOURCE" \
   --result-root "$RESULT_ROOT" --code-sha "$FOLLOWUP_CODE_SHA" --code-repo "$LP_CODE"
 mkdir -p "$RESULT_ROOT/progressive_llm/.locks"
 exec 9>"$RESULT_ROOT/progressive_llm/.locks/$LP_MATRIX_ID.lock"

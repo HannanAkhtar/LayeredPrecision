@@ -38,6 +38,53 @@ is imposed. Actual filesystem free space and the site quota are separate
 checks. The previously authorized `LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1` skips
 only formal quota confirmation.
 
+## AUS prerequisite CPU audit
+
+The `hpc` partition has 96 CPUs and 373555 MiB per node on AUS; the `cpu`
+partition has only 15564 MiB. The audit therefore requests 4 CPUs, 32 GiB,
+and no GPU on `hpc`. It stages the requested Git commit, runs the pinned
+AutoRound dispatch audit and full repaired-base/pilot verification, and writes
+`progressive_llm/prerequisites/prerequisites_<CODE_SHA>.json` only on success.
+An existing report does not skip the full CPU audit; a successful repeat saves
+the previous report under a `superseded.<job_id>.json` name. Failures write a
+separate `failure.<job_id>.json` diagnostic.
+
+```bash
+cd /shared/makhtar/lp_llm/code
+set -euo pipefail
+git pull --ff-only origin experiment/rrq-w2-reproduction
+CODE_SHA=$(git rev-parse HEAD)
+LP_ROOT=/shared/makhtar/lp_llm
+RESULT_ROOT="$LP_ROOT/results/qwen3_8b_base"
+mkdir -p "$LP_ROOT/logs" "$RESULT_ROOT/progressive_llm/prerequisites"
+sinfo -h -p hpc -o '%P %c %m %l'
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
+  hpc/progressive_llm/verify_prerequisites.sbatch
+```
+
+Monitor the returned job ID and inspect its report:
+
+```bash
+JOB_ID=<returned-job-id>
+squeue -j "$JOB_ID" -o '%.18i %.9T %.10M %.12R'
+sacct -j "$JOB_ID" --format=JobID,State,ExitCode,ReqMem,MaxRSS,Elapsed
+tail -n 40 "$LP_ROOT/logs/lp-llm-prerequisites-$JOB_ID.out"
+tail -n 40 "$RESULT_ROOT/progressive_llm/prerequisites/prerequisites_$CODE_SHA.json.log"
+"$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_prerequisites check \
+  --source "$LP_ROOT/models/qwen3-8b-base" --result-root "$RESULT_ROOT" \
+  --code-sha "$CODE_SHA" --code-repo "$PWD"
+```
+
+Require Slurm `COMPLETED`, exit code `0:0`, and a successful lightweight
+report check before Stage A. The report contains verified SHA-256 identities;
+the lightweight gate checks current size, timestamps, inode, device, and file
+inventory without rereading checkpoint tensors. These metadata checks catch
+ordinary changes but cannot prove that a file owner with write access did not
+restore metadata after modifying contents. If file integrity is uncertain,
+rerun the full CPU audit before submitting more jobs. Any metadata mismatch
+fails closed. Preserve the checkpoint directories as read-only operational
+inputs while the matrix runs.
+
 ## AUS Stage A: two real matrix points
 
 Run these commands from the trusted Git checkout. They submit only `s01_w4`
@@ -51,14 +98,8 @@ CODE_SHA=$(git rev-parse HEAD)
 LP_ROOT=/shared/makhtar/lp_llm
 RESULT_ROOT="$LP_ROOT/results/qwen3_8b_base"
 MANIFEST="$RESULT_ROOT/progressive_llm/matrix_jobs.json"
-mkdir -p "$LP_ROOT/logs" "$RESULT_ROOT/progressive_llm/pilots"
 unset LP_MATRIX_SHARED_QUOTA_FREE_GIB
 export LP_MATRIX_ALLOW_UNKNOWN_QUOTA=1
-PYTHONPATH="$LP_ROOT/references/rrq_pr2308/auto-round:$PWD" \
-  "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_support \
-  --checkout "$LP_ROOT/references/rrq_pr2308/auto-round" \
-  --output "$RESULT_ROOT/progressive_llm/pilots/control_support_$CODE_SHA.json" \
-  --code-sha "$CODE_SHA"
 "$LP_ROOT/envs/lp_llm/bin/python" -m lp_llm.progressive_plan verify-prerequisites \
   --source "$LP_ROOT/models/qwen3-8b-base" --result-root "$RESULT_ROOT" \
   --code-sha "$CODE_SHA" --code-repo "$PWD"
@@ -78,11 +119,11 @@ After both jobs finish, check Slurm state and validate the actual artifacts:
 "$LP_ROOT/envs/lp_llm/bin/python" - <<'PY'
 import json, math
 from pathlib import Path
-from lp_llm.progressive_lp import _files
 root = Path('/shared/makhtar/lp_llm/results/qwen3_8b_base')
 manifest = json.loads((root / 'progressive_llm/matrix_jobs.json').read_text())
 jobs = manifest['job_ids']
-source = _files(Path('/shared/makhtar/lp_llm/models/qwen3-8b-base'))
+source = json.loads((root / ('progressive_llm/prerequisites/prerequisites_' +
+                          manifest['code_sha'] + '.json')).read_text())['source_identity']
 for point in ('s01_w4', 's01_lp_2p2'):
     resource = json.loads((root / f'progressive_llm/job_resources/{point}-{jobs[point]}.json').read_text())
     assert resource['host_memory_10pct_headroom_passed'], (point, resource)
@@ -125,7 +166,10 @@ finish. Do not submit Stage B based on Slurm exit status alone.
 
 After Stage A artifacts pass review, resume the same manifest. The two
 recorded jobs are reused. If account capacity is insufficient, rerun this
-same command later to submit the remaining missing points.
+same command later to submit the remaining missing points. The planner also
+checks both Stage A Slurm exit codes, `full.json` identities, coverage,
+perplexity, corpus hash, storage/distortion fields, and cgroup/RSS headroom
+before it submits any of the other ten points.
 
 ```bash
 cd /shared/makhtar/lp_llm/code

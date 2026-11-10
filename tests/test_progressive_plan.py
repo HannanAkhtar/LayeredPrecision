@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from lp_llm.progressive_plan import (LP_PILOT_PREVIOUS_SHA, accepted_lp_pilot_sha,
-                                     admit_submission, main, plan, submit)
+                                     admit_submission, main, plan, submit, verify_stage_a)
 
 
 def test_matrix_has_twelve_points_and_scientific_dependencies(tmp_path):
@@ -58,6 +58,58 @@ def test_submit_uses_only_scientific_dependencies_and_resumes(tmp_path, monkeypa
     assert submit(report, tmp_path / "run_point.sbatch", manifest) == completed
     assert len(commands) == 12
     assert json.loads(manifest.read_text())["job_ids"] == completed["job_ids"]
+
+
+def test_stage_a_gate_requires_successful_jobs_and_scientific_reports(tmp_path, monkeypatch):
+    source = {"config_sha256": "a" * 64}
+    manifest = tmp_path / "jobs.json"
+    manifest.write_text(json.dumps({"code_sha": "a" * 40,
+                                    "job_ids": {"s01_w4": "101", "s01_lp_2p2": "102"}}))
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output",
+                        lambda command, **_: "COMPLETED|0:0\n")
+    common = {"status": "completed_validated", "identity": {"source": source},
+              "corpus": {"token_sha256":
+                  "8ffcee84dd4b684ec631cb52845e18c9c181ce6fdb8b26d65a4ffdc3d35fbda3",
+                  "scored_tokens": 298862}, "evaluation": {"perplexity": 12.47}}
+    for point, job in (("s01_w4", "101"), ("s01_lp_2p2", "102")):
+        folder = tmp_path / "progressive_llm" / ("controls" if point == "s01_w4"
+            else "evaluation") / point
+        folder.mkdir(parents=True)
+        full = dict(common)
+        if point == "s01_w4":
+            check = {"quantized_projection_count": 252,
+                "source_exact_excluded_tensor_count": 147,
+                "sampled_group_grid_checks": 1, "actual_checkpoint_file_bytes": 1,
+                "distortion": {"mse_fp32": 0.01, "normalized_mse_fp32": 0.02}}
+            full.update(identity={"source": source, "code_sha": "a" * 40},
+                        checkpoint_validation=check)
+            (folder / "encoding_complete.json").write_text(json.dumps({
+                "status": "completed_validated", "checkpoint_validation": check}))
+        else:
+            full.update(code_sha="a" * 40, depth=1,
+                        materialization={"status": "completed_validated",
+                                         "projection_count": 252},
+                        storage={"prefixes": [{"total_reconstruction_bytes": 1}]})
+            layer_path = tmp_path / "progressive_llm/s01/layer1/encoding_complete.json"
+            layer_path.parent.mkdir(parents=True)
+            layer_path.write_text(json.dumps({"status": "completed_validated",
+                "identity": {"source": source}, "code_sha": "a" * 40,
+                "projection_count": 252, "chunk_count": 1, "chunks": [{}],
+                "code_bytes": 1, "metadata_bytes": 1,
+                "mse_fp32": 0.01, "normalized_mse_fp32": 0.02}))
+        (folder / "full.json").write_text(json.dumps(full))
+        resource = tmp_path / "progressive_llm/job_resources" / f"{point}-{job}.json"
+        resource.parent.mkdir(parents=True, exist_ok=True)
+        resource.write_text(json.dumps({"status": "measured", "point": point,
+            "job_id": job, "host_memory_10pct_headroom_passed": True,
+            "slurm_cgroup_peak_bytes": 1, "process_peak_rss_bytes": 1,
+            "host_allocation_bytes": 12 * 1024**3,
+            "exit_code_before_resource_check": 0}))
+    assert len(verify_stage_a(tmp_path, manifest, {"source_identity": source}, "a" * 40)) == 2
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output",
+                        lambda command, **_: "FAILED|1:0\n")
+    with pytest.raises(ValueError, match="not completed successfully"):
+        verify_stage_a(tmp_path, manifest, {"source_identity": source}, "a" * 40)
 
 
 def test_partial_submission_respects_fourteen_account_jobs(tmp_path, monkeypatch):
@@ -115,13 +167,22 @@ def test_prior_lp_pilot_acceptance_is_exact_and_requires_unchanged_code(monkeypa
         return type("Result", (), {"returncode": 0})()
     monkeypatch.setattr("lp_llm.progressive_plan.subprocess.run", unchanged)
     monkeypatch.setattr("lp_llm.progressive_plan.verify_executed_code", lambda *_: None)
+    source = (Path(__file__).resolve().parents[1] / "lp_llm/progressive_lp.py").read_text()
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output",
+                        lambda command, **_: source if command[3] == "show" else "")
     assert accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40, Path("repo"), Path("stage")) == LP_PILOT_PREVIOUS_SHA
-    assert len(calls) == 1 and "progressive_lp.py" in " ".join(calls[0])
+    assert len(calls) == 1 and "progressive_run.py" in " ".join(calls[0])
     with pytest.raises(ValueError, match="validated prior"):
         accepted_lp_pilot_sha("f" * 40, "a" * 40, Path("repo"), Path("stage"))
     monkeypatch.setattr("lp_llm.progressive_plan.subprocess.run",
                         lambda *_a, **_k: type("Result", (), {"returncode": 1})())
     with pytest.raises(ValueError, match="implementation differs"):
+        accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40, Path("repo"), Path("stage"))
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.run", unchanged)
+    monkeypatch.setattr("lp_llm.progressive_plan.subprocess.check_output",
+                        lambda command, **_: source + "\ndef changed_numerical_code(): return 1\n"
+                        if command[-1].startswith("a" * 40) else source)
+    with pytest.raises(ValueError, match="numerical implementation differs"):
         accepted_lp_pilot_sha(LP_PILOT_PREVIOUS_SHA, "a" * 40, Path("repo"), Path("stage"))
 
 
@@ -130,12 +191,14 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
     checkout, staged = tmp_path / "checkout", tmp_path / "stage"
     subprocess.run(["git", "clone", "--quiet", str(workspace), str(checkout)], check=True)
     for file in ("lp_llm/progressive_plan.py", "lp_llm/progressive_control_pilot.py",
-                 "lp_llm/progressive_resources.py"):
+                 "lp_llm/progressive_resources.py", "lp_llm/progressive_lp.py",
+                 "lp_llm/progressive_prerequisites.py"):
         shutil.copy2(workspace / file, checkout / file)
     shutil.copy2(workspace / "hpc/progressive_llm/run_point.sbatch",
                  checkout / "hpc/progressive_llm/run_point.sbatch")
     subprocess.run(["git", "-C", str(checkout), "add", "lp_llm/progressive_plan.py",
                     "lp_llm/progressive_control_pilot.py", "lp_llm/progressive_resources.py",
+                    "lp_llm/progressive_lp.py", "lp_llm/progressive_prerequisites.py",
                     "hpc/progressive_llm/run_point.sbatch"], check=True)
     subprocess.run(["git", "-C", str(checkout), "-c", "user.name=Test", "-c",
                     "user.email=test@example.com", "commit", "-qm", "proposed archive"], check=True)

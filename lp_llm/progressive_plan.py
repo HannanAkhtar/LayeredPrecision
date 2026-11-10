@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import io
 import tarfile
 from unittest.mock import patch
@@ -21,9 +22,10 @@ from .storage import atomic_json
 
 
 LP_PILOT_PREVIOUS_SHA = "b650efb085b00b801f0f42543485c84ae9fbbbc0"
-LP_UNCHANGED_PATHS = ("lp_llm/progressive_lp.py", "lp_llm/progressive_run.py",
+LP_UNCHANGED_PATHS = ("lp_llm/progressive_run.py",
                       "lp_llm/progressive_pilot.py", "lp_llm/progressive_base_parity.py",
                       "lp_llm/quantize.py", "lp_llm/storage.py")
+LP_INPUT_VERIFICATION_FUNCTIONS = {"_files", "validate_repaired_base"}
 
 
 def verify_executed_code(code_repo: Path, code_sha: str, staged_root: Path) -> None:
@@ -63,6 +65,14 @@ def accepted_lp_pilot_sha(record_sha: str, code_sha: str,
                LP_PILOT_PREVIOUS_SHA, code_sha, "--", *LP_UNCHANGED_PATHS]
     if subprocess.run(command, check=False).returncode != 0:
         raise ValueError("LP implementation differs from the validated pilot commit")
+    def numerical_ast(ref: str) -> list[str]:
+        source = subprocess.check_output(["git", "-C", str(code_repo.resolve()),
+            "show", f"{ref}:lp_llm/progressive_lp.py"], text=True)
+        return [ast.dump(node, include_attributes=False) for node in ast.parse(source).body
+                if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and
+                        node.name in LP_INPUT_VERIFICATION_FUNCTIONS)]
+    if numerical_ast(LP_PILOT_PREVIOUS_SHA) != numerical_ast(code_sha):
+        raise ValueError("LP numerical implementation differs from the validated pilot commit")
     return LP_PILOT_PREVIOUS_SHA
 
 
@@ -82,6 +92,7 @@ def valid_control_traversal(control: dict) -> bool:
 
 
 MAX_ACTIVE_JOBS = 14
+STAGE_A = frozenset({"s01_w4", "s01_lp_2p2"})
 
 
 def points(root: Path, slots: int) -> list[dict]:
@@ -118,7 +129,7 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
         base = result_root / "quantizer_followups" / repair / "export"
         root = result_root / "progressive_llm/pilots" / branch
         record = json.loads((root / "report.json").read_text())
-        validate_repaired_base(branch, source, base)
+        base_validation = validate_repaired_base(branch, source, base)
         ident = identity(branch, source, base)
         accepted_sha = accepted_lp_pilot_sha(record.get("code_sha"), code_sha,
                                             code_repo, Path(__file__).resolve().parents[1])
@@ -158,11 +169,13 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
         reports[branch] = {"accepted_pilot_code_sha": accepted_sha,
                            "cross_commit_acceptance": accepted_sha != code_sha,
                            "source_base_identity": ident,
+                           "base_validation": base_validation,
                            "process_peak_rss_kib": record["process_peak_rss_kib"],
                            "artifact_bytes": record["artifact_bytes"],
                            "report": str(root / "report.json"),
                            "base_parity_report": str(parity_path),
                            "base_parity_perplexity": parity["evaluation"]["perplexity"]}
+        print(f"[{branch.upper()} BASE VALIDATED]", flush=True)
     support_path = result_root / "progressive_llm/pilots" / f"control_support_{code_sha}.json"
     support = json.loads(support_path.read_text())
     if (support.get("status") != "control_dispatch_verified" or
@@ -191,15 +204,21 @@ def verify_pilots(source: Path, result_root: Path, code_sha: str, code_repo: Pat
                         {"coarse": 256, "fine": 64}))):
                 raise ValueError("Pinned full-control recipe support audit differs")
     reports["control_support"] = str(support_path)
+    print("[LP PILOTS VALIDATED]", flush=True)
+    print("[CONTROL RECIPES VALIDATED]", flush=True)
     if any(reports[branch]["cross_commit_acceptance"] for branch in BRANCHES):
         acceptance = {"status": "prior_lp_pilots_validated", "current_code_sha": code_sha,
             "prior_code_sha": LP_PILOT_PREVIOUS_SHA,
             "lp_implementation_paths_verified_unchanged": list(LP_UNCHANGED_PATHS),
+            "lp_numerical_ast_verified_unchanged": True,
+            "lp_input_verification_functions_reviewed": sorted(LP_INPUT_VERIFICATION_FUNCTIONS),
             "accepted": {branch: reports[branch] for branch in BRANCHES}}
         path = result_root / "progressive_llm/pilots" / f"lp_cross_commit_acceptance_{code_sha}.json"
-        if path.is_file() and json.loads(path.read_text()) != acceptance:
-            raise ValueError("Existing LP cross-commit acceptance report differs")
-        atomic_json(path, acceptance)
+        if path.is_file():
+            if json.loads(path.read_text()) != acceptance:
+                raise ValueError("Existing LP cross-commit acceptance report differs")
+        else:
+            atomic_json(path, acceptance)
         reports["cross_commit_acceptance_report"] = str(path)
     return reports
 
@@ -313,6 +332,82 @@ def admit_submission(source: Path, result_root: Path, slots: int) -> dict:
             "slots": slots}
 
 
+def verify_stage_a(result_root: Path, manifest_path: Path, prerequisite: dict,
+                   code_sha: str) -> dict:
+    """Small Stage A report gate before admitting the remaining ten points."""
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("code_sha") != code_sha or not STAGE_A <= set(manifest.get("job_ids", {})):
+        raise ValueError("Stage A manifest or job IDs are incomplete")
+    checked = {}
+    for point in sorted(STAGE_A):
+        job_id = str(manifest["job_ids"][point])
+        if not re.fullmatch(r"[0-9]+", job_id):
+            raise ValueError("Stage A Slurm job ID is invalid")
+        state = subprocess.check_output(["sacct", "-n", "-P", "-X", "-j", job_id,
+            "-o", "State,ExitCode"], text=True).strip().splitlines()
+        if state != ["COMPLETED|0:0"]:
+            raise ValueError(f"Stage A Slurm job has not completed successfully: {point}: {state}")
+        path = result_root / "progressive_llm" / ("controls" if point == "s01_w4"
+            else "evaluation") / point / "full.json"
+        full = json.loads(path.read_text())
+        resource = json.loads((result_root / "progressive_llm/job_resources" /
+                               f"{point}-{job_id}.json").read_text())
+        identity = full.get("identity", {})
+        if (full.get("status") != "completed_validated" or
+                identity.get("source") != prerequisite["source_identity"] or
+                full.get("corpus", {}).get("token_sha256") !=
+                    "8ffcee84dd4b684ec631cb52845e18c9c181ce6fdb8b26d65a4ffdc3d35fbda3" or
+                full.get("corpus", {}).get("scored_tokens") != 298862 or
+                not math.isfinite(full.get("evaluation", {}).get("perplexity", float("nan"))) or
+                resource.get("status") != "measured" or
+                resource.get("point") != point or resource.get("job_id") != job_id or
+                resource.get("host_memory_10pct_headroom_passed") is not True or
+                resource.get("slurm_cgroup_peak_bytes", 0) <= 0 or
+                resource.get("process_peak_rss_bytes", 0) <= 0 or
+                resource.get("host_allocation_bytes") != 12 * 1024**3 or
+                max(resource["slurm_cgroup_peak_bytes"],
+                    resource["process_peak_rss_bytes"]) * 10 >=
+                    resource["host_allocation_bytes"] * 9 or
+                resource.get("exit_code_before_resource_check") != 0):
+            raise ValueError(f"Stage A result or resource report is invalid: {point}")
+        if point == "s01_w4":
+            check = full.get("checkpoint_validation", {})
+            marker = json.loads((path.parent / "encoding_complete.json").read_text())
+            if (identity.get("code_sha") != code_sha or
+                    marker.get("status") != "completed_validated" or
+                    marker.get("checkpoint_validation") != check or
+                    check.get("quantized_projection_count") != 252 or
+                    check.get("source_exact_excluded_tensor_count", 0) <= 0 or
+                    check.get("sampled_group_grid_checks", 0) <= 0 or
+                    check.get("actual_checkpoint_file_bytes", 0) <= 0 or
+                    not math.isfinite(check.get("distortion", {}).get("mse_fp32", float("nan"))) or
+                    not math.isfinite(check.get("distortion", {}).get(
+                        "normalized_mse_fp32", float("nan")))):
+                raise ValueError("Stage A S01 W4 coverage or distortion differs")
+        else:
+            layer = json.loads((result_root / "progressive_llm/s01/layer1/encoding_complete.json")
+                               .read_text())
+            if (full.get("code_sha") != code_sha or full.get("depth") != 1 or
+                    full.get("materialization", {}).get("projection_count") != 252 or
+                    full.get("materialization", {}).get("status") != "completed_validated" or
+                    full.get("storage", {}).get("prefixes", [{}])[0].get(
+                        "total_reconstruction_bytes", 0) <= 0 or
+                    layer.get("status") != "completed_validated" or
+                    layer.get("identity") != identity or
+                    layer.get("code_sha") != code_sha or
+                    layer.get("projection_count") != 252 or
+                    layer.get("chunk_count") != len(layer.get("chunks", [])) or
+                    layer.get("code_bytes", 0) <= 0 or
+                    layer.get("metadata_bytes", 0) <= 0 or
+                    not math.isfinite(layer.get("mse_fp32", float("nan"))) or
+                    not math.isfinite(layer.get("normalized_mse_fp32", float("nan")))):
+                raise ValueError("Stage A S01 LP coverage, distortion or storage differs")
+        checked[point] = {"job_id": job_id, "full_report": str(path),
+                          "resource_report": str(result_root / "progressive_llm/job_resources" /
+                                                 f"{point}-{job_id}.json")}
+    return checked
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("dry-run", "verify-pilots",
@@ -329,31 +424,48 @@ def main() -> None:
     parser.add_argument("--script", type=Path,
                         default=Path("hpc/progressive_llm/run_point.sbatch"))
     args = parser.parse_args()
-    if args.action in ("verify-pilots", "verify-prerequisites"):
+    if args.action == "verify-pilots":
+        raise ValueError("Full pilot verification runs only inside the CPU prerequisite job")
+    if args.action == "verify-prerequisites":
         if args.source is None or args.code_repo is None:
-            parser.error("verify-pilots requires --source and --code-repo")
-        print(json.dumps(verify_pilots(args.source, args.result_root, args.code_sha,
-                                       args.code_repo), indent=2))
+            parser.error("verify-prerequisites requires --source and --code-repo")
+        from .progressive_prerequisites import verify_report
+        checked = verify_report(args.source, args.result_root, args.code_sha,
+                                args.code_repo)
+        print(f"[PREREQUISITES REPORT VALIDATED] job={checked['slurm_job_id']}")
         return
     manifest = plan(args.result_root, args.code_sha, slots=args.slots)
     if args.action == "submit":
         if args.source is None or args.manifest is None or args.code_repo is None:
             parser.error("submit requires --source, --manifest and --code-repo")
-        verify_pilots(args.source, args.result_root, args.code_sha, args.code_repo)
+        from .progressive_prerequisites import verify_report
+        prerequisite = verify_report(args.source, args.result_root, args.code_sha,
+                                     args.code_repo)
+        print(f"[MATRIX SUBMISSION] prerequisite job={prerequisite['slurm_job_id']}")
+        selected = set(args.only) if args.only else None
+        if selected is None or not selected <= STAGE_A:
+            stage_a = verify_stage_a(args.result_root, args.manifest, prerequisite,
+                                     args.code_sha)
+            print(f"[STAGE A VALIDATED] jobs={','.join(row['job_id'] for row in stage_a.values())}")
         manifest["admission"] = admit_submission(args.source, args.result_root, args.slots)
         actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
         if actual != args.code_sha:
             raise ValueError("Submission code SHA differs from current checkout")
-        prior = json.loads(args.manifest.read_text()) if args.manifest.is_file() else {}
         manifest = submit(manifest, args.script, args.manifest,
-                          selected=set(args.only) if args.only else None)
+                          selected=selected)
     elif args.manifest:
         if args.manifest.exists():
             previous = json.loads(args.manifest.read_text())
             if previous.get("job_ids") or previous.get("status") in ("submitting", "submitted"):
                 raise FileExistsError("Dry run cannot overwrite a submitted job manifest")
         atomic_json(args.manifest, manifest)
-    print(json.dumps(manifest, indent=2))
+    if args.action == "submit":
+        print(json.dumps({"status": manifest["status"], "code_sha": args.code_sha,
+            "manifest": str(args.manifest), "job_ids": manifest["job_ids"],
+            "remaining": [point["id"] for point in manifest["points"]
+                          if point["id"] not in manifest["job_ids"]]}, indent=2))
+    else:
+        print(json.dumps(manifest, indent=2))
 
 
 if __name__ == "__main__":

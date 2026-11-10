@@ -33,6 +33,10 @@ QUANTIZER = {"family": "symmetric_rtn", "bits": 2, "group_size": GROUP,
 
 
 def _files(directory: Path) -> dict:
+    from .progressive_prerequisites import verified_input_identity
+    cached = verified_input_identity(directory)
+    if cached is not None:
+        return cached
     mapping = _weight_map(directory)
     return {"config_sha256": sha256(directory / "config.json"),
             "index_sha256": sha256(directory / "model.safetensors.index.json"),
@@ -130,6 +134,12 @@ def verified_layers(root: Path, depth: int, expected_identity: dict,
 
 def validate_repaired_base(branch: str, source: Path, base: Path) -> dict:
     """Require the original repair marker, full evaluation and current tensor audit."""
+    from .progressive_prerequisites import verified_input_identity
+    cached = verified_input_identity(base, branch=branch)
+    if cached is not None:
+        if verified_input_identity(source) is None:
+            raise ValueError("Prerequisite source identity is unavailable")
+        return cached
     from .quantizer_followups import load_config, validate_checkpoint
 
     if branch not in BRANCHES or base.parent.name != BRANCHES[branch]:
