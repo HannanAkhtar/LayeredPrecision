@@ -54,12 +54,16 @@ def test_validation_sweep_requires_exact_endpoint(tmp_path):
 def test_original_baseline_uses_official_protocol_once(tmp_path, monkeypatch):
     source, base = fixture(tmp_path, width=128)
     ident = diagnostic.identity("s01", source, base)
+    pinned_source = {"checkpoint": "original", "config_sha256": "config",
+                     "index_sha256": "index", "shard_sha256": {"shard": "hash"},
+                     "sidecar_sha256": {"tokenizer.json": "token-hash"}}
     prior = {key: {"identity": {"source": ident["source"],
                                 "repaired_base": ident["repaired_base"]}}
-             for key in ("w2", "ternary_e2", "signed_e2")}
+             for key in ("ternary_e2", "signed_e2")}
+    prior["w2"] = {"identity": {"id": "s01_fp16_load_repair",
+                              "original_run_identity": {"source": pinned_source}}}
     monkeypatch.setattr(diagnostic, "_records", lambda *_: prior)
-    monkeypatch.setattr(diagnostic, "same_hf_contents", lambda *_: True)
-    monkeypatch.setattr("lp_llm.rrq_pr2308.source_identity", lambda *_: {})
+    monkeypatch.setattr("lp_llm.rrq_pr2308.source_identity", lambda *_: pinned_source)
     monkeypatch.setattr(diagnostic, "check_revision", lambda *_: None)
     monkeypatch.setattr(diagnostic, "validate_repaired_base", lambda *_: {})
     monkeypatch.setattr(diagnostic, "corpus_identity", lambda path: {
@@ -78,4 +82,8 @@ def test_original_baseline_uses_official_protocol_once(tmp_path, monkeypatch):
     assert calls == [source]
     (output / "evaluation.log").write_text("modified")
     with pytest.raises(ValueError, match="Existing original baseline"):
+        diagnostic.baseline(source, base, tmp_path, tmp_path, output, "a" * 40)
+    prior["w2"]["identity"]["original_run_identity"]["source"] = {
+        **pinned_source, "config_sha256": "wrong"}
+    with pytest.raises(ValueError, match="source or base identity differs"):
         diagnostic.baseline(source, base, tmp_path, tmp_path, output, "a" * 40)

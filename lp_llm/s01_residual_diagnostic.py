@@ -57,7 +57,8 @@ def baseline(source: Path, base: Path, result_root: Path, matgptq: Path,
     ident = identity("s01", source, base)
     prior = _records(result_root)
     from .rrq_pr2308 import source_identity
-    if (not same_hf_contents(prior["w2"]["identity"]["source"], source_identity(source)) or
+    if (not same_hf_contents(prior["w2"]["identity"]["original_run_identity"]["source"],
+                             source_identity(source)) or
             prior["ternary_e2"]["identity"].get("source") != ident["source"] or
             prior["ternary_e2"]["identity"].get("repaired_base") != ident["repaired_base"] or
             prior["signed_e2"]["identity"].get("source") != ident["source"] or
