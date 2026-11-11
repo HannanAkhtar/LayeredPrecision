@@ -95,6 +95,55 @@ inputs while the matrix runs.
 
 ## AUS Stage A: two real matrix points
 
+### S01 signed E2 ablation
+
+The separate `progressive_llm/ablations/s01_autoround_signed_rtn` root tests
+AutoRound plain signed RTN for the E2 residual. The historical ternary layer
+under `progressive_llm/s01` and the repaired S01 W2 checkpoint are read-only
+inputs. The CPU job validates the repaired base and writes one signed E2 layer;
+the GPU job verifies that layer, materializes a temporary FP16 checkpoint,
+and uses the unchanged official MatGPTQ evaluator. Both jobs record Slurm
+cgroup and process RSS under `progressive_llm/job_resources`. No Stage A or
+Stage B admission status is conferred by this ablation.
+
+Submit each job normally and inspect its completed Slurm status before the
+next submission:
+
+```bash
+cd /shared/makhtar/lp_llm/code
+git pull --ff-only origin experiment/rrq-w2-reproduction
+CODE_SHA=$(git rev-parse HEAD)
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/progressive_llm/e2_signed_encode.sbatch
+# After encoding completes with exit code 0:0:
+ROOT=/shared/makhtar/lp_llm/results/qwen3_8b_base/progressive_llm/ablations/s01_autoround_signed_rtn
+test -s "$ROOT/layer1/encoding_complete.json"
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" hpc/progressive_llm/e2_signed_evaluate.sbatch
+# After evaluation completes with exit code 0:0:
+python - <<'PY'
+import json
+from pathlib import Path
+r = Path('/shared/makhtar/lp_llm/results/qwen3_8b_base/progressive_llm/ablations/s01_autoround_signed_rtn')
+layer = json.loads((r/'layer1/encoding_complete.json').read_text())
+full = json.loads((r/'evaluation/full.json').read_text())
+print('PPL:', full['evaluation']['perplexity'])
+print('Base MSE:', layer['base_mse_fp32'])
+print('Signed E2 MSE:', layer['mse_fp32'])
+print('Signed E2 FP16 MSE:', layer['mse_after_fp16_checkpoint_cast'])
+print('Signed E2 SQNR dB:', layer['sqnr_db_fp32'])
+print('Codes:', layer['code_histogram'])
+print('Group scales:', layer['group_scale_statistics'])
+print('Enhancement bytes:', layer['code_bytes'] + layer['metadata_bytes'])
+print('MatGPTQ log:', r/'evaluation/evaluation.log')
+PY
+```
+
+The existing W2 and ternary E2 PPL values are 12.47 and 13.38. Read their
+stored records when assembling the three-column comparison; the signed E2
+PPL is unknown until the GPU job finishes. The new layer reports measured
+base and enhanced weight MSE, FP16-cast MSE, SQNR, code use, scales, and
+physical code plus metadata bytes. Historical metrics unavailable in the
+original records remain unfilled rather than inferred.
+
 **Recovery of jobs 55385/55386:** Do not rerun the commands below for those
 existing points. The LP `full.json` is scientifically complete at PPL 13.38,
 but its 12G Slurm job failed the prior memory rule. The W4 `export.partial`

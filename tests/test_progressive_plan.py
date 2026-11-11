@@ -225,6 +225,14 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
             ", Path(" + repr(str(checkout)) + "), Path.cwd()))")
     result = subprocess.run([sys.executable, "-c", code], cwd=staged, env=environment,
                             text=True, capture_output=True, check=False)
+    numerical_changed = subprocess.run(["git", "-C", str(checkout), "diff", "--quiet",
+        LP_PILOT_PREVIOUS_SHA, proposed, "--", "lp_llm/progressive_lp.py"],
+        check=False).returncode != 0
+    if numerical_changed:
+        # A new enhancement format must not inherit historical pilot admission.
+        assert result.returncode != 0
+        assert "LP numerical implementation differs" in result.stderr
+        return
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == LP_PILOT_PREVIOUS_SHA
     result_root = tmp_path / "results"

@@ -34,11 +34,12 @@ def _chunk_for(manifest: dict, name: str, first: int, stop: int) -> dict:
 
 
 def materialize(branch: str, depth: int, source: Path, base: Path, root: Path,
-                target: Path, *, rows: int = ROWS) -> dict:
+                target: Path, *, rows: int = ROWS,
+                quantizer: str = "symmetric_ternary_rtn") -> dict:
     """One tensor per shard; never overwrite a checkpoint or interrupted partial."""
     if depth not in (0, 1, 2, 3):
         raise ValueError("LP materialization depth must be 0..3")
-    ident = identity(branch, source, base)
+    ident = identity(branch, source, base, quantizer)
     layers = verified_layers(root, depth, ident)
     partial = target.with_name(target.name + ".partial")
     if target.exists() or partial.exists():
@@ -100,12 +101,13 @@ def materialize(branch: str, depth: int, source: Path, base: Path, root: Path,
 
 
 def evaluate(branch: str, depth: int, source: Path, base: Path, root: Path,
-             matgptq: Path, result: Path, *, python: str = sys.executable) -> dict:
+             matgptq: Path, result: Path, *, python: str = sys.executable,
+             quantizer: str = "symmetric_ternary_rtn") -> dict:
     if depth not in (1, 2, 3):
         raise ValueError("Invalid LP evaluation depth")
     check_revision(matgptq, MATGPTQ_COMMIT)
     validate_repaired_base(branch, source, base)
-    ident = identity(branch, source, base)
+    ident = identity(branch, source, base, quantizer)
     verified_layers(root, depth, ident)
     full = result / "full.json"
     if full.is_file():
@@ -125,7 +127,8 @@ def evaluate(branch: str, depth: int, source: Path, base: Path, root: Path,
                                       "code_sha": os.environ.get("FOLLOWUP_CODE_SHA")})
     checkpoint = result / "checkpoint"
     try:
-        materialization = materialize(branch, depth, source, base, root, checkpoint)
+        materialization = materialize(branch, depth, source, base, root, checkpoint,
+                                      quantizer=quantizer)
         corpus = corpus_identity(checkpoint)
         if corpus["token_sha256"] != TOKEN_SHA or corpus["scored_tokens"] != 298862:
             raise ValueError("LP MatGPTQ corpus identity differs")
@@ -139,7 +142,7 @@ def evaluate(branch: str, depth: int, source: Path, base: Path, root: Path,
                   "code_sha": os.environ.get("FOLLOWUP_CODE_SHA"),
                   "materialization": materialization, "corpus": corpus,
                   "evaluation": measurement,
-                  "storage": storage_report(branch, source, base, root, depth),
+                  "storage": storage_report(branch, source, base, root, depth, quantizer),
                   "evaluation_log_sha256": sha256(result / "evaluation.log")}
         atomic_json(full, record)
         # Only this job's generated checkpoint is removed after durable full.json.
@@ -162,12 +165,14 @@ def main() -> None:
     parser.add_argument("--result", type=Path)
     parser.add_argument("--matgptq", type=Path)
     parser.add_argument("--pilot-tensors", type=int)
+    parser.add_argument("--quantizer", choices=("symmetric_ternary_rtn", "autoround_signed_rtn"),
+                        default="symmetric_ternary_rtn")
     args = parser.parse_args()
     if args.action == "encode":
         try:
             validate_repaired_base(args.branch, args.source, args.base)
             report = encode_layer(args.branch, args.depth, args.source, args.base, args.root,
-                                  limit_tensors=args.pilot_tensors)
+                                  limit_tensors=args.pilot_tensors, quantizer=args.quantizer)
             (args.root / f"failure-layer{args.depth}.json").unlink(missing_ok=True)
         except Exception as error:
             atomic_json(args.root / f"failure-layer{args.depth}.json", {
@@ -178,7 +183,7 @@ def main() -> None:
         if args.result is None or args.matgptq is None:
             parser.error("evaluate requires --result and --matgptq")
         report = evaluate(args.branch, args.depth, args.source, args.base, args.root,
-                          args.matgptq, args.result)
+                          args.matgptq, args.result, quantizer=args.quantizer)
     print(json.dumps({"status": report["status"], "depth": args.depth,
                       "branch": args.branch}, indent=2))
 

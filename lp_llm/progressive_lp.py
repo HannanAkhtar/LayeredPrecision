@@ -12,7 +12,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
-from .quantize import affine_decode, symmetric_rtn_quantize
+from .quantize import affine_decode, autoround_rtn_sym_quantize, symmetric_rtn_quantize
 from .rrq_pr2308_compare import _eligible, _weight_map
 from .storage import atomic_json, pack_codes, sha256, unpack_codes
 
@@ -30,6 +30,23 @@ QUANTIZER = {"family": "symmetric_rtn", "bits": 2, "group_size": GROUP,
              "residual_dtype": "float32", "accumulator_dtype": "float32",
              "checkpoint_dtype": "float16_for_eligible;source_dtype_for_excluded",
              "calibration": "none"}
+SIGNED_QUANTIZER = {"family": "autoround_rtn_sym", "bits": 2, "group_size": GROUP,
+                    "axis": "input_channels_per_output_row", "grid": "{-2s,-s,0,+s}",
+                    "code_values": {"-2": 0, "-1": 1, "0": 2, "+1": 3},
+                    "scale_dtype": "float16_computed;float32_serialized",
+                    "zero_point": "implicit_2", "rounding": "torch.round_ties_to_even",
+                    "clipping": "signed_int2", "residual_dtype": "float32",
+                    "accumulator_dtype": "float32",
+                    "checkpoint_dtype": "float16_for_eligible;source_dtype_for_excluded",
+                    "calibration": "none"}
+QUANTIZERS = {"symmetric_ternary_rtn": QUANTIZER,
+              "autoround_signed_rtn": SIGNED_QUANTIZER}
+
+
+def _quantizer(name: str) -> dict:
+    if name not in QUANTIZERS:
+        raise ValueError(f"Unknown LP enhancement quantizer: {name}")
+    return QUANTIZERS[name]
 
 
 def _files(directory: Path) -> dict:
@@ -45,7 +62,8 @@ def _files(directory: Path) -> dict:
             "tensor_names": sorted(mapping)}
 
 
-def identity(branch: str, source: Path, base: Path) -> dict:
+def identity(branch: str, source: Path, base: Path,
+             quantizer: str = "symmetric_ternary_rtn") -> dict:
     if branch not in BRANCHES:
         raise ValueError("Unknown LP branch")
     source_files, base_files = _files(source), _files(base)
@@ -55,7 +73,7 @@ def identity(branch: str, source: Path, base: Path) -> dict:
     if len(eligible) != 252:
         raise ValueError(f"Expected 252 projections, got {len(eligible)}")
     return {"branch": branch, "source": source_files, "repaired_base": base_files,
-            "residual_quantizer": QUANTIZER, "eligible_projection_count": 252}
+            "residual_quantizer": _quantizer(quantizer), "eligible_projection_count": 252}
 
 
 def _slice(directory: Path, mapping: dict, name: str, first: int, stop: int) -> torch.Tensor:
@@ -63,8 +81,14 @@ def _slice(directory: Path, mapping: dict, name: str, first: int, stop: int) -> 
         return handle.get_slice(name)[first:stop]
 
 
-def encode_residual(residual: torch.Tensor) -> tuple[dict, torch.Tensor]:
-    params, encoded = symmetric_rtn_quantize(residual.float(), 2, "group", GROUP)
+def encode_residual(residual: torch.Tensor, quantizer: str = "symmetric_ternary_rtn") -> tuple[dict, torch.Tensor]:
+    _quantizer(quantizer)
+    quantize = (symmetric_rtn_quantize if quantizer == "symmetric_ternary_rtn"
+                else autoround_rtn_sym_quantize)
+    params, encoded = quantize(residual.float(), 2, "group", GROUP)
+    if quantizer == "autoround_signed_rtn":
+        # Preserve the reference's FP16-rounded scale exactly as FP32 payload.
+        params["scale"] = params["scale"].float()
     decoded = affine_decode(params)
     if not torch.equal(encoded, decoded):
         raise ValueError("Encoder and independent FP32 decoder differ")
@@ -74,6 +98,8 @@ def encode_residual(residual: torch.Tensor) -> tuple[dict, torch.Tensor]:
 
 
 def _read_chunk(layer_dir: Path, record: dict) -> torch.Tensor:
+    quantizer = record.get("quantizer", "symmetric_ternary_rtn")
+    _quantizer(quantizer)
     code, meta = layer_dir / record["code"], layer_dir / record["metadata"]
     if (sha256(code) != record["code_sha256"] or
             sha256(meta) != record["metadata_sha256"]):
@@ -81,12 +107,12 @@ def _read_chunk(layer_dir: Path, record: dict) -> torch.Tensor:
     tensors = load_file(str(meta), device="cpu")
     if set(tensors) != {"scale"} or tensors["scale"].dtype != torch.float32:
         raise ValueError("Residual scale metadata differs")
-    params = {"family": "symmetric_rtn", "bits": 2, "granularity": "group",
+    params = {"family": _quantizer(quantizer)["family"], "bits": 2, "granularity": "group",
               "group_size": GROUP, "shape": record["shape"],
               "codes": unpack_codes(code, tuple(record["shape"]), 2),
               "scale": tensors["scale"]}
-    if int(params["codes"].min()) < 1 or int(params["codes"].max()) > 3:
-        raise ValueError("Residual code outside signed ternary grid")
+    if int(params["codes"].min()) < (1 if quantizer == "symmetric_ternary_rtn" else 0) or int(params["codes"].max()) > 3:
+        raise ValueError("Residual code outside selected signed grid")
     return affine_decode(params)
 
 
@@ -99,7 +125,7 @@ def _manifest(root: Path, depth: int, expected_identity: dict,
     expected_status = "pilot_validated" if pilot else "completed_validated"
     if (record.get("status") != expected_status or
             record.get("identity") != expected_identity or record.get("depth") != depth or
-            record.get("quantizer") != QUANTIZER or
+            record.get("quantizer") != expected_identity.get("residual_quantizer") or
             record.get("projection_count") != (7 if pilot else 252) or
             record.get("chunk_count") != len(record.get("chunks", []))):
         raise ValueError(f"LP predecessor identity or structure differs: {path}")
@@ -108,6 +134,9 @@ def _manifest(root: Path, depth: int, expected_identity: dict,
         raise ValueError("LP predecessor was encoded by a different code commit")
     by_tensor: dict[str, list[dict]] = {}
     for chunk in record["chunks"]:
+        if chunk.get("quantizer", "symmetric_ternary_rtn") not in QUANTIZERS or \
+                _quantizer(chunk.get("quantizer", "symmetric_ternary_rtn")) != record["quantizer"]:
+            raise ValueError("LP chunk quantizer differs from layer manifest")
         _read_chunk(root / f"layer{depth}", chunk)
         by_tensor.setdefault(chunk["name"], []).append(chunk)
     if set(by_tensor) != set(record.get("tensor_rows", {})):
@@ -180,12 +209,13 @@ def _checkpoint_bytes(base: Path) -> int:
 
 
 def encode_layer(branch: str, depth: int, source: Path, base: Path, root: Path,
-                 *, rows: int = ROWS, limit_tensors: int | None = None) -> dict:
+                 *, rows: int = ROWS, limit_tensors: int | None = None,
+                 quantizer: str = "symmetric_ternary_rtn") -> dict:
     """Encode one enhancement; pilot limit writes an isolated incomplete pilot."""
     started = time.monotonic()
     if depth not in (1, 2, 3) or rows < 1:
         raise ValueError("Invalid LP depth or row block")
-    current_identity = identity(branch, source, base)
+    current_identity = identity(branch, source, base, quantizer)
     prior = verified_layers(root, depth - 1, current_identity,
                             pilot=limit_tensors is not None)
     target = root / f"layer{depth}"
@@ -205,7 +235,11 @@ def encode_layer(branch: str, depth: int, source: Path, base: Path, root: Path,
     atomic_json(partial / "run.json", {"status": "started", "identity": current_identity,
                                       "depth": depth, "code_sha": code_sha})
     chunks = []
-    sum_sq = source_sq = 0.0
+    sum_sq = source_sq = base_sq = fp16_sq = 0.0
+    code_histogram = [0, 0, 0, 0]
+    scale_abs_sum = 0.0
+    scale_min = scale_max = None
+    scale_count = 0
     count = 0
     layer_errors: dict[str, dict] = {}
     tensor_rows: dict[str, int] = {}
@@ -226,8 +260,18 @@ def encode_layer(branch: str, depth: int, source: Path, base: Path, root: Path,
                 if len(matches) != 1:
                     raise ValueError("Predecessor row partition differs")
                 previous += _read_chunk(root / f"layer{number}", matches[0])
-            params, decoded = encode_residual(original - previous)
+            params, decoded = encode_residual(original - previous, quantizer)
+            base_sq += float((original - base_value.float()).double().square().sum())
+            for code_value, frequency in enumerate(torch.bincount(params["codes"].flatten().long(),
+                                                                   minlength=4).tolist()):
+                code_histogram[code_value] += frequency
+            scale_abs = params["scale"].abs()
+            scale_abs_sum += float(scale_abs.double().sum())
+            scale_min = min(scale_min, float(params["scale"].min())) if scale_min is not None else float(params["scale"].min())
+            scale_max = max(scale_max, float(params["scale"].max())) if scale_max is not None else float(params["scale"].max())
+            scale_count += params["scale"].numel()
             reconstructed = previous + decoded
+            fp16_sq += float((original - reconstructed.to(torch.float16).float()).double().square().sum())
             if not bool(torch.isfinite(reconstructed).all()):
                 raise ValueError(f"Nonfinite LP prefix: {name}")
             stem = f"chunks/{tensor_number:03d}-{first:05d}"
@@ -237,13 +281,15 @@ def encode_layer(branch: str, depth: int, source: Path, base: Path, root: Path,
             save_file({"scale": params["scale"].contiguous()}, meta, metadata={"format": "pt"})
             loaded = _read_chunk(partial, {"code": str(code.relative_to(partial)),
                 "metadata": str(meta.relative_to(partial)), "code_sha256": sha256(code),
-                "metadata_sha256": sha256(meta), "shape": list(params["codes"].shape)})
+                "metadata_sha256": sha256(meta), "shape": list(params["codes"].shape),
+                "quantizer": quantizer})
             if not torch.equal(loaded, decoded):
                 raise ValueError("Saved residual code round trip differs")
             chunks.append({"name": name, "first": first, "stop": stop,
                 "shape": list(params["codes"].shape), "code": str(code.relative_to(partial)).replace("\\", "/"),
                 "metadata": str(meta.relative_to(partial)).replace("\\", "/"),
                 "code_sha256": sha256(code), "metadata_sha256": sha256(meta),
+                "quantizer": quantizer,
                 "code_bytes": code.stat().st_size, "metadata_bytes": meta.stat().st_size,
                 "scale_payload_bytes": params["scale"].numel() * params["scale"].element_size()})
             error = original - reconstructed
@@ -268,12 +314,18 @@ def encode_layer(branch: str, depth: int, source: Path, base: Path, root: Path,
                   "site_confirmed" if os.environ.get("LP_MATRIX_SHARED_QUOTA_FREE_GIB") else
                   "unknown_unapproved"),
               "identity": current_identity, "depth": depth, "code_sha": code_sha,
-              "quantizer": QUANTIZER,
+              "quantizer": _quantizer(quantizer),
               "pilot_tensor_limit": limit_tensors,
               "tensor_rows": tensor_rows,
               "chunk_count": len(chunks), "chunks": chunks, "projection_count":
               len({chunk["name"] for chunk in chunks}), "encoded_elements": count,
               "mse_fp32": sum_sq / count, "normalized_mse_fp32": sum_sq / source_sq if source_sq else None,
+              "base_mse_fp32": base_sq / count,
+              "mse_after_fp16_checkpoint_cast": fp16_sq / count,
+              "code_histogram": code_histogram,
+              "group_scale_statistics": {"count": scale_count, "signed_min": scale_min,
+                                         "signed_max": scale_max,
+                                         "mean_abs": scale_abs_sum / scale_count},
               "sqnr_db_fp32": 10 * math.log10(source_sq / sum_sq) if sum_sq and source_sq else None,
               "layerwise": {layer: {"mse_fp32": value["squared_error"] / value["elements"],
                                      "normalized_mse_fp32": value["squared_error"] / value["signal_square"]
@@ -297,9 +349,10 @@ def encode_layer(branch: str, depth: int, source: Path, base: Path, root: Path,
     return report
 
 
-def storage_report(branch: str, source: Path, base: Path, root: Path, depth: int) -> dict:
+def storage_report(branch: str, source: Path, base: Path, root: Path, depth: int,
+                   quantizer: str = "symmetric_ternary_rtn") -> dict:
     """Measured dependent bytes; the repaired W2 base remains an external artifact."""
-    ident = identity(branch, source, base)
+    ident = identity(branch, source, base, quantizer)
     layers = verified_layers(root, depth, ident)
     base_bytes = _checkpoint_bytes(base)
     rows = []
