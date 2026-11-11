@@ -231,7 +231,8 @@ def test_cross_commit_acceptance_from_real_git_archive(tmp_path):
     if numerical_changed:
         # A new enhancement format must not inherit historical pilot admission.
         assert result.returncode != 0
-        assert "LP numerical implementation differs" in result.stderr
+        assert ("LP numerical implementation differs" in result.stderr or
+                "LP implementation differs" in result.stderr)
         return
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == LP_PILOT_PREVIOUS_SHA

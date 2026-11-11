@@ -95,6 +95,54 @@ inputs while the matrix runs.
 
 ## AUS Stage A: two real matrix points
 
+### Read-only S01 residual diagnosis
+
+The diagnostic root is `progressive_llm/diagnostics/s01_residual_behavior/<CODE_SHA>`.
+It does not change the original, repaired W2, ternary E2, or signed E2 artifacts.
+Run the original FP16 MatGPTQ baseline and the CPU exact-residual audit first.
+The exact audit streams all 252 projections, checks excluded tensors, and
+requires FP16 endpoint equality. Its `exact_endpoint.json` must have
+`completed_validated`, `projection_count=252`, `fp16_differing_elements=0`,
+and `exact_mse_after_fp16_cast=0` before submitting the validation sweep.
+
+```bash
+cd /shared/makhtar/lp_llm/code
+git pull --ff-only origin experiment/rrq-w2-reproduction
+CODE_SHA=$(git rev-parse HEAD)
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",S01_DIAG_ACTION=baseline \
+  hpc/progressive_llm/s01_diagnostic_gpu.sbatch
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA" \
+  hpc/progressive_llm/s01_diagnostic_exact.sbatch
+# Inspect both Slurm exit codes and the two completed_validated reports before continuing.
+ROOT=/shared/makhtar/lp_llm/results/qwen3_8b_base/progressive_llm/diagnostics/s01_residual_behavior/$CODE_SHA
+python - "$ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+r = Path(sys.argv[1]); exact = json.loads((r/'exact_endpoint.json').read_text())
+base = json.loads((r/'original_baseline/full.json').read_text())
+assert exact['status'] == base['status'] == 'completed_validated'
+assert exact['projection_count'] == 252 and exact['fp16_differing_elements'] == 0
+assert exact['exact_mse_after_fp16_cast'] == 0
+print('original FP16 MatGPTQ PPL:', base['evaluation']['perplexity'])
+print('W2 MSE:', exact['w2_mse_fp32'])
+print('exact residual MSE:', exact['exact_mse_fp32'])
+PY
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",S01_DIAG_ACTION=sweep,S01_DIAG_BLOCKS=8 \
+  hpc/progressive_llm/s01_diagnostic_gpu.sbatch
+# After the 8-block screen passes, inspect the validation results. If useful,
+# confirm with 32 fixed validation blocks; do not use test-set PPL for selection.
+sbatch --export=ALL,FOLLOWUP_CODE_SHA="$CODE_SHA",S01_DIAG_ACTION=sweep,S01_DIAG_BLOCKS=32 \
+  hpc/progressive_llm/s01_diagnostic_gpu.sbatch
+```
+
+The sweep writes separate `validation_sweep_8.json` and
+`validation_sweep_32.json` with exact and signed alpha values, weight MSE,
+FP16-cast MSE, validation cross-entropy, validation PPL, scored tokens, and
+runtime. Do not submit the 32-block confirmation until the 8-block report
+passes review. Layer-group sensitivity remains gated on the AUS exact-endpoint
+and validation-path checks; no group sweep or full test-set tuning is launched
+by these commands.
+
 ### S01 signed E2 ablation
 
 The separate `progressive_llm/ablations/s01_autoround_signed_rtn` root tests
