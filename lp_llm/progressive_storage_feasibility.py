@@ -16,6 +16,7 @@ import torch
 from safetensors import safe_open
 
 from .progressive_lp import _files
+from .rrq_pr2308 import source_identity
 from .rrq_pr2308_compare import _eligible, _weight_map
 from .storage import atomic_json, sha256
 
@@ -96,18 +97,27 @@ def _checkpoint(root: Path, branch: str, bits: int) -> dict:
             "checkpoint_validation": checked}
 
 
-def inventory(source: Path, root: Path, branch: str, bits: int) -> dict:
-    item = _checkpoint(root, branch, bits)
+def _verify_source(source: Path, item: dict) -> None:
+    """Use the producing experiment's source identity schema, never cross-compare schemas."""
     full = json.loads(Path(item["full_json"]).read_text())
+    branch, bits = item["branch"], item["bits"]
     if branch == "s01" and bits == 4:
         marker = json.loads(Path(item["completion_json"]).read_text())
         recorded_source = marker.get("source_identity")
+        current = _files(source)
     elif bits == 2:
         recorded_source = (full.get("identity") or {}).get("original_run_identity", {}).get("source")
+        current = source_identity(source)
     else:
         recorded_source = (full.get("identity") or {}).get("source")
-    if recorded_source is None or recorded_source != _files(source):
+        current = _files(source)
+    if not isinstance(recorded_source, dict) or recorded_source != current:
         raise ValueError(f"{item['id']} source identity differs")
+
+
+def inventory(source: Path, root: Path, branch: str, bits: int) -> dict:
+    item = _checkpoint(root, branch, bits)
+    _verify_source(source, item)
     path = Path(item["checkpoint"])
     mapping, source_map = _weight_map(path), _weight_map(source)
     if set(mapping) != set(source_map):

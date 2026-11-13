@@ -5,6 +5,7 @@ import torch
 from safetensors.torch import save_file
 
 from lp_llm import progressive_storage_feasibility as sf
+from lp_llm.rrq_pr2308 import source_identity
 
 
 @pytest.mark.parametrize("bits", (2, 4, 6, 8))
@@ -104,3 +105,62 @@ def test_report_conflict_does_not_modify_existing_file(tmp_path):
     with pytest.raises(FileExistsError):
         sf.run(tmp_path, tmp_path, output, "sample", "a" * 40)
     assert output.read_bytes() == b"historic report"
+
+
+@pytest.mark.parametrize("branch", ("s01", "r02"))
+def test_nested_w2_source_identity_uses_original_hf_schema(tmp_path, branch):
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"model.embed_tokens.weight": torch.ones((2, 2), dtype=torch.bfloat16)},
+              source / "model-00001-of-00001.safetensors")
+    (source / "config.json").write_text(json.dumps({"model_type": "qwen3",
+        "num_hidden_layers": 36, "hidden_size": 4096}))
+    (source / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"model.embed_tokens.weight": "model-00001-of-00001.safetensors"}}))
+    detailed = source_identity(source)
+    assert detailed["checkpoint"] == str(source.resolve())
+    assert "tensor_names" not in detailed
+    assert detailed["config_sha256"] == sf.sha256(source / "config.json")
+    record = tmp_path / f"{branch}-full.json"
+    record.write_text(json.dumps({"identity": {"original_run_identity": {"source": detailed}}}))
+    item = {"id": f"{branch}_w2", "branch": branch, "bits": 2, "full_json": str(record)}
+    sf._verify_source(source, item)
+    alternate = tmp_path / "alternate-source"
+    alternate.mkdir()
+    for name in ("config.json", "model.safetensors.index.json", "model-00001-of-00001.safetensors"):
+        (alternate / name).write_bytes((source / name).read_bytes())
+    with pytest.raises(ValueError, match="source identity differs"):
+        sf._verify_source(alternate, item)
+    (source / "config.json").write_text(json.dumps({"model_type": "qwen3",
+        "num_hidden_layers": 36, "hidden_size": 4096, "changed": True}))
+    with pytest.raises(ValueError, match="source identity differs"):
+        sf._verify_source(source, item)
+    (source / "config.json").write_text(json.dumps({"model_type": "qwen3",
+        "num_hidden_layers": 36, "hidden_size": 4096}))
+    save_file({"model.embed_tokens.weight": torch.zeros((2, 2), dtype=torch.bfloat16)},
+              source / "model-00001-of-00001.safetensors")
+    with pytest.raises(ValueError, match="source identity differs"):
+        sf._verify_source(source, item)
+
+
+def test_control_and_recovered_w4_keep_lp_source_schema(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    expected = {"config_sha256": "c", "index_sha256": "i",
+                "shard_sha256": {"a.safetensors": "s"}, "tensor_names": ["weight"]}
+    monkeypatch.setattr(sf, "_files", lambda _: expected)
+    for branch, bits in (("r02", 4), ("s01", 4)):
+        record = tmp_path / f"{branch}-full.json"
+        completion = tmp_path / f"{branch}-audit.json"
+        if branch == "s01":
+            record.write_text("{}")
+            completion.write_text(json.dumps({"source_identity": expected}))
+        else:
+            record.write_text(json.dumps({"identity": {"source": expected}}))
+        item = {"id": f"{branch}_w{bits}", "branch": branch, "bits": bits,
+                "full_json": str(record), "completion_json": str(completion)}
+        sf._verify_source(source, item)
+        monkeypatch.setattr(sf, "_files", lambda _: {**expected, "config_sha256": "wrong"})
+        with pytest.raises(ValueError, match="source identity differs"):
+            sf._verify_source(source, item)
+        monkeypatch.setattr(sf, "_files", lambda _: expected)
