@@ -30,10 +30,12 @@ def _row(name: str, branch: str, bits: int, path: Path, kind: str) -> dict:
                 "status": "invalid_report", "perplexity": None, "result_path": str(path)}
     storage = full.get("storage", {})
     check = full.get("checkpoint_validation", {})
+    distortion = check.get("distortion", {}) if kind == "monolithic_control" else \
+        (full.get("materialization", {}) or {})
     return {"id": name, "branch": branch, "nominal_bits": bits, "kind": kind,
             "status": "completed_validated_reported", "perplexity": ppl,
-            "mse_fp32": (full.get("materialization", {}) or {}).get("mse_fp32"),
-            "sqnr_db_fp32": (full.get("materialization", {}) or {}).get("sqnr_db_fp32"),
+            "mse_fp32": distortion.get("mse_fp32"),
+            "sqnr_db_fp32": distortion.get("sqnr_db_fp32"),
             "physical_reconstruction_bytes": storage.get("physical_reconstruction_bytes") or
                 check.get("actual_checkpoint_file_bytes"),
             "storage_basis": storage.get("basis", "fake_qdq_checkpoint"),

@@ -53,7 +53,7 @@ if [[ "$ACTION" == recover_evaluate ]]; then
       --checkout "$LP_ROOT/references/rrq_pr2308/auto-round" \
       --matgptq "$LP_ROOT/references/rrq_w2/MatGPTQ" --audit "$AUDIT" \
       --result "$RESULT_ROOT/progressive_llm/scaled_signed_v1/control_recovery/s01_w4/evaluation" \
-      --code-sha "$CODE_SHA"
+      --code-sha "$CODE_SHA" --code-repo "$LP_CODE"
 else
   if [[ "$ACTION" == encode ]]; then
     if [[ ! -s "$CONTROL/encoding_complete.json" ]]; then
