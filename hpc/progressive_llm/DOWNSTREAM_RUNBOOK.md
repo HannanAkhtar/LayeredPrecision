@@ -38,10 +38,18 @@ echo "$PREFLIGHT"
 sacct -j "$PREFLIGHT" --format=JobID,State,ExitCode,ReqMem,MaxRSS
 ROOT=$RESULT_ROOT/progressive_llm/downstream_zero_shot/$FOLLOWUP_CODE_SHA
 "$LP_ROOT/envs/downstream/bin/python" -m json.tool "$ROOT/manifest.json" | head -n 100
+"$LP_ROOT/envs/downstream/bin/python" -m json.tool "$ROOT/preflight_complete.json" | head -n 60
+"$LP_ROOT/envs/downstream/bin/python" -m json.tool "$ROOT/job_resources/preflight-$PREFLIGHT.json" | head -n 80
 ```
 
-The preflight writes the pinned environment versions and dataset fingerprints.
-Require exit `0:0` and inspect the manifest before submitting pilots.
+The preflight writes the pinned environment versions and dataset fingerprints,
+then seals all 15 verified model identities. An incomplete preflight can be
+rerun; the seal is absent until all checks pass. The 48 GiB CPU allocation
+assumes sequential checkpoint verification with source/base identities cached
+only within this one process, followed by an independent rehash. NFS page
+cache may count against the Slurm cgroup; inspect the resource report and
+increase or split the CPU audit if it exceeds 48 GiB. Require exit `0:0`
+and inspect the manifest, seal and resource report before submitting pilots.
 
 ## Three concurrent pilots
 

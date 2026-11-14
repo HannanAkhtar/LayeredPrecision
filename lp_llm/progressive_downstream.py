@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -11,9 +12,10 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from .progressive_lp import BRANCHES, _files
-from .progressive_scaled import layers, materialize, scaled_identity
+from .progressive_scaled import S01_PRODUCER, layers, materialize, scaled_identity
 from .progressive_storage_feasibility import _checkpoint, _verify_source
 from .storage import atomic_json, sha256
 from .progressive_scaled_aggregate import aggregate as perplexity_matrix
@@ -48,19 +50,39 @@ def _versions() -> dict:
 
 
 def _cgroup_snapshot() -> dict:
-    base = Path("/sys/fs/cgroup")
+    proc = Path("/proc/self/cgroup")
+    if not proc.is_file():
+        return {"available": False}
+    selected = None
+    for line in proc.read_text().splitlines():
+        _, controllers, relative = line.split(":", 2)
+        if controllers == "" or "memory" in controllers.split(","):
+            selected = (controllers, relative)
+            if controllers == "":
+                break
+    if selected is None:
+        return {"available": False}
+    controllers, relative = selected
+    mount = Path("/sys/fs/cgroup" if controllers == "" else "/sys/fs/cgroup/memory")
+    base = (mount / relative.lstrip("/")).resolve()
+    if not base.is_relative_to(mount.resolve()) or base == mount.resolve():
+        raise ValueError("Cannot resolve the Slurm job memory cgroup")
     stat = base / "memory.stat"
     if not stat.is_file():
         return {"available": False}
     values = {}
     for line in stat.read_text().splitlines():
         name, count = line.split()
-        if name in ("anon", "file", "shmem", "inactive_file", "active_file"):
+        if name in ("anon", "file", "shmem", "inactive_file", "active_file",
+                    "rss", "cache"):
             values[name + "_bytes"] = int(count)
-    for name in ("memory.peak", "memory.max"):
+    for name in (("memory.peak", "memory.max") if controllers == "" else
+                 ("memory.max_usage_in_bytes", "memory.limit_in_bytes")):
         path = base / name
-        values[name.replace(".", "_") + "_bytes"] = path.read_text().strip() if path.is_file() else None
-    return {"available": True, **values}
+        raw = path.read_text().strip() if path.is_file() else None
+        values[("peak_bytes" if "peak" in name or "max_usage" in name else "limit_bytes")] = \
+            int(raw) if raw is not None and raw.isdigit() else raw
+    return {"available": True, "cgroup_path": str(base), **values}
 
 
 def _task_configs(checkout: Path) -> dict:
@@ -90,10 +112,18 @@ def _manifest(path: Path, code_sha: str, checkout: Path, *, create: bool) -> dic
         for key, value in expected.items():
             if saved.get(key) != value:
                 raise ValueError(f"Downstream manifest changed at {key}")
-        if (json.loads((path.parent / "environment.json").read_text()) != saved["versions"] or
-                json.loads((path.parent / "task_manifest.json").read_text()) !=
-                {"tasks": saved["tasks"], "datasets": saved["datasets"]}):
-            raise ValueError("Downstream environment or task manifest changed")
+        sidecars = {"environment.json": saved["versions"],
+                    "task_manifest.json": {"tasks": saved["tasks"],
+                                           "datasets": saved["datasets"]}}
+        for name, value in sidecars.items():
+            sidecar = path.parent / name
+            if sidecar.is_file():
+                if json.loads(sidecar.read_text()) != value:
+                    raise ValueError(f"Downstream {name} changed")
+            elif create:
+                atomic_json(sidecar, value)
+            else:
+                raise FileNotFoundError(f"Incomplete downstream preflight: {name}")
         return saved
     if not create:
         raise FileNotFoundError(f"CPU downstream preflight required: {path}")
@@ -136,17 +166,28 @@ def _historical(root: Path, model: str, source: Path) -> tuple[Path | None, dict
         depth = int(suffix[2:]) // 2 - 1
         base = root / f"quantizer_followups/{BRANCHES[branch]}/export"
         lp = root / f"progressive_llm/scaled_signed_v1/{branch}"
-        ident = scaled_identity(branch, source, base)
-        prior = layers(branch, depth, source, base, lp, ident)
+        if branch == "s01" and not (lp / "layer1_reference.json").is_file():
+            raise ValueError("Historical S01 E1 reference is missing; refusing to write LP artifacts")
         record = root / f"progressive_llm/scaled_signed_v1/{branch}/evaluation/depth{depth}/full.json"
         full = json.loads(record.read_text())
+        producer = full.get("code_sha")
+        if not isinstance(producer, str) or len(producer) != 40:
+            raise ValueError(f"Historical LP producer SHA missing: {model}")
+        ident = scaled_identity(branch, source, base)
+        with patch.dict(os.environ, {"FOLLOWUP_CODE_SHA": producer}):
+            prior = layers(branch, depth, source, base, lp, ident)
         if (full.get("status") != "completed_validated" or full.get("identity") != ident or
                 full.get("depth") != depth or len(prior) != depth or
                 sha256(record.parent / "evaluation.log") != full.get("evaluation_log_sha256")):
             raise ValueError(f"Historical LP evaluation differs: {model}")
+        for number, layer in enumerate(prior, 1):
+            expected_sha = S01_PRODUCER if branch == "s01" and number == 1 else producer
+            if layer["manifest"].get("code_sha") != expected_sha:
+                raise ValueError(f"Historical LP layer producer differs: {model}")
         return None, {"historical_report": str(record), "report_sha256": sha256(record),
                       "historical_materialization": full["materialization"],
                       "lp_identity": ident, "depth": depth, "branch": branch,
+                      "historical_producer_sha": producer,
                       "base": str(base), "lp_root": str(lp)}
     bits = int(suffix[1:])
     item = _checkpoint(root, branch, bits)
@@ -170,11 +211,64 @@ def registry(source: Path, root: Path) -> dict:
     return {model: _historical(root, model, source) for model in MODELS}
 
 
+def _preflight_registry(source: Path, root: Path) -> dict:
+    """Hash each LP source/base once, then rehash to certify the complete audit."""
+    from . import progressive_lp, progressive_scaled, progressive_storage_feasibility
+    original = progressive_lp._files
+    cache = {}
+    def files(directory: Path) -> dict:
+        directory = Path(directory).resolve()
+        stamp = {p.name: (p.stat().st_size, p.stat().st_mtime_ns,
+                          p.stat().st_ctime_ns, p.stat().st_ino)
+                 for p in directory.iterdir() if p.is_file()}
+        saved = cache.get(directory)
+        if saved is not None and saved[0] == stamp:
+            return saved[1]
+        value = original(directory)
+        cache[directory] = (stamp, value)
+        return value
+    with patch.object(progressive_lp, "_files", files), \
+         patch.object(progressive_scaled, "_files", files), \
+         patch.object(progressive_storage_feasibility, "_files", files), \
+         patch.dict(globals(), {"_files": files}):
+        entries = registry(source, root)
+    for directory, (stamp, identity) in cache.items():
+        if files(directory) != identity or original(directory) != identity:
+            raise ValueError(f"Preflight input changed during verification: {directory}")
+    return entries
+
+
+def _provenance_digest(value: tuple[Path | None, dict]) -> str:
+    return hashlib.sha256(json.dumps([str(value[0]) if value[0] else None, value[1]],
+                                     sort_keys=True).encode()).hexdigest()
+
+
+def _preflight_seal(output_root: Path, manifest: dict, entries: dict | None = None) -> dict:
+    path = output_root / "preflight_complete.json"
+    expected = {"status": "completed_validated", "code_sha": manifest["code_sha"],
+                "manifest_sha256": sha256(output_root / "manifest.json"),
+                "environment_sha256": sha256(output_root / "environment.json"),
+                "task_manifest_sha256": sha256(output_root / "task_manifest.json")}
+    if entries is not None:
+        expected["models"] = {name: _provenance_digest(entries[name]) for name in MODELS}
+    if path.is_file():
+        saved = json.loads(path.read_text())
+        if any(saved.get(key) != value for key, value in expected.items()) or \
+                set(saved.get("models", {})) != set(MODELS):
+            raise ValueError("Completed downstream preflight seal differs")
+        return saved
+    if entries is None:
+        raise FileNotFoundError("Completed downstream preflight seal required")
+    atomic_json(path, expected)
+    return expected
+
+
 def _materialize_lp(source: Path, model: str, provenance: dict, target: Path) -> Path:
     if shutil.disk_usage(target.parent).free < 18 * 1024**3:
         raise ValueError("Insufficient node-local scratch for LP checkpoint")
     report = materialize(provenance["branch"], provenance["depth"], source,
-                         Path(provenance["base"]), Path(provenance["lp_root"]), target)
+                         Path(provenance["base"]), Path(provenance["lp_root"]), target,
+                         historical_layer_sha=provenance["historical_producer_sha"])
     historical = provenance["historical_materialization"]
     if (report["shard_sha256"] != historical["shard_sha256"] or
             report["tensor_count"] != historical["tensor_count"] or
@@ -203,11 +297,14 @@ def _metrics(raw: dict, manifest: dict, tasks: tuple[str, ...]) -> dict:
 
 
 def evaluate(source: Path, root: Path, output_root: Path, model: str, manifest: dict,
-             *, pilot: bool, scratch: Path) -> dict:
+             *, pilot: bool, scratch: Path, seal: dict | None = None) -> dict:
     if model not in MODELS or pilot and model not in PILOTS:
         raise ValueError("Unknown or unsupported pilot model")
     target = output_root / ("pilot" if pilot else "models") / model
     full_path = target / "full.json"
+    checkpoint, provenance = _historical(root, model, source)
+    if seal is not None and seal["models"].get(model) != _provenance_digest((checkpoint, provenance)):
+        raise ValueError(f"Preflight model provenance changed: {model}")
     if full_path.exists():
         old = json.loads(full_path.read_text())
         if old.get("manifest_sha256") != sha256(output_root / "manifest.json") or \
@@ -216,7 +313,6 @@ def evaluate(source: Path, root: Path, output_root: Path, model: str, manifest: 
         return old
     if target.exists() and any(target.iterdir()):
         raise FileExistsError("Incomplete downstream result requires inspection")
-    checkpoint, provenance = _historical(root, model, source)
     owned = scratch / f"downstream-{model}-{os.environ.get('SLURM_JOB_ID', 'local')}"
     if owned.exists():
         raise FileExistsError("Job scratch already exists")
@@ -350,16 +446,20 @@ def main() -> None:
     manifest_path = a.output_root / "manifest.json"
     manifest = _manifest(manifest_path, a.code_sha, a.harness, create=a.action == "preflight")
     if a.action == "preflight":
-        registry(a.source, a.result_root)
+        entries = _preflight_registry(a.source, a.result_root)
+        _verify_datasets(manifest)
+        _preflight_seal(a.output_root, manifest, entries)
         print(json.dumps({"models": len(MODELS), "tasks": list(TASKS)}))
     elif a.action == "aggregate":
+        _preflight_seal(a.output_root, manifest)
         print(json.dumps({"rows": len(write_aggregate(a.result_root, a.output_root)["rows"])}))
     else:
         if a.model is None or a.scratch is None:
             p.error("evaluate requires --model and --scratch")
+        seal = _preflight_seal(a.output_root, manifest)
         _verify_datasets(manifest)
         result = evaluate(a.source, a.result_root, a.output_root, a.model, manifest,
-                          pilot=a.pilot, scratch=a.scratch)
+                          pilot=a.pilot, scratch=a.scratch, seal=seal)
         print(json.dumps({"model": a.model, "status": result["status"]}))
 
 

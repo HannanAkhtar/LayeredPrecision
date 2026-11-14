@@ -195,9 +195,15 @@ def encode(branch: str, depth: int, source: Path, base: Path, root: Path,
 
 
 def materialize(branch: str, depth: int, source: Path, base: Path, root: Path,
-                target: Path) -> dict:
+                target: Path, *, historical_layer_sha: str | None = None) -> dict:
     ident = scaled_identity(branch, source, base)
-    prior = layers(branch, depth, source, base, root, ident)
+    if historical_layer_sha is None:
+        prior = layers(branch, depth, source, base, root, ident)
+    else:
+        if len(historical_layer_sha) != 40:
+            raise ValueError("Historical LP producer SHA is invalid")
+        with patch.dict(os.environ, {"FOLLOWUP_CODE_SHA": historical_layer_sha}):
+            prior = layers(branch, depth, source, base, root, ident)
     partial = target.with_name(target.name + ".partial")
     if target.exists() or partial.exists():
         raise FileExistsError("Scaled checkpoint or partial already exists")
