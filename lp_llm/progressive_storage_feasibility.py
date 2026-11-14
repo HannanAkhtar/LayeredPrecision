@@ -214,7 +214,8 @@ def _candidate_scales(values: torch.Tensor, codes: range, dtype: torch.dtype,
 
 
 def recover_group(values: torch.Tensor, bits: int, branch: str, scale_dtype: str,
-                  *, search_limit: int = 256) -> dict:
+                  *, search_limit: int = 256, pre_export_fp16: bool = False,
+                  candidate_scales: list[float] | None = None) -> dict:
     if values.dtype not in (torch.float16, torch.bfloat16) or values.ndim != 1 or not 0 < len(values) <= GROUP:
         raise ValueError("Expected one nonempty FP16/BF16 input-channel group")
     if not bool(torch.isfinite(values).all()):
@@ -229,7 +230,8 @@ def recover_group(values: torch.Tensor, bits: int, branch: str, scale_dtype: str
               "maximum": float(values.max()), "zeros": int((values == 0).sum()),
               "negative": int((values < 0).sum()), "positive": int((values > 0).sum()),
               "code_range": [domain.start, domain.stop - 1], "scale_format": scale_dtype,
-              "decoder": "scale-dtype multiply then stored-dtype cast; integer (q-z) for R02",
+              "decoder": ("scale-dtype multiply, FP16 QDQ cast, stored-dtype export cast"
+                          if pre_export_fp16 else "scale-dtype multiply then stored-dtype cast") ,
               "signed_zero_present": bool(((_bits(values) == -32768)).any()),
               "search_limit": search_limit}
     if unique_bits > 1 << bits:
@@ -238,7 +240,8 @@ def recover_group(values: torch.Tensor, bits: int, branch: str, scale_dtype: str
     # R02 is evaluated with integer zero point; all possible offsets are included.
     effective_domain = domain if signed else range(-(1 << bits) + 1, 1 << bits)
     scaled_codes = effective_domain
-    candidates = _candidate_scales(values, scaled_codes, dtype, search_limit)
+    candidates = (candidate_scales[:search_limit] if candidate_scales is not None else
+                  _candidate_scales(values, scaled_codes, dtype, search_limit))
     tested = 0
     target = _bits(values)
     best = None
@@ -246,15 +249,27 @@ def recover_group(values: torch.Tensor, bits: int, branch: str, scale_dtype: str
         if not signed and scale <= 0:
             continue
         effective = torch.tensor(list(effective_domain), dtype=dtype)
-        grid = (effective * torch.tensor(scale, dtype=dtype)).to(values.dtype)
+        product = effective * torch.tensor(scale, dtype=dtype)
+        grid = product.to(torch.float16).to(values.dtype) if pre_export_fp16 else product.to(values.dtype)
         eq = _bits(grid)[:, None] == target[None, :]
         matches = eq.any(dim=0)
         positions = eq.to(torch.int8).argmax(dim=0)
+        zero = 0
+        feasible = bool(matches.all())
+        if feasible and not signed:
+            last = len(effective_domain) - 1 - eq.flip(0).to(torch.int8).argmax(dim=0)
+            first_effective = positions + effective_domain.start
+            last_effective = last + effective_domain.start
+            maxq = (1 << bits) - 1
+            low = max(0, int((-last_effective).max()))
+            high = min(maxq, int((maxq - first_effective).min()))
+            feasible = low <= high
+            if feasible:
+                zero = low
+                valid = torch.tensor([0 <= q + zero <= maxq for q in effective_domain])
+                positions = (eq & valid[:, None]).to(torch.int8).argmax(dim=0)
         chosen = positions + effective_domain.start
-        zero_low = max(0, -int(chosen.min())) if not signed else 0
-        zero_high = min((1 << bits) - 1, (1 << bits) - 1 - int(chosen.max())) if not signed else 0
-        zero = zero_low
-        count = int((~matches).sum()) + int(zero_low > zero_high)
+        count = int((~matches).sum()) + int(not feasible and bool(matches.all()))
         tested += 1
         if best is None or count < best["mismatching_elements"]:
             decoded = grid[positions]
@@ -315,6 +330,7 @@ def inspect(item: dict, mode: str, group_path: Path | None = None) -> dict:
     outcomes = ("exact_constructive", "not_representable_proven", "not_found_under_search", "unknown")
     counts = {fmt: {outcome: 0 for outcome in outcomes} for fmt in ("fp16", "fp32")}
     examples, total, exact_elements = [], 0, 0
+    exact_by_format = {"fp16": 0, "fp32": 0, "mixed": 0}
     errors = {"zero": 0, "positive_under_1e-3": 0, "at_least_1e-3": 0, "unavailable": 0}
     if group_path is not None:
         group_path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,15 +360,20 @@ def inspect(item: dict, mode: str, group_path: Path | None = None) -> dict:
                     if len(examples) < 24:
                         examples.append(entry)
                     total += 1
+                    for fmt in ("fp16", "fp32"):
+                        if tested[fmt]["outcome"] == "exact_constructive":
+                            exact_by_format[fmt] += len(values)
                     if any(c["outcome"] == "exact_constructive" for c in tested.values()):
                         exact_elements += len(values)
+                        exact_by_format["mixed"] += len(values)
     return {"inventory": item, "storage": _storage(item), "group_file": str(group_path),
             "group_file_sha256": sha256(group_path) if group_path else None,
             "examples": examples, "group_count": total, "exact_elements": exact_elements,
             "counts": counts, "error_histogram": errors,
             "scope": "all_groups" if mode == "full" else "deterministic_sample",
-            "exact_certificate": mode == "full" and total > 0 and
-                sum(counts["fp16"].values()) == total and exact_elements == item["eligible_elements"]}
+            "exact_certificates": {fmt: mode == "full" and total > 0 and
+                exact_by_format[fmt] == item["eligible_elements"]
+                for fmt in ("fp16", "fp32", "mixed")}}
 
 
 def _bar_figure(path: Path, title: str, rows: list[tuple[str, float]],
