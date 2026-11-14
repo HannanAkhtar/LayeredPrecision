@@ -239,3 +239,47 @@ def test_staged_jobs_prepend_pinned_harness_checkout():
         assert script.index('git -C "$LP_CODE" archive') < script.index('PYTHONPATH="$STAGE:$HARNESS')
     assert 'PYTHONPATH="$SOURCE${PYTHONPATH:+:$PYTHONPATH}"' in (
         root / "setup_downstream_env.sh").read_text()
+
+
+def test_task_manifest_json_round_trip_and_identity_changes(tmp_path, monkeypatch):
+    checkout = tmp_path / "harness"
+    for task, relative in ds.TASK_FILES.items():
+        path = checkout / "lm_eval/tasks" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"task: {task}\n")
+    monkeypatch.setattr(ds, "_revision", lambda *_: None)
+    monkeypatch.setattr(ds, "_versions", lambda: {"torch": "2.9.1+cu128"})
+    monkeypatch.setattr(ds, "_runtime_imports", lambda _: {"harness_file": "pinned"})
+    tasks = ds._task_configs(checkout)
+    assert isinstance(tasks["arc_easy"]["dataset"], list)
+    output = tmp_path / "output"
+    output.mkdir()
+    manifest = {"code_sha": "a" * 40, "harness_sha": ds.HARNESS_SHA,
+                "tasks": tasks, "versions": ds._versions(),
+                "runtime_imports": ds._runtime_imports(checkout),
+                "protocol": {"model": "hf", "dtype": "float16", "num_fewshot": 0,
+                             "batch_size": 1, "apply_chat_template": False,
+                             "limit": None, "seeds": [0, 1234, 1234, 1234]},
+                "datasets": {task: {"fingerprint": task} for task in ds.TASKS}}
+    path = output / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    (output / "environment.json").write_text(json.dumps({
+        "versions": manifest["versions"], "runtime_imports": manifest["runtime_imports"]}))
+    (output / "task_manifest.json").write_text(json.dumps({
+        "tasks": tasks, "datasets": manifest["datasets"]}))
+    before = {name: (output / name).read_bytes() for name in
+              ("manifest.json", "environment.json", "task_manifest.json")}
+    assert ds._manifest(path, "a" * 40, checkout, create=False) == manifest
+    assert before == {name: (output / name).read_bytes() for name in before}
+    for changed in ({**tasks["arc_easy"], "dataset": ["wrong", "ARC-Easy", "test"]},
+                    {**tasks["arc_easy"], "dataset": ["allenai/ai2_arc", "ARC-Easy", "validation"]},
+                    {**tasks["arc_easy"], "sha256": "wrong"}):
+        tampered = dict(manifest)
+        tampered["tasks"] = {**tasks, "arc_easy": changed}
+        path.write_text(json.dumps(tampered))
+        with pytest.raises(ValueError, match="manifest changed at tasks"):
+            ds._manifest(path, "a" * 40, checkout, create=False)
+    path.write_bytes(before["manifest.json"])
+    (checkout / "lm_eval/tasks/arc/arc_easy.yaml").write_text("task: arc_easy\nchanged: true\n")
+    with pytest.raises(ValueError, match="manifest changed at tasks"):
+        ds._manifest(path, "a" * 40, checkout, create=False)

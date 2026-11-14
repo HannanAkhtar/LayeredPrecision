@@ -117,7 +117,7 @@ def _task_configs(checkout: Path) -> dict:
         if f"task: {task}" not in content:
             raise ValueError(f"Pinned harness task ID differs: {task}")
         result[task] = {"yaml": relative, "sha256": sha256(path),
-                        "dataset": DATASETS[task], "metric": "acc",
+                        "dataset": list(DATASETS[task]), "metric": "acc",
                         "normalized_metric": None if task == "winogrande" else "acc_norm"}
     return result
 
