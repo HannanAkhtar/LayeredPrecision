@@ -49,6 +49,28 @@ def _versions() -> dict:
     return {name: importlib.metadata.version(name) for name in names}
 
 
+def _runtime_imports(checkout: Path) -> dict:
+    import lm_eval
+    import torch
+    import transformers
+
+    checkout = checkout.resolve()
+    lp_env = checkout.parents[2] / "envs/lp_llm"
+    harness_file = Path(lm_eval.__file__).resolve()
+    torch_file = Path(torch.__file__).resolve()
+    transformers_file = Path(transformers.__file__).resolve()
+    if not harness_file.is_relative_to(checkout):
+        raise ValueError(f"Pinned harness is shadowed by {harness_file}")
+    if (torch.__version__ != "2.9.1+cu128" or
+            transformers.__version__ != "4.57.1" or
+            not torch_file.is_relative_to(lp_env) or
+            not transformers_file.is_relative_to(lp_env) or
+            importlib.metadata.version("lm_eval") != "0.4.9.1"):
+        raise ValueError("Downstream runtime imports differ from pinned LP/harness environment")
+    return {"harness_file": str(harness_file), "torch_file": str(torch_file),
+            "transformers_file": str(transformers_file)}
+
+
 def _cgroup_snapshot() -> dict:
     proc = Path("/proc/self/cgroup")
     if not proc.is_file():
@@ -104,6 +126,7 @@ def _manifest(path: Path, code_sha: str, checkout: Path, *, create: bool) -> dic
     _revision(checkout, HARNESS_SHA)
     expected = {"code_sha": code_sha, "harness_sha": HARNESS_SHA,
                 "tasks": _task_configs(checkout), "versions": _versions(),
+                "runtime_imports": _runtime_imports(checkout),
                 "protocol": {"model": "hf", "dtype": "float16", "num_fewshot": 0,
                              "batch_size": 1, "apply_chat_template": False,
                              "limit": None, "seeds": [0, 1234, 1234, 1234]}}
@@ -112,7 +135,8 @@ def _manifest(path: Path, code_sha: str, checkout: Path, *, create: bool) -> dic
         for key, value in expected.items():
             if saved.get(key) != value:
                 raise ValueError(f"Downstream manifest changed at {key}")
-        sidecars = {"environment.json": saved["versions"],
+        sidecars = {"environment.json": {"versions": saved["versions"],
+                                        "runtime_imports": saved["runtime_imports"]},
                     "task_manifest.json": {"tasks": saved["tasks"],
                                            "datasets": saved["datasets"]}}
         for name, value in sidecars.items():
@@ -137,7 +161,9 @@ def _manifest(path: Path, code_sha: str, checkout: Path, *, create: bool) -> dic
                           "download_checksums": data.info.download_checksums}
     expected["datasets"] = datasets
     atomic_json(path, expected)
-    atomic_json(path.parent / "environment.json", expected["versions"])
+    atomic_json(path.parent / "environment.json",
+                {"versions": expected["versions"],
+                 "runtime_imports": expected["runtime_imports"]})
     atomic_json(path.parent / "task_manifest.json",
                 {"tasks": expected["tasks"], "datasets": datasets})
     return expected

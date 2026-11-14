@@ -44,7 +44,8 @@ trap finish EXIT
 git -C "$LP_CODE" cat-file -e "$SHA^{commit}"
 git -C "$LP_CODE" archive --format=tar --output="$STAGE/code.tar" "$SHA"
 tar -xf "$STAGE/code.tar" -C "$STAGE"; rm -- "$STAGE/code.tar"
-export PYTHONPATH="$STAGE${PYTHONPATH:+:$PYTHONPATH}" HF_HOME="$LP_ROOT/cache/downstream_hf"
+HARNESS=$LP_ROOT/references/downstream/lm-evaluation-harness
+export PYTHONPATH="$STAGE:$HARNESS${PYTHONPATH:+:$PYTHONPATH}" HF_HOME="$LP_ROOT/cache/downstream_hf"
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 cd "$STAGE"
 exec 9>"$ROOT/.${PILOT}-${MODEL}.lock"

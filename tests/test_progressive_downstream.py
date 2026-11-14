@@ -163,17 +163,20 @@ def test_interrupted_preflight_manifest_resumes_without_overwrite(tmp_path, monk
     monkeypatch.setattr(ds, "_revision", lambda *_: None)
     monkeypatch.setattr(ds, "_task_configs", lambda *_: {"arc_easy": {"sha256": "pinned"}})
     monkeypatch.setattr(ds, "_versions", lambda: {"torch": "2.9.1+cu128"})
+    monkeypatch.setattr(ds, "_runtime_imports", lambda _: {"harness_file": "pinned"})
     path = tmp_path / "manifest.json"
     manifest = {"code_sha": "a" * 40, "harness_sha": ds.HARNESS_SHA,
                 "tasks": ds._task_configs(tmp_path), "versions": ds._versions(),
                 "protocol": {"model": "hf", "dtype": "float16", "num_fewshot": 0,
                              "batch_size": 1, "apply_chat_template": False,
                              "limit": None, "seeds": [0, 1234, 1234, 1234]},
-                "datasets": {"arc_easy": {"fingerprint": "cached"}}}
+                "datasets": {"arc_easy": {"fingerprint": "cached"}},
+                "runtime_imports": {"harness_file": "pinned"}}
     path.write_text(json.dumps(manifest))
     saved = ds._manifest(path, "a" * 40, tmp_path, create=True)
     assert saved == manifest
-    assert json.loads((tmp_path / "environment.json").read_text()) == manifest["versions"]
+    assert json.loads((tmp_path / "environment.json").read_text()) == {
+        "versions": manifest["versions"], "runtime_imports": manifest["runtime_imports"]}
     assert not (tmp_path / "preflight_complete.json").exists()
     (tmp_path / "environment.json").write_text('{"torch":"wrong"}')
     with pytest.raises(ValueError, match="environment.json changed"):
@@ -198,3 +201,41 @@ def test_lp_materialization_uses_historical_sha_and_exact_shard_hashes(tmp_path,
     provenance["historical_materialization"]["shard_sha256"] = {"model.safetensors": "tampered"}
     with pytest.raises(ValueError, match="differs from evaluated weights"):
         ds._materialize_lp(tmp_path, "r02_lp6", provenance, tmp_path / "checkpoint")
+
+
+def test_pinned_harness_source_cannot_be_shadowed_by_parent_env(tmp_path, monkeypatch):
+    import importlib.metadata
+    checkout = tmp_path / "references/downstream/lm-evaluation-harness"
+    parent = tmp_path / "envs/lp_llm"
+    checkout.mkdir(parents=True)
+    parent.mkdir(parents=True)
+    harness = types.ModuleType("lm_eval")
+    harness.__file__ = str(checkout / "lm_eval/__init__.py")
+    torch = types.ModuleType("torch")
+    torch.__file__ = str(parent / "lib/python3/site-packages/torch/__init__.py")
+    torch.__version__ = "2.9.1+cu128"
+    transformers = types.ModuleType("transformers")
+    transformers.__file__ = str(parent / "lib/python3/site-packages/transformers/__init__.py")
+    transformers.__version__ = "4.57.1"
+    for name, module in (("lm_eval", harness), ("torch", torch), ("transformers", transformers)):
+        monkeypatch.setitem(sys.modules, name, module)
+    original = importlib.metadata.version
+    monkeypatch.setattr(importlib.metadata, "version", lambda name:
+                        "0.4.9.1" if name == "lm_eval" else original(name))
+    assert ds._runtime_imports(checkout)["harness_file"] == str(
+        checkout / "lm_eval/__init__.py")
+    harness.__file__ = str(parent / "lib/python3/site-packages/lm_eval/__init__.py")
+    with pytest.raises(ValueError, match="shadowed"):
+        ds._runtime_imports(checkout)
+
+
+def test_staged_jobs_prepend_pinned_harness_checkout():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "hpc/progressive_llm"
+    for name in ("downstream_preflight.sbatch", "downstream_model.sbatch"):
+        script = (root / name).read_text()
+        assert 'HARNESS=$LP_ROOT/references/downstream/lm-evaluation-harness' in script
+        assert 'PYTHONPATH="$STAGE:$HARNESS${PYTHONPATH:+:$PYTHONPATH}"' in script
+        assert script.index('git -C "$LP_CODE" archive') < script.index('PYTHONPATH="$STAGE:$HARNESS')
+    assert 'PYTHONPATH="$SOURCE${PYTHONPATH:+:$PYTHONPATH}"' in (
+        root / "setup_downstream_env.sh").read_text()

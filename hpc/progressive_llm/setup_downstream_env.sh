@@ -26,6 +26,7 @@ if [[ ! -x "$VENV/bin/python" ]]; then
 fi
 "$VENV/bin/python" -m pip install -e "$SOURCE"
 "$VENV/bin/python" -m pip check
+export PYTHONPATH="$SOURCE${PYTHONPATH:+:$PYTHONPATH}"
 "$VENV/bin/python" - <<'PY'
 import importlib.metadata as m
 import os, pathlib, sys, torch, transformers, lm_eval
